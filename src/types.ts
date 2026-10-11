@@ -1,0 +1,42 @@
+/** Longtable Phase 0 recipe schema. One Automerge document per recipe. */
+
+export interface Recipe {
+  title: string
+  ingredients: string[]
+  steps: string[]
+  /** optional, minutes */
+  prepMinutes?: number
+  /** optional, minutes */
+  cookMinutes?: number
+  /** data URLs (image/*), downscaled on import */
+  photos: string[]
+  /** ISO-8601 timestamps */
+  createdAt: string
+  updatedAt: string
+}
+
+/** Fields the user supplies; timestamps are assigned by the store. */
+export type RecipeInput = Omit<Recipe, 'createdAt' | 'updatedAt'>
+
+/** Partial update — every field optional. */
+export interface RecipePatch {
+  title?: string
+  ingredients?: string[]
+  steps?: string[]
+  prepMinutes?: number
+  cookMinutes?: number
+  photos?: string[]
+}
+
+/** Lightweight list entry kept in the recipe index document. */
+export interface RecipeSummary {
+  id: string
+  title: string
+  url: string
+  updatedAt: string
+}
+
+/** Shape of the dedicated Automerge index document (recipe list -> doc URLs). */
+export interface RecipeIndexDoc {
+  recipes: Record<string, { title: string; url: string; updatedAt: string }>
+}
