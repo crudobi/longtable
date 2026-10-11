@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Longtable</string>
+    <string name="title_activity_main">Longtable</string>
+    <string name="package_name">kitchen.longtable.app</string>
+    <string name="custom_url_scheme">kitchen.longtable.app</string>
+</resources>

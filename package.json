@@ -3,11 +3,14 @@
     "@automerge/automerge": "^3.5.0",
     "@automerge/automerge-repo": "2.5.6",
     "@automerge/automerge-repo-storage-indexeddb": "2.5.6",
+    "@capacitor/android": "^7.6.9",
+    "@capacitor/core": "^7.6.9",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
-  "description": "Longtable Phase 0 \u2014 local-first recipe box. Local cookbook, no sync, no network.",
+  "description": "Longtable Phase 0 — local-first recipe box. Local cookbook, no sync, no network.",
   "devDependencies": {
+    "@capacitor/cli": "^7.6.9",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
@@ -16,8 +19,8 @@
     "typescript": "~5.9.3",
     "vite": "^7.1.7",
     "vite-plugin-pwa": "^1.0.1",
-    "vitest": "^3.2.4",
-    "vite-plugin-wasm": "^3.1.0"
+    "vite-plugin-wasm": "^3.1.0",
+    "vitest": "^3.2.4"
   },
   "name": "longtable",
   "private": true,
