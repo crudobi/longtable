@@ -1,9 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import wasm from 'vite-plugin-wasm'
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default defineConfig({
   plugins: [
+    wasm(),
     react(),
     VitePWA({
       // We register the service worker manually in main.tsx so we can pass
@@ -22,10 +24,10 @@ export default defineConfig({
         start_url: '/',
         scope: '/',
         icons: [
-          { src: '/icons/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
-          { src: '/icons/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
+          { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
           {
-            src: '/icons/maskable-icon-512x512.png',
+            src: '/maskable-icon-512x512.png',
             sizes: '512x512',
             type: 'image/png',
             purpose: 'maskable',
@@ -33,8 +35,10 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Precache the entire app shell, including the Automerge WASM blob.
+        // Precache the entire app shell, including the Automerge WASM blob
+        // (3.6 MB — above workbox's 2 MiB default precache limit).
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm,woff2}'],
+        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         navigateFallback: 'index.html',
         cleanupOutdatedCaches: true,
         skipWaiting: true,
