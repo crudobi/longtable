@@ -1,0 +1,102 @@
+# Longtable e2e + Android debugging cheat-sheet
+
+End-to-end validation runs on devbox against the `longtable-test` emulator
+(Pixel 7, API 35, x86_64, KVM). The suite is Appium (UiAutomator2 driver) +
+webdriverio: native context for install/system dialogs, WEBVIEW context for the
+Capacitor UI (elements addressed by `data-testid` CSS selectors).
+
+## Run the gate
+
+```bash
+/home/devbox/code/longtable/e2e/run-e2e.sh [/path/to.apk]
+# default APK: /home/devbox/builds/longtable/longtable-debug.apk
+```
+
+What it does: boots the emulator (idempotent), starts Appium if needed, then
+runs 13 steps — install+launch, UI renders, no crash, screenshot non-blank,
+create recipe, persistence across force-stop, airplane-mode on, offline
+create/edit/delete, airplane-mode off, final crash check. Exit 0 = all pass;
+any failure prints the step name and the assertion that failed.
+
+## emu.sh — emulator helper
+
+`/home/devbox/tools/android-emu/emu.sh`:
+
+| command | what it does |
+|---|---|
+| `boot` | start AVD headless in tmux (`longtable-emu`), wait for `sys.boot_completed`; no-op if already booted |
+| `install <apk>` | `adb install -r -g` (grants runtime permissions up front) |
+| `launch` | start `kitchen.longtable.app/.MainActivity` |
+| `logcat [-d/-c/…]` | adb logcat passthrough |
+| `screenshot [file]` | PNG screenshot (default `/tmp/lt-shot.png`) |
+| `shell [cmd…]` | adb shell passthrough |
+| `status` | `adb devices` + boot state |
+| `kill` | stop emulator + tmux session |
+
+Env notes: `ANDROID_AVD_HOME=/home/devbox/tools/android-sdk/avd`,
+emulator runs `-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect`.
+
+## Debugging recipes
+
+App logs (Capacitor/WebView console goes to logcat via chromium tag):
+
+```bash
+emu.sh logcat -d | grep -iE "chromium|kitchen.longtable|FATAL"
+emu.sh logcat -c   # clear before a repro run
+```
+
+Crash check:
+
+```bash
+emu.sh logcat -d | grep "FATAL EXCEPTION"
+```
+
+Screenshots / screen recording:
+
+```bash
+emu.sh screenshot /tmp/bug.png
+emu.sh shell screenrecord /sdcard/bug.mp4   # Ctrl-C to stop
+```
+
+Pull the WebView's IndexedDB (Automerge docs live here):
+
+```bash
+emu.sh shell "run-as kitchen.longtable.app ls app_webview/Default/IndexedDB"
+# debug builds are debuggable, so run-as works:
+adb -s emulator-5554 exec-out run-as kitchen.longtable.app tar c app_webview > /tmp/webview.tar
+```
+
+Clear app data (fresh-install state):
+
+```bash
+emu.sh shell pm clear kitchen.longtable.app
+```
+
+Attach tooling to the running emulator:
+
+```bash
+adb -s emulator-5554 shell          # any adb command; only one emulator is attached
+# Appium: point capabilities at http://127.0.0.1:4723 with appium:udid emulator-5554
+# Chrome DevTools: Capacitor debug builds set WebContentsDebuggingEnabled,
+# so chrome://inspect on a desktop Chrome sees the WebView (via adb).
+```
+
+Appium server (if you need it outside run-e2e.sh):
+
+```bash
+tmux new -s longtable-appium -d 'appium --address 127.0.0.1 --port 4723'
+curl -s http://127.0.0.1:4723/status | head -c 200
+```
+
+## Toolchain versions (pinned 2026-10-11)
+
+- Appium 3.8.0 (`/usr/local/bin/appium`), uiautomator2 driver 8.7.0
+- webdriverio pinned via `e2e/package-lock.json`
+- Emulator + `system-images;android-35;google_apis;x86_64` under `/home/devbox/tools/android-sdk`
+- Temurin JDK 21 at `/home/devbox/tools/jdk-21` (`JAVA_HOME` for sdkmanager/avdmanager)
+
+## Storage-migration testing (from Phase 1 on)
+
+The harness supports upgrade testing: install APK N (seed data via the suite),
+`adb install -r` APK N+1 over it, assert the recipes survive. Phase 0 has no
+predecessor build, so this activates with the first Phase 1 APK.

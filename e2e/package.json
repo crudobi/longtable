@@ -1,0 +1,1 @@
+{"dependencies":{"webdriverio":"^9.0.0"},"description":"Appium (UiAutomator2) end-to-end tests for the Longtable Android debug build. Proves the Phase 0 oath on the emulator.","name":"longtable-e2e","private":true,"scripts":{"test":"node test.mjs"},"type":"module","version":"0.1.0"}
