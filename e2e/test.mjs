@@ -3,6 +3,7 @@
 // Run via e2e/run-e2e.sh (sets APK env). Exit 0 = every step passed.
 import { remote } from 'webdriverio';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 const APK = process.env.APK || '/home/devbox/builds/longtable/longtable-debug.apk';
 const PKG = 'kitchen.longtable.app';
@@ -84,7 +85,12 @@ async function backToList() {
   await el('[data-testid="recipe-list"]');
 }
 
-async function createRecipe(title, ingredient, stepText) {
+async function cancelForm() {
+  await (await $d('//button[contains(., "Cancel")]')).click();
+  await el('[data-testid="recipe-list"]');
+}
+
+async function createRecipe(title, ingredient, stepText, prep, cook) {
   await (await el('[data-testid="new-recipe"]')).click();
   await (await el('[data-testid="field-title"]')).setValue(title);
   if (ingredient) {
@@ -94,6 +100,16 @@ async function createRecipe(title, ingredient, stepText) {
   if (stepText) {
     await (await el('[data-testid="field-step"]')).setValue(stepText);
     await (await el('[data-testid="add-step"]')).click();
+  }
+  if (prep) {
+    const f = await el('[data-testid="field-prep"]');
+    await f.clearValue();
+    await f.setValue(prep);
+  }
+  if (cook) {
+    const f = await el('[data-testid="field-cook"]');
+    await f.clearValue();
+    await f.setValue(cook);
   }
   await (await el('[data-testid="save-recipe"]')).click();
   // App navigates to the detail view after create (not the list).
@@ -110,7 +126,11 @@ async function openRecipeCard(title) {
 }
 
 async function fatalCrashes() {
-  const out = adb('logcat', '-d');
+  // logcat -d can exceed execFileSync's default 1MB buffer on long runs (ENOBUFS).
+  const out = execFileSync(ADB, ['-s', SERIAL, 'logcat', '-d'], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
   return out.split('\n').filter((l) => l.includes('FATAL EXCEPTION') && l.includes(PKG));
 }
 
@@ -170,6 +190,60 @@ async function main() {
     await createRecipe('E2E Pancakes', 'flour', 'Mix well');
     assert((await bodyText()).includes('E2E Pancakes'), 'recipe not in list after save');
     return 'in list';
+  });
+
+  await step('detail view shows ingredients and steps', async () => {
+    await openRecipeCard('E2E Pancakes');
+    const t = await bodyText();
+    assert(t.includes('flour'), 'ingredient missing from detail');
+    assert(t.includes('Mix well'), 'step missing from detail');
+    await backToList();
+    return 'detail ok';
+  });
+
+  await step('prep/cook times saved and shown', async () => {
+    await createRecipe('E2E Times', 'salt', 'Stir', '15', '30');
+    await openRecipeCard('E2E Times');
+    const t = await bodyText();
+    assert(t.includes('15 min'), 'prep time missing from detail');
+    assert(t.includes('30 min'), 'cook time missing from detail');
+    await backToList();
+    assert((await bodyText()).includes('E2E Times'), 'E2E Times not in list');
+    return '15 min / 30 min shown';
+  });
+
+  await step('photo attach: downscaled to <=1280px and shown', async () => {
+    await (await el('[data-testid="new-recipe"]')).click();
+    await (await el('[data-testid="field-title"]')).setValue('E2E Photo');
+    // The OS file picker can't be driven from automation, and chromedriver
+    // does no client-side file detection for sendKeys. Inject the file
+    // directly via DataTransfer + a bubbling change event instead: everything
+    // from the input's onChange onward (FileReader, canvas downscale,
+    // preview, save) is the real app pipeline.
+    const b64 = readFileSync(new URL('./fixtures/photo.jpg', import.meta.url)).toString('base64');
+    await driver.executeScript(
+      'var b64 = arguments[0];' +
+      'var bin = atob(b64);' +
+      'var arr = new Uint8Array(bin.length);' +
+      'for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);' +
+      'var file = new File([arr], "photo.jpg", { type: "image/jpeg" });' +
+      'var dt = new DataTransfer(); dt.items.add(file);' +
+      'var input = document.querySelector(\'[data-testid="field-photos"]\');' +
+      'input.files = dt.files;' +
+      'input.dispatchEvent(new Event("change", { bubbles: true }));',
+      [b64]
+    );
+    await el('img[alt="Attached photo 1"]', 30000);
+    const w = await driver.executeScript(
+      'var img = document.querySelector(\'img[alt="Attached photo 1"]\');' +
+      'return img ? img.naturalWidth : -1;', []
+    );
+    assert(w > 0 && w <= 1280, `photo not downscaled to <=1280px: naturalWidth=${w}`);
+    await (await el('[data-testid="save-recipe"]')).click();
+    await el('[data-testid="recipe-detail"]');
+    await el('img[alt="Recipe photo 1"]');
+    await backToList();
+    return `downscaled to ${w}px, preview + detail ok`;
   });
 
   await step('recipe persists across force-stop + relaunch', async () => {
@@ -247,6 +321,44 @@ async function main() {
     }
     assert(sh('settings get global airplane_mode_on') === '0', 'airplane_mode_on not 0');
     return 'online';
+  });
+
+  await step('url import: unreachable host shows graceful error', async () => {
+    await (await el('[data-testid="new-recipe"]')).click();
+    await (await el('[data-testid="import-url"]')).click();
+    await (await el('[data-testid="field-url"]')).setValue('https://invalid.invalid/recipe');
+    await (await el('[data-testid="fetch-url"]')).click();
+    const status = await el('[data-testid="import-status"]', 30000);
+    const msg = await status.getText();
+    assert(msg.length > 10, 'import-status empty');
+    // Dialog still open (did not crash or dismiss): the URL field remains.
+    await el('[data-testid="field-url"]');
+    await (await $d('//div[@role="dialog"]//button[contains(., "Cancel")]')).click(); // close dialog
+    await cancelForm();
+    return `graceful: "${msg.slice(0, 60)}"`;
+  });
+
+  await step('url import: fixture page prefills the form', async () => {
+    await (await el('[data-testid="new-recipe"]')).click();
+    await (await el('[data-testid="import-url"]')).click();
+    await (await el('[data-testid="field-url"]')).setValue('https://10.0.2.2:18443/recipe.html');
+    await (await el('[data-testid="fetch-url"]')).click();
+    // Success closes the dialog and prefills the form; failure shows import-status.
+    let titleVal = '';
+    let errMsg = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 30000) {
+      const st = await $d('[data-testid="import-status"]');
+      if (await st.isExisting()) { errMsg = await st.getText(); break; }
+      titleVal = await (await $d('[data-testid="field-title"]')).getValue();
+      if (titleVal) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    assert(!errMsg, `import failed: ${errMsg}`);
+    assert(titleVal === 'Fixture Pancakes', `title not prefilled, got "${titleVal}"`);
+    assert((await bodyText()).includes('200g flour'), 'ingredients not prefilled');
+    await cancelForm();
+    return 'prefilled title + ingredients';
   });
 
   await step('no fatal crash at end', async () => {

@@ -100,3 +100,46 @@ curl -s http://127.0.0.1:4723/status | head -c 200
 The harness supports upgrade testing: install APK N (seed data via the suite),
 `adb install -r` APK N+1 over it, assert the recipes survive. Phase 0 has no
 predecessor build, so this activates with the first Phase 1 APK.
+
+## URL-import fixture (HTTPS + test CA)
+
+The url-import positive test fetches `https://10.0.2.2:18443/recipe.html`
+(served from `e2e/fixtures/` by `serve-https.py`, started automatically by
+`run-e2e.sh`). Plain HTTP cannot be used: the Capacitor WebView origin is
+https, and Android blocks cleartext, so a fixture must be HTTPS with a
+CA the emulator trusts.
+
+One-time setup (machine-level, NOT committed):
+
+```bash
+CERTS=/home/devbox/tools/android-emu/fixture-certs
+mkdir -p $CERTS && cd $CERTS
+# 1. test CA + server cert (SAN IP:10.0.2.2 = emulator's host alias)
+openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.crt -days 825 -nodes -subj "/CN=Longtable E2E Test CA"
+openssl req -newkey rsa:2048 -keyout server.key -out server.csr -nodes -subj "/CN=10.0.2.2"
+printf "subjectAltName=IP:10.0.2.2\n" > ext.cnf
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 825 -extfile ext.cnf
+# 2. install the CA in the emulator's USER trust store (persists in userdata.img)
+H=$(openssl x509 -inform PEM -subject_hash_old -in ca.crt | head -1)
+adb -s emulator-5554 root
+adb -s emulator-5554 shell mkdir -p /data/misc/user/0/cacerts-added
+adb -s emulator-5554 push ca.crt /data/misc/user/0/cacerts-added/$H.0
+adb -s emulator-5554 shell chmod 644 /data/misc/user/0/cacerts-added/$H.0
+adb -s emulator-5554 reboot   # keystore reads user CAs at boot
+```
+
+The debug APK trusts user CAs via a debug-only network security config
+(`android/app/src/debug/`): `<debug-overrides>` applies to debuggable builds
+only, so release builds keep the platform default (system CAs).
+
+Port 18443 was chosen because 8443 is taken by the fleet API on this box.
+
+## Photo-attach test note
+
+chromedriver performs no client-side file detection for `sendKeys` (that lives
+in desktop Selenium clients, not in chromedriver), so `setValue(path)` on the
+file input silently attaches nothing (`files.length === 0`, verified). The test
+instead injects the fixture JPEG (`e2e/fixtures/photo.jpg`, 1600x1200) via
+`DataTransfer` + a bubbling `change` event: everything from the input's
+`onChange` onward (FileReader, canvas downscale, preview, save, detail) is the
+real app pipeline. The OS file picker itself is Android UI, not app code.

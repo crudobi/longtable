@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only network security config. debug-overrides apply solely to
+     debuggable builds; release builds fall back to the platform default
+     (system CAs only). Lets the e2e URL-import test use a local HTTPS
+     fixture whose CA is installed in the emulator's user trust store. -->
+<network-security-config>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

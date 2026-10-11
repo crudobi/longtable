@@ -3,13 +3,16 @@
 # Usage: run-e2e.sh [apk-path]
 #   1. boots the longtable-test emulator (idempotent)
 #   2. starts the Appium server if needed (tmux session longtable-appium)
-#   3. runs the webdriverio suite against the APK
+#   3. starts the HTTPS URL-import fixture if needed (tmux lt-fixture-https)
+#   4. runs the webdriverio suite against the APK
 # Exit 0 = all steps passed; non-zero = at least one step failed (see per-step report).
 set -u
 
 EMU=/home/devbox/tools/android-emu/emu.sh
 E2E_DIR=/home/devbox/code/longtable/e2e
 APK="${1:-/home/devbox/builds/longtable/longtable-debug.apk}"
+FIXTURE_CERTS=/home/devbox/tools/android-emu/fixture-certs
+FIXTURE_PORT=18443
 
 [ -f "$APK" ] || { echo "ERROR: APK not found: $APK" >&2; exit 2; }
 
@@ -29,6 +32,22 @@ if ! curl -sf --max-time 3 http://127.0.0.1:4723/status > /dev/null 2>&1; then
     if curl -sf --max-time 3 http://127.0.0.1:4723/status > /dev/null 2>&1; then ok=1; break; fi
   done
   [ "$ok" = 1 ] || { echo "ERROR: appium server did not start" >&2; exit 2; }
+fi
+
+# HTTPS fixture for the url-import positive test (recipe.html over TLS with
+# CORS). The emulator trusts FIXTURE_CERTS/ca.crt via its user store, and the
+# debug APK's networkSecurityConfig (src/debug, debug-only) trusts user CAs.
+[ -f "$FIXTURE_CERTS/server.crt" ] || { echo "ERROR: fixture certs missing: $FIXTURE_CERTS (see e2e/README.md)" >&2; exit 2; }
+if ! curl -sk --max-time 3 -o /dev/null -w "%{http_code}" "https://127.0.0.1:$FIXTURE_PORT/recipe.html" 2>/dev/null | grep -q 200; then
+  echo "starting https fixture (tmux lt-fixture-https, port $FIXTURE_PORT)"
+  tmux kill-session -t lt-fixture-https 2>/dev/null || true
+  tmux new -s lt-fixture-https -d "python3 $E2E_DIR/fixtures/serve-https.py $FIXTURE_CERTS $FIXTURE_PORT"
+  ok=0
+  for i in $(seq 1 15); do
+    sleep 1
+    if curl -sk --max-time 3 -o /dev/null "https://127.0.0.1:$FIXTURE_PORT/recipe.html" 2>/dev/null; then ok=1; break; fi
+  done
+  [ "$ok" = 1 ] || { echo "ERROR: https fixture did not start" >&2; exit 2; }
 fi
 
 cd "$E2E_DIR"
