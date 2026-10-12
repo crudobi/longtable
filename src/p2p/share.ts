@@ -83,23 +83,6 @@ const updateListeners = new Set<() => void>()
  * Used to verify CRDT merge when y-webrtc transport is unavailable
  * (e.g. emulator NAT). Not for production use.
  */
-export async function debugExportUpdate(recipeId: string): Promise<string> {
-  const repo = getRepo()
-  const doc = await getOrCreateDoc(repo, recipeId)
-  return u8ToBase64(Y.encodeStateAsUpdate(doc))
-}
-
-export async function debugImportUpdate(recipeId: string, b64: string): Promise<void> {
-  const repo = getRepo()
-  const doc = await getOrCreateDoc(repo, recipeId)
-  Y.applyUpdate(doc, base64ToU8(b64))
-}
-
-// Expose for WebDriver executeScript in e2e proof.
-if (typeof window !== 'undefined') {
-  ;(window as any).__ltDebug = { debugExportUpdate, debugImportUpdate }
-}
-
 export function onShareUpdate(cb: () => void): () => void {
   updateListeners.add(cb)
   return () => {

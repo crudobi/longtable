@@ -189,4 +189,44 @@ describe('recipe store', () => {
     expect(kept!.title).toBe('Survivor')
     expect(kept!.ingredients).toEqual(['2 cups flour', '1 tsp salt'])
   })
+
+  it('concurrent offline edits merge with zero field loss (no duplicate items)', async () => {
+    // Simulates two devices: A and B share a doc via sync, go offline,
+    // edit different fields, then sync. Yjs must merge cleanly.
+    const Y = await import('yjs')
+    const { getOrCreateDoc } = await import('../store/repo')
+    dbCounter += 1
+    const repoA = createRepo(`longtable-merge-${dbCounter}`)
+    const indexA = await getOrCreateIndex(repoA, kv)
+    const summary = await createRecipe(repoA, indexA, sample('Merge Soup'))
+    await repoA.flush()
+
+    // B gets the doc via sync (same mechanism as the share snapshot)
+    const docA = await getOrCreateDoc(repoA, summary.id)
+    const updateAB = Y.encodeStateAsUpdate(docA)
+    const docB = new Y.Doc({ guid: summary.id })
+    Y.applyUpdate(docB, updateAB)
+
+    // Concurrent offline edits: A renames title (ingredients untouched),
+    // B adds an ingredient (title untouched)
+    await updateRecipe(repoA, indexA, summary.id, { title: 'Merge Soup REMIXED' })
+    const mapB = docB.getMap('recipe')
+    docB.transact(() => {
+      const arr = mapB.get('ingredients')
+      if (arr instanceof Y.Array) arr.push(['1 tbsp sugar'])
+    })
+
+    // Sync both ways (what y-webrtc would do automatically)
+    const docA2 = await getOrCreateDoc(repoA, summary.id)
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA2))
+    Y.applyUpdate(docA2, Y.encodeStateAsUpdate(docB))
+
+    // Both converge: title from A, all three ingredients, no duplicates
+    for (const doc of [docA2, docB]) {
+      const m = doc.getMap('recipe')
+      expect(m.get('title')).toBe('Merge Soup REMIXED')
+      const ings = (m.get('ingredients') as any).toArray()
+      expect(ings).toEqual(['2 cups flour', '1 tsp salt', '1 tbsp sugar'])
+    }
+  })
 })

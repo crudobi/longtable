@@ -81,6 +81,13 @@ function toStringArray(value: unknown): string[] {
 function replaceArray(map: Y.Map<any>, key: string, items: string[]): void {
   const cur = map.get(key)
   if (cur instanceof Y.Array) {
+    // If the content is identical, do nothing: delete+push would mint new
+    // Yjs item IDs for the same strings, which breaks concurrent merge
+    // (a peer holding the old IDs would see duplicates after sync).
+    const current = cur.toArray() as string[]
+    if (current.length === items.length && current.every((v, i) => v === items[i])) {
+      return
+    }
     cur.delete(0, cur.length)
     cur.push(items)
   } else {
