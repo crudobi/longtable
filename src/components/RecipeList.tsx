@@ -4,6 +4,7 @@ interface Props {
   recipes: RecipeSummary[]
   onOpen: (id: string) => void
   onNew: () => void
+  onJoin: () => void
 }
 
 function formatDate(iso: string): string {
@@ -11,13 +12,16 @@ function formatDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
 }
 
-export function RecipeList({ recipes, onOpen, onNew }: Props) {
+export function RecipeList({ recipes, onOpen, onNew, onJoin }: Props) {
   return (
     <div className="view" data-testid="recipe-list">
       <header className="app-header">
         <h1>Longtable</h1>
         <button className="primary" data-testid="new-recipe" onClick={onNew}>
           + New recipe
+        </button>
+        <button data-testid="join-recipe" onClick={onJoin}>
+          Join shared
         </button>
       </header>
       {recipes.length === 0 ? (

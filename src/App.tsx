@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getRepo } from './store/repo'
 import {
   createRecipe,
@@ -11,6 +11,10 @@ import {
 import { RecipeList } from './components/RecipeList'
 import { RecipeDetail } from './components/RecipeDetail'
 import { RecipeForm } from './components/RecipeForm'
+import { ShareModal } from './components/ShareModal'
+import { JoinModal } from './components/JoinModal'
+import { onShareUpdate, rejoinShares, shareRecipe } from './p2p/share'
+import type { SharePayload } from './p2p/share'
 import type { Recipe, RecipeInput, RecipeSummary } from './types'
 
 type View =
@@ -27,18 +31,16 @@ export default function App() {
   const [current, setCurrent] = useState<Recipe | null>(null)
   const [ready, setReady] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [sharePayload, setSharePayload] = useState<SharePayload | null>(null)
+  const [joinOpen, setJoinOpen] = useState(false)
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const detailIdRef = useRef<string | null>(null)
 
   const refresh = useCallback(async () => {
     const repo = getRepo()
     const index = await getOrCreateIndex(repo)
     setSummaries(await listRecipes(index))
   }, [])
-
-  useEffect(() => {
-    refresh()
-      .catch((e) => setError(String(e)))
-      .finally(() => setReady(true))
-  }, [refresh])
 
   const openDetail = useCallback(async (id: string) => {
     try {
@@ -56,6 +58,34 @@ export default function App() {
       setError(String(e))
     }
   }, [])
+
+  useEffect(() => {
+    detailIdRef.current = view.name === 'detail' ? view.id : null
+  })
+
+  useEffect(() => {
+    refresh()
+      .catch((e) => setError(String(e)))
+      .finally(() => setReady(true))
+    // Rejoin P2P shares (peers rediscover via signaling and sync converges).
+    void rejoinShares().catch((e) => console.warn('rejoin shares failed', e))
+    // Live refresh when a shared doc updates (local or remote edit).
+    // Debounced: a burst of keystrokes or sync updates refreshes once.
+    const unsubscribe = onShareUpdate(() => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current)
+      refreshTimer.current = setTimeout(() => {
+        void refresh()
+        // If a detail view is open, re-read it so remote edits appear live.
+        const id = detailIdRef.current
+        if (id) void openDetail(id).catch(() => undefined)
+      }, 800)
+    })
+    return () => {
+      unsubscribe()
+      if (refreshTimer.current) clearTimeout(refreshTimer.current)
+    }
+  }, [refresh, openDetail])
+
 
   const handleCreate = useCallback(
     async (input: RecipeInput) => {
@@ -100,6 +130,21 @@ export default function App() {
     [summaries, refresh],
   )
 
+  const handleShare = useCallback(async (id: string) => {
+    try {
+      const summary = summaries.find((s) => s.id === id)
+      const payload = await shareRecipe(id, summary?.title ?? 'Shared recipe')
+      setSharePayload(payload)
+    } catch (e) {
+      setError(String(e))
+    }
+  }, [summaries])
+
+  const handleJoined = useCallback(async () => {
+    setJoinOpen(false)
+    await refresh()
+  }, [refresh])
+
   if (!ready) {
     return (
       <div className="view">
@@ -116,6 +161,7 @@ export default function App() {
           recipes={summaries}
           onOpen={openDetail}
           onNew={() => setView({ name: 'new' })}
+          onJoin={() => setJoinOpen(true)}
         />
       )}
       {view.name === 'detail' && current && (
@@ -123,6 +169,7 @@ export default function App() {
           recipe={current}
           onEdit={() => setView({ name: 'edit', id: view.id })}
           onDelete={() => void handleDelete(view.id)}
+          onShare={() => void handleShare(view.id)}
           onBack={() => setView({ name: 'list' })}
         />
       )}
@@ -148,6 +195,12 @@ export default function App() {
           onSave={(input) => void handleUpdate(view.id, input)}
           onCancel={() => void openDetail(view.id)}
         />
+      )}
+      {sharePayload && (
+        <ShareModal payload={sharePayload} onClose={() => setSharePayload(null)} />
+      )}
+      {joinOpen && (
+        <JoinModal onJoined={() => void handleJoined()} onClose={() => setJoinOpen(false)} />
       )}
     </div>
   )

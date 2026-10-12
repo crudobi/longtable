@@ -4,6 +4,7 @@ interface Props {
   recipe: Recipe
   onEdit: () => void
   onDelete: () => void
+  onShare: () => void
   onBack: () => void
 }
 
@@ -11,7 +12,7 @@ function formatMinutes(min?: number): string {
   return min === undefined ? '—' : `${min} min`
 }
 
-export function RecipeDetail({ recipe, onEdit, onDelete, onBack }: Props) {
+export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onBack }: Props) {
   return (
     <div className="view" data-testid="recipe-detail">
       <header className="app-header">
@@ -24,6 +25,9 @@ export function RecipeDetail({ recipe, onEdit, onDelete, onBack }: Props) {
           </button>
           <button className="danger" data-testid="delete-recipe" onClick={onDelete}>
             Delete
+          </button>
+          <button data-testid="share-recipe" onClick={onShare}>
+            Share
           </button>
         </div>
       </header>

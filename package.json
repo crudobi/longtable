@@ -4,8 +4,10 @@
     "@capacitor/core": "^7.6.9",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "yjs": "13.6.33",
-    "y-indexeddb": "9.0.12"
+    "react-qr-code": "^2.2.0",
+    "y-indexeddb": "9.0.12",
+    "y-webrtc": "^10.3.0",
+    "yjs": "13.6.33"
   },
   "description": "Longtable Phase 0 — local-first recipe box. Local cookbook, no sync, no network.",
   "devDependencies": {

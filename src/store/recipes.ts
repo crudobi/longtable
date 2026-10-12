@@ -160,6 +160,27 @@ export async function createRecipe(
   return summary
 }
 
+/**
+ * Register a recipe received via P2P share in the local index so it appears
+ * in the list. The document content itself arrives via Yjs sync; this only
+ * adds the index entry. Idempotent — a second join is a no-op.
+ */
+export async function registerSharedRecipe(
+  repo: YjsStore,
+  id: string,
+  title: string,
+): Promise<void> {
+  const url = docUrl(id)
+  const updatedAt = new Date().toISOString()
+  const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  indexDoc.transact(() => {
+    const map = indexDoc.getMap(INDEX_MAP)
+    if (!map.has(id)) {
+      map.set(id, entryMap({ title, url, updatedAt }))
+    }
+  })
+}
+
 /** List all recipes (newest first) from the index document. */
 export async function listRecipes(index: IndexHandle): Promise<RecipeSummary[]> {
   const snap = await index.doc()
