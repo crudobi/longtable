@@ -18,8 +18,15 @@
 
 import { WebSocketServer } from 'ws'
 import http from 'node:http'
+import https from 'node:https'
+import fs from 'node:fs'
 
 const PORT = Number(process.env.PORT || 4444)
+// TLS cert/key for wss://. The app's WebView is https://localhost, and browsers
+// block insecure ws:// from secure contexts — so the signaling server must speak
+// wss://. Defaults to the e2e fixture cert (SAN IP:10.0.2.2); override via env.
+const TLS_CERT = process.env.TLS_CERT || '/home/devbox/tools/android-emu/fixture-certs/server.crt'
+const TLS_KEY = process.env.TLS_KEY || '/home/devbox/tools/android-emu/fixture-certs/server.key'
 const MAX_PAYLOAD = 1 << 20 // 1 MiB — signaling frames (SDP/ICE) are tiny
 const MAX_TOPIC_LEN = 256
 const PING_INTERVAL = 30000
@@ -170,7 +177,7 @@ const onConnection = conn => {
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD })
 wss.on('connection', onConnection)
 
-const server = http.createServer((req, res) => {
+const requestHandler = (req, res) => {
   if (req.url === '/health') {
     const body = JSON.stringify({ ok: true, topics: topics.size })
     res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -179,7 +186,14 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.end('okay')
-})
+}
+const useTls = fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY)
+const server = useTls
+  ? https.createServer(
+      { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) },
+      requestHandler,
+    )
+  : http.createServer(requestHandler)
 
 server.on('upgrade', (req, socket, head) => {
   // Auth hook point for the hub later; currently open (LAN/P2P use).
@@ -187,7 +201,9 @@ server.on('upgrade', (req, socket, head) => {
 })
 
 server.listen(PORT, () => {
-  console.log(`longtable signaling server listening on :${PORT}`)
+  console.log(
+    `longtable signaling server listening on :${PORT} (${useTls ? 'wss' : 'ws'})`,
+  )
 })
 
 if (STATS) {

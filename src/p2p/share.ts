@@ -16,10 +16,11 @@ import { getOrCreateDoc, getRepo } from '../store/repo'
 import { registerSharedRecipe } from '../store/recipes'
 
 /**
- * Default signaling server. Phase 1 dev points at devbox (reachable from
- * the emulator as 10.0.2.2). Production: the hub's wss:// URL.
+ * Default signaling server (wss:// — the app's https://localhost WebView blocks
+ * insecure ws://). Phase 1 dev points at devbox (reachable from the
+ * emulator as 10.0.2.2). Production: the hub's wss:// URL.
  */
-export const DEFAULT_SIGNALING_URL = 'ws://10.0.2.2:4444'
+export const DEFAULT_SIGNALING_URL = 'wss://10.0.2.2:4444'
 
 const SHARES_KEY = 'longtable:shares'
 
