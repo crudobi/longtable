@@ -8,6 +8,30 @@ export const INDEX_GUID = 'longtable-index'
 
 const URL_SCHEME = 'yjs:'
 const FLUSH_KEY = '__longtable_flush__'
+/**
+ * Stable per-device Yjs clientID (persisted in localStorage).
+ * Yjs assigns a random clientID to each new Doc; without stability, an edit
+ * made after an app restart gets clock 0 under a fresh clientID and can LOSE
+ * a conflict against the pre-restart item (same clock 0, higher old clientID).
+ * A stable clientID keeps the Lamport clock monotonic across launches.
+ */
+const CLIENT_ID_KEY = 'longtable:client-id'
+
+/** This device's stable Yjs clientID, generated once and persisted. */
+export function getDeviceClientId(): number {
+  try {
+    const raw = localStorage.getItem(CLIENT_ID_KEY)
+    if (raw) {
+      const n = parseInt(raw, 10)
+      if (Number.isSafeInteger(n) && n > 0) return n
+    }
+  } catch { /* storage unavailable — fall through to ephemeral */ }
+  const n = 1 + Math.floor(Math.random() * 0xffffffff)
+  try {
+    localStorage.setItem(CLIENT_ID_KEY, String(n))
+  } catch { /* ignore */ }
+  return n
+}
 
 /** One cached Yjs document: the live doc plus its IndexedDB persistence. */
 export interface YjsDocEntry {
@@ -111,6 +135,14 @@ export async function getOrCreateDoc(store: YjsStore, guid: string): Promise<Y.D
       const persistence = new IndexeddbPersistence(docDbName(store.dbName, guid), doc)
       try {
         await persistence.whenSynced
+        // Stable clientID: without this, edits after a restart get clock 0
+        // under a fresh random clientID and can lose conflicts against the
+        // pre-restart item (same clock 0, higher old clientID).
+        // MUST be set AFTER whenSynced: y-indexeddb replays stored updates as
+        // remote transactions, and Yjs changes the clientID if a remote
+        // transaction touches the doc's own clientID. After load, the store
+        // knows this client's clock, so edits continue monotonically.
+        doc.clientID = getDeviceClientId()
         store.docs.set(guid, { doc, persistence })
         return doc
       } catch (e) {

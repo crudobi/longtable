@@ -229,4 +229,49 @@ describe('recipe store', () => {
       expect(ings).toEqual(['2 cups flour', '1 tsp salt', '1 tbsp sugar'])
     }
   })
+
+  it('stable clientID: edits after a simulated restart keep a monotonic clock', async () => {
+    // Mock a persistent localStorage so the clientID survives "restarts".
+    const store = new Map<string, string>()
+    const ls = {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    }
+    ;(globalThis as any).localStorage = ls
+
+    const { getOrCreateDoc } = await import('../store/repo')
+    const Y = await import('yjs')
+    dbCounter += 1
+    const repo = createRepo(`longtable-clientid-${dbCounter}`)
+
+    // First "launch": create doc, set title.
+    const doc1 = await getOrCreateDoc(repo, 'restart-doc')
+    const cid1 = doc1.clientID
+    doc1.getMap('recipe').set('title', 'v1')
+    const item1 = (doc1.getMap('recipe') as any)._map.get('title')
+    const clock1 = item1.id.clock
+
+    // Simulate app restart: drop the repo (clears the doc cache) but keep
+    // localStorage (stable clientID) and IndexedDB (persisted updates).
+    ;(repo as any).docs.clear()
+    ;(repo as any).pending.clear()
+    const doc2 = await getOrCreateDoc(repo, 'restart-doc')
+    expect(doc2.clientID).toBe(cid1)
+    expect(doc2.getMap('recipe').get('title')).toBe('v1')
+
+    // Edit after restart: clock must continue, not reset to 0.
+    doc2.getMap('recipe').set('title', 'v2')
+    const item2 = (doc2.getMap('recipe') as any)._map.get('title')
+    expect(item2.id.client).toBe(cid1)
+    expect(item2.id.clock).toBeGreaterThan(clock1)
+
+    // The v2 edit must beat the pre-restart v1 item in a merge.
+    const docB = new Y.Doc({ guid: 'restart-doc' })
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(doc1))
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(doc2))
+    expect(docB.getMap('recipe').get('title')).toBe('v2')
+
+    delete (globalThis as any).localStorage
+  })
 })

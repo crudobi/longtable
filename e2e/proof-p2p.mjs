@@ -146,6 +146,8 @@ try {
     recipeId = (JSON.parse(payload)).recipeId;
     await (await el(driverA, '[data-testid="close-share"]')).click();
     await backToList(driverA);
+    // Flush wait: localStorage share must hit disk before any force-stop.
+    await new Promise((r) => setTimeout(r, 10000));
     return `room ${(JSON.parse(payload)).room}`;
   });
 
@@ -171,7 +173,12 @@ try {
       await new Promise((r) => setTimeout(r, 2000));
     }
     if (!found) throw new Error('B never listed the shared recipe');
-    return 'B lists "P2P Pancakes"';
+    const bShares = await driverB.executeScript('return localStorage.getItem("longtable:shares");', []);
+    if (!bShares || !bShares.includes(recipeId)) throw new Error('B join did not persist share: ' + bShares);
+    // Let localStorage flush to disk: force-stop before the flush loses the
+    // saved share (Chromium batches LevelDB writes; ~10-15s is safe).
+    await new Promise((r) => setTimeout(r, 15000));
+    return 'B lists "P2P Pancakes", share persisted+flushed';
   });
 
   // 4. PARTITION: kill apps + signaling
@@ -247,27 +254,14 @@ try {
     return 'signaling up, apps relaunched';
   });
 
-  // 6b. Manual sync via debug hooks (emulator NAT blocks y-webrtc WebRTC;
-  // on real devices y-webrtc would do this automatically via TURN).
-  // This proves the Yjs CRDT merge with the app's real docs.
-  await step('manual P2P sync (debug hook)', async () => {
-    // A -> B
-    const updateA = await driverA.executeScript(
-      'return window.__ltDebug.debugExportUpdate(arguments[0]);', [recipeId]
-    );
-    await driverB.executeScript(
-      'return window.__ltDebug.debugImportUpdate(arguments[0], arguments[1]);',
-      [recipeId, updateA]
-    );
-    // B -> A
-    const updateB = await driverB.executeScript(
-      'return window.__ltDebug.debugExportUpdate(arguments[0]);', [recipeId]
-    );
-    await driverA.executeScript(
-      'return window.__ltDebug.debugImportUpdate(arguments[0], arguments[1]);',
-      [recipeId, updateB]
-    );
-    return 'updates exchanged both ways';
+  // 6b. Live y-webrtc sync (works now that the test CA is installed on both
+  // emulators: signaling connects, peers discover each other, and the data
+  // channel carries the Yjs updates automatically — no manual hook needed).
+  // Step 7 polls each device for convergence (up to 60s each); this step just
+  // gives ICE a moment to establish before the first poll.
+  await step('live y-webrtc sync window', async () => {
+    await new Promise((r) => setTimeout(r, 15000));
+    return 'peers syncing via WebRTC data channel';
   });
 
   // 7. Assert convergence with zero field loss on BOTH devices
