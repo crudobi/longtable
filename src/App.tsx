@@ -64,7 +64,20 @@ export default function App() {
   })
 
   useEffect(() => {
-    refresh()
+    void (async () => {
+      // One-time Phase 0 (Automerge) recovery migration: imports any
+      // recipes orphaned by the Phase 1 storage swap. Flag-guarded and
+      // dynamically imported, so it is inert after the first run.
+      try {
+        const { migrateFromAutomergeIfNeeded } = await import(
+          './store/migrateFromAutomerge'
+        )
+        await migrateFromAutomergeIfNeeded()
+      } catch (e) {
+        console.warn('automerge migration failed', e)
+      }
+      await refresh()
+    })()
       .catch((e) => setError(String(e)))
       .finally(() => setReady(true))
     // Rejoin P2P shares (peers rediscover via signaling and sync converges).

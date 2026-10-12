@@ -98,8 +98,16 @@ curl -s http://127.0.0.1:4723/status | head -c 200
 ## Storage-migration testing (from Phase 1 on)
 
 The harness supports upgrade testing: install APK N (seed data via the suite),
-`adb install -r` APK N+1 over it, assert the recipes survive. Phase 0 has no
-predecessor build, so this activates with the first Phase 1 APK.
+`adb install -r` APK N+1 over it, assert the recipes survive.
+
+**Phase 0 -> Phase 1 (Automerge -> Yjs):** `e2e/proof-migration.mjs` is the
+repeatable proof. It installs the Phase 0 APK (built from commit `6223a9b`,
+kept at `/home/devbox/builds/longtable/longtable-phase0.apk`), seeds a
+recipe with a photo through the UI, upgrades with `adb install -r`, and
+asserts the recipe survives exactly once with content intact — recovered by
+the one-time migration in `src/store/migrateFromAutomerge.ts`. Run it with
+Appium up: `cd e2e && node proof-migration.mjs`. Env overrides: `P0_APK`,
+`APK`, `SERIAL`.
 
 ## URL-import fixture (HTTPS + test CA)
 

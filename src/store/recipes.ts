@@ -138,9 +138,14 @@ export async function createRecipe(
   // store (its guid is deterministic), so the handle itself is not needed here.
   _index: IndexHandle,
   input: RecipeInput,
+  // Optional preserved timestamps (used by the Phase 0 recovery migration so
+  // an imported recipe keeps its original created/updated times). Defaults
+  // to "now" for normal creation.
+  timestamps?: { createdAt?: string; updatedAt?: string },
 ): Promise<RecipeSummary> {
   const id = crypto.randomUUID()
-  const createdAt = nowIso()
+  const createdAt = timestamps?.createdAt ?? nowIso()
+  const updatedAt = timestamps?.updatedAt ?? createdAt
   // Fresh UUID: the document cannot already exist in IndexedDB.
   const doc = await getOrCreateDoc(repo, id)
   doc.transact(() => {
@@ -150,19 +155,19 @@ export async function createRecipe(
     map.set('steps', strArray(input.steps))
     map.set('photos', strArray(input.photos))
     map.set('createdAt', createdAt)
-    map.set('updatedAt', createdAt)
+    map.set('updatedAt', updatedAt)
     // Only set optional fields when present.
     if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
     if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
   })
 
   const url = docUrl(id)
-  const summary: RecipeSummary = { id, title: input.title, url, updatedAt: createdAt }
+  const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
   indexDoc.transact(() => {
     indexDoc
       .getMap(INDEX_MAP)
-      .set(id, entryMap({ title: input.title, url, updatedAt: createdAt }))
+      .set(id, entryMap({ title: input.title, url, updatedAt }))
   })
   return summary
 }
