@@ -12,7 +12,7 @@
  */
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
-import { registerSharedRecipe } from '../store/recipes'
+import { RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -139,7 +139,7 @@ export async function shareRecipe(
   const room = roomForRecipe(recipeId)
   await joinRoom(room, doc, signaling)
   saveShare({ recipeId, room, signaling, role: 'host' })
-  return { v: 1, room, signaling, recipeId, title }
+  return { v: 1 as const, room, signaling, recipeId, title }
 }
 
 /**
@@ -147,10 +147,26 @@ export async function shareRecipe(
  * local Y.Doc with the same guid; y-webrtc sync fills in the content.
  * Registers the recipe in the local index so it appears in the list.
  */
+/**
+ * Wait until the shared doc has content (title set) or timeout.
+ * Without this, a fast join can register the recipe in the index before its
+ * content arrives via sync — it would list but not open.
+ */
+async function waitForContent(doc: Y.Doc, timeoutMs: number): Promise<void> {
+  const map = doc.getMap(RECIPE_MAP)
+  const t0 = Date.now()
+  while (Date.now() - t0 < timeoutMs) {
+    if (typeof map.get('title') === 'string') return
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error('Timed out waiting for the shared recipe to arrive.')
+}
+
 export async function joinShare(payload: SharePayload): Promise<void> {
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, payload.recipeId)
   await joinRoom(payload.room, doc, payload.signaling)
+  await waitForContent(doc, 20000)
   await registerSharedRecipe(repo, payload.recipeId, payload.title)
   saveShare({
     recipeId: payload.recipeId,

@@ -10,7 +10,7 @@ import type {
 } from '../types'
 
 const INDEX_URL_KEY = 'longtable:recipe-index-url'
-const RECIPE_MAP = 'recipe'
+export const RECIPE_MAP = 'recipe'
 const INDEX_MAP = 'recipes'
 
 /** Minimal key/value store (localStorage in the app, in-memory in tests). */
