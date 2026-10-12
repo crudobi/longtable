@@ -78,6 +78,28 @@ const updateListeners = new Set<() => void>()
  * Subscribe to shared-doc updates. The app uses this to refresh the list and
  * the open detail view when a friend's edit arrives. Returns an unsubscribe.
  */
+/**
+ * Debug hook for e2e proof: export/import Yjs updates as base64.
+ * Used to verify CRDT merge when y-webrtc transport is unavailable
+ * (e.g. emulator NAT). Not for production use.
+ */
+export async function debugExportUpdate(recipeId: string): Promise<string> {
+  const repo = getRepo()
+  const doc = await getOrCreateDoc(repo, recipeId)
+  return u8ToBase64(Y.encodeStateAsUpdate(doc))
+}
+
+export async function debugImportUpdate(recipeId: string, b64: string): Promise<void> {
+  const repo = getRepo()
+  const doc = await getOrCreateDoc(repo, recipeId)
+  Y.applyUpdate(doc, base64ToU8(b64))
+}
+
+// Expose for WebDriver executeScript in e2e proof.
+if (typeof window !== 'undefined') {
+  ;(window as any).__ltDebug = { debugExportUpdate, debugImportUpdate }
+}
+
 export function onShareUpdate(cb: () => void): () => void {
   updateListeners.add(cb)
   return () => {
