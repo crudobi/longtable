@@ -33,6 +33,21 @@ const TURN_PASS = 'dev-turn-password'
 
 const SHARES_KEY = 'longtable:shares'
 
+/** Encode a Uint8Array as base64 (browser-safe). */
+function u8ToBase64(u8: Uint8Array): string {
+  let s = ''
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i])
+  return btoa(s)
+}
+
+/** Decode a base64 string to Uint8Array (browser-safe). */
+function base64ToU8(b64: string): Uint8Array {
+  const s = atob(b64)
+  const u8 = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i)
+  return u8
+}
+
 export interface SharePayload {
   v: 1
   /** y-webrtc room both devices join */
@@ -43,6 +58,8 @@ export interface SharePayload {
   recipeId: string
   /** human-readable, shown on the join confirmation */
   title: string
+  /** base64-encoded Yjs state update (snapshot) for instant initial sync */
+  snapshot: string
 }
 
 export interface ShareRecord {
@@ -154,13 +171,17 @@ export async function shareRecipe(
   const room = roomForRecipe(recipeId)
   await joinRoom(room, doc, signaling)
   saveShare({ recipeId, room, signaling, role: 'host' })
-  return { v: 1 as const, room, signaling, recipeId, title }
+  // Embed a snapshot so the guest gets content instantly, even if y-webrtc
+  // hasn't synced yet. y-webrtc handles live updates after the join.
+  const snapshot = u8ToBase64(Y.encodeStateAsUpdate(doc))
+  return { v: 1 as const, room, signaling, recipeId, title, snapshot }
 }
 
 /**
  * Guest side: join a share from a scanned or pasted payload. Creates the
- * local Y.Doc with the same guid; y-webrtc sync fills in the content.
- * Registers the recipe in the local index so it appears in the list.
+ * local Y.Doc with the same guid; applies the embedded snapshot for instant
+ * content, then y-webrtc handles live sync. Registers the recipe in the
+ * local index so it appears in the list.
  */
 /**
  * Wait until the shared doc has content (title set) or timeout.
@@ -180,8 +201,15 @@ async function waitForContent(doc: Y.Doc, timeoutMs: number): Promise<void> {
 export async function joinShare(payload: SharePayload): Promise<void> {
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, payload.recipeId)
+  // Apply the embedded snapshot for instant content. y-webrtc then handles
+  // live updates. Falls back to waiting for sync if no snapshot (old payloads).
+  if (payload.snapshot) {
+    Y.applyUpdate(doc, base64ToU8(payload.snapshot))
+  }
   await joinRoom(payload.room, doc, payload.signaling)
-  await waitForContent(doc, 20000)
+  if (!payload.snapshot) {
+    await waitForContent(doc, 20000)
+  }
   await registerSharedRecipe(repo, payload.recipeId, payload.title)
   saveShare({
     recipeId: payload.recipeId,
