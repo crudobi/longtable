@@ -11,9 +11,13 @@
  * reconnect after app restarts (this is also what heals a partition).
  */
 import * as Y from 'yjs'
-import { WebrtcProvider } from 'y-webrtc'
 import { getOrCreateDoc, getRepo } from '../store/repo'
 import { registerSharedRecipe } from '../store/recipes'
+
+// y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
+// don't want evaluated at app startup (and it keeps the initial bundle lean).
+// The type is imported statically for TypeScript.
+import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
 
 /**
  * Default signaling server (wss:// — the app's https://localhost WebView blocks
@@ -43,7 +47,7 @@ export interface ShareRecord {
   role: 'host' | 'guest'
 }
 
-const providers = new Map<string, WebrtcProvider>()
+const providers = new Map<string, WebrtcProviderType>()
 
 /** Callbacks fired when any shared doc updates (local or remote edit). */
 const updateListeners = new Set<() => void>()
@@ -101,7 +105,7 @@ export function getShare(recipeId: string): ShareRecord | undefined {
 
 /** Number of connected peers in a room (excluding self), 0 when not joined. */
 export function peerCount(room: string): number {
-  const p = providers.get(room)
+  const p: WebrtcProviderType | undefined = providers.get(room)
   if (!p) return 0
   return Math.max(0, p.awareness.getStates().size - 1)
 }
@@ -110,9 +114,10 @@ async function joinRoom(
   room: string,
   doc: Y.Doc,
   signaling: string,
-): Promise<WebrtcProvider> {
+): Promise<WebrtcProviderType> {
   let p = providers.get(room)
   if (!p) {
+    const { WebrtcProvider } = await import('y-webrtc')
     p = new WebrtcProvider(room, doc, { signaling: [signaling] })
     providers.set(room, p)
     doc.on('update', notifyUpdate)
