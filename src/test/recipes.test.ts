@@ -6,8 +6,7 @@
  */
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { Repo } from '@automerge/automerge-repo'
-import { IndexedDBStorageAdapter } from '@automerge/automerge-repo-storage-indexeddb'
+import { createRepo } from '../store/repo'
 import {
   createRecipe,
   deleteRecipe,
@@ -25,7 +24,7 @@ let kv: KeyValueStore
 
 const makeRepo = () => {
   dbCounter += 1
-  return new Repo({ storage: new IndexedDBStorageAdapter(`longtable-test-${dbCounter}`) })
+  return createRepo(`longtable-test-${dbCounter}`)
 }
 
 const sample = (title: string, extra: Partial<RecipeInput> = {}): RecipeInput => ({
@@ -51,7 +50,7 @@ describe('recipe store', () => {
 
     expect(summary.id).toBeTruthy()
     expect(summary.title).toBe('Pancakes')
-    expect(summary.url).toMatch(/^automerge:/)
+    expect(summary.url).toMatch(/^yjs:/)
 
     const listed = await listRecipes(index)
     expect(listed).toHaveLength(1)
@@ -114,7 +113,7 @@ describe('recipe store', () => {
 
   it('persists across repo reloads (IndexedDB round-trip)', async () => {
     const dbName = `longtable-roundtrip-${Date.now()}`
-    const repo1 = new Repo({ storage: new IndexedDBStorageAdapter(dbName) })
+    const repo1 = createRepo(dbName)
     const index1 = await getOrCreateIndex(repo1, kv)
     const summary = await createRecipe(
       repo1,
@@ -122,13 +121,13 @@ describe('recipe store', () => {
       sample('Overnight Oats', { photos: ['data:image/png;base64,AAA'] }),
     )
     await updateRecipe(repo1, index1, summary.id, { cookMinutes: 0 })
-    // Flush pending writes to IndexedDB before "reloading" (the storage
-    // adapter writes asynchronously; a real reload happens much later).
+    // Flush pending writes to IndexedDB before "reloading" (the persistence
+    // layer writes asynchronously; a real reload happens much later).
     await repo1.flush()
 
-    // Simulate a full reload: brand-new Repo over the same IndexedDB database,
-    // same persisted index URL.
-    const repo2 = new Repo({ storage: new IndexedDBStorageAdapter(dbName) })
+    // Simulate a full reload: brand-new store over the same IndexedDB
+    // namespace, same persisted index URL.
+    const repo2 = createRepo(dbName)
     const index2 = await getOrCreateIndex(repo2, kv)
 
     const listed = await listRecipes(index2)
@@ -166,5 +165,28 @@ describe('recipe store', () => {
     expect(second.url).toBe(first.url)
     await createRecipe(repo, first, sample('One'))
     expect(await listRecipes(second)).toHaveLength(1)
+  })
+
+  it('deleteRecipe wipes the doc from IndexedDB (no resurrection on reload)', async () => {
+    dbCounter += 1
+    const dbName = `longtable-delete-${dbCounter}`
+    const repo1 = createRepo(dbName)
+    const index1 = await getOrCreateIndex(repo1, kv)
+    const doomed = await createRecipe(repo1, index1, sample('Doomed'))
+    const survivor = await createRecipe(repo1, index1, sample('Survivor'))
+
+    await deleteRecipe(repo1, index1, doomed.id)
+    await repo1.flush()
+
+    // Fresh store over the same IndexedDB namespace: the deleted recipe is
+    // gone from the index AND its document data no longer loads.
+    const repo2 = createRepo(dbName)
+    const index2 = await getOrCreateIndex(repo2, kv)
+    const listed = await listRecipes(index2)
+    expect(listed.map((s) => s.id)).toEqual([survivor.id])
+    expect(await getRecipe(repo2, doomed.url)).toBeNull()
+    const kept = await getRecipe(repo2, survivor.url)
+    expect(kept!.title).toBe('Survivor')
+    expect(kept!.ingredients).toEqual(['2 cups flour', '1 tsp salt'])
   })
 })

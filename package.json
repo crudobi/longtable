@@ -1,12 +1,11 @@
 {
   "dependencies": {
-    "@automerge/automerge": "^3.5.0",
-    "@automerge/automerge-repo": "2.5.6",
-    "@automerge/automerge-repo-storage-indexeddb": "2.5.6",
     "@capacitor/android": "^7.6.9",
     "@capacitor/core": "^7.6.9",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "yjs": "13.6.33",
+    "y-indexeddb": "9.0.12"
   },
   "description": "Longtable Phase 0 — local-first recipe box. Local cookbook, no sync, no network.",
   "devDependencies": {

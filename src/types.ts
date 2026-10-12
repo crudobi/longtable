@@ -1,4 +1,4 @@
-/** Longtable Phase 0 recipe schema. One Automerge document per recipe. */
+/** Longtable recipe schema. One Y.Doc per recipe. */
 
 export interface Recipe {
   title: string
@@ -36,7 +36,7 @@ export interface RecipeSummary {
   updatedAt: string
 }
 
-/** Shape of the dedicated Automerge index document (recipe list -> doc URLs). */
+/** Shape of the dedicated Yjs index document (recipe list -> doc URLs). */
 export interface RecipeIndexDoc {
   recipes: Record<string, { title: string; url: string; updatedAt: string }>
 }

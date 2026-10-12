@@ -1,5 +1,6 @@
-import type { AutomergeUrl, DocHandle, Repo } from '@automerge/automerge-repo'
-import { getRepo } from './repo'
+import * as Y from 'yjs'
+import { INDEX_GUID, docUrl, getOrCreateDoc, getRepo, guidFromUrl } from './repo'
+import type { YjsStore } from './repo'
 import type {
   Recipe,
   RecipeIndexDoc,
@@ -9,6 +10,8 @@ import type {
 } from '../types'
 
 const INDEX_URL_KEY = 'longtable:recipe-index-url'
+const RECIPE_MAP = 'recipe'
+const INDEX_MAP = 'recipes'
 
 /** Minimal key/value store (localStorage in the app, in-memory in tests). */
 export interface KeyValueStore {
@@ -27,64 +30,141 @@ export function memoryStore(): KeyValueStore {
 }
 
 /**
- * Load the dedicated index document (recipe list -> doc URLs), creating it on
- * first run. The index URL itself is kept in the provided key/value store.
+ * Opaque handle for the recipe index document (replaces Automerge's
+ * `DocHandle<RecipeIndexDoc>`). `doc()` returns a plain-object snapshot —
+ * Yjs types never leak to callers.
  */
-export async function getOrCreateIndex(
-  repo: Repo = getRepo(),
-  kv: KeyValueStore = localStorage,
-): Promise<DocHandle<RecipeIndexDoc>> {
-  const stored = kv.getItem(INDEX_URL_KEY)
-  if (stored) {
-    return repo.find<RecipeIndexDoc>(stored as AutomergeUrl)
-  }
-  const handle = repo.create<RecipeIndexDoc>({ recipes: {} })
-  kv.setItem(INDEX_URL_KEY, handle.url)
-  return handle
+export interface IndexHandle {
+  /** Stable URL of the index document (`yjs:longtable-index`). */
+  url: string
+  doc(): Promise<RecipeIndexDoc | null>
+}
+
+interface IndexEntry {
+  title: string
+  url: string
+  updatedAt: string
 }
 
 function nowIso(): string {
   return new Date().toISOString()
 }
 
-/** Create one Automerge document for the recipe and register it in the index. */
+function strArray(items: string[]): Y.Array<string> {
+  const arr = new Y.Array<string>()
+  arr.push(items)
+  return arr
+}
+
+/**
+ * Build a nested Y.Map for an index entry. (Yjs does NOT auto-convert plain
+ * objects set as map values — they land as inert `Object`s — so the Y.Map
+ * must be constructed explicitly for the entry to be a real CRDT map.)
+ */
+function entryMap(entry: IndexEntry): Y.Map<unknown> {
+  const m = new Y.Map<unknown>()
+  m.set('title', entry.title)
+  m.set('url', entry.url)
+  m.set('updatedAt', entry.updatedAt)
+  return m
+}
+
+function toStringArray(value: unknown): string[] {
+  if (value instanceof Y.Array) {
+    return (value.toArray() as unknown[]).filter(
+      (x): x is string => typeof x === 'string',
+    )
+  }
+  return []
+}
+
+function replaceArray(map: Y.Map<any>, key: string, items: string[]): void {
+  const cur = map.get(key)
+  if (cur instanceof Y.Array) {
+    cur.delete(0, cur.length)
+    cur.push(items)
+  } else {
+    map.set(key, strArray(items))
+  }
+}
+
+function snapshotIndex(doc: Y.Doc): RecipeIndexDoc {
+  const recipes: Record<string, IndexEntry> = {}
+  doc.getMap(INDEX_MAP).forEach((raw, id) => {
+    if (raw instanceof Y.Map) {
+      const e = raw.toJSON() as IndexEntry
+      if (
+        typeof e.title === 'string' &&
+        typeof e.url === 'string' &&
+        typeof e.updatedAt === 'string'
+      ) {
+        recipes[id] = { title: e.title, url: e.url, updatedAt: e.updatedAt }
+      }
+    }
+  })
+  return { recipes }
+}
+
+/**
+ * Load the dedicated index document (recipe list -> doc URLs), creating it on
+ * first run. The index URL itself is kept in the provided key/value store.
+ */
+export async function getOrCreateIndex(
+  repo: YjsStore = getRepo(),
+  kv: KeyValueStore = localStorage,
+): Promise<IndexHandle> {
+  const url = docUrl(INDEX_GUID)
+  if (!kv.getItem(INDEX_URL_KEY)) {
+    kv.setItem(INDEX_URL_KEY, url)
+  }
+  const doc = await getOrCreateDoc(repo, INDEX_GUID)
+  return {
+    url,
+    doc: async () => snapshotIndex(doc),
+  }
+}
+
+/** Create one Y.Doc for the recipe and register it in the index. */
 export async function createRecipe(
-  repo: Repo,
-  index: DocHandle<RecipeIndexDoc>,
+  repo: YjsStore,
+  // Named for call-shape compatibility; the index doc is resolved from the
+  // store (its guid is deterministic), so the handle itself is not needed here.
+  _index: IndexHandle,
   input: RecipeInput,
 ): Promise<RecipeSummary> {
+  const id = crypto.randomUUID()
   const createdAt = nowIso()
-  const doc: Recipe = {
-    title: input.title,
-    ingredients: [...input.ingredients],
-    steps: [...input.steps],
-    photos: [...input.photos],
-    createdAt,
-    updatedAt: createdAt,
-  }
-  // Automerge rejects `undefined` values, so only set optional fields when present.
-  if (input.prepMinutes !== undefined) doc.prepMinutes = input.prepMinutes
-  if (input.cookMinutes !== undefined) doc.cookMinutes = input.cookMinutes
+  // Fresh UUID: the document cannot already exist in IndexedDB.
+  const doc = await getOrCreateDoc(repo, id)
+  doc.transact(() => {
+    const map = doc.getMap(RECIPE_MAP)
+    map.set('title', input.title)
+    map.set('ingredients', strArray(input.ingredients))
+    map.set('steps', strArray(input.steps))
+    map.set('photos', strArray(input.photos))
+    map.set('createdAt', createdAt)
+    map.set('updatedAt', createdAt)
+    // Only set optional fields when present.
+    if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
+    if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
+  })
 
-  const handle = repo.create<Recipe>(doc)
-  const id = handle.documentId
-  const summary: RecipeSummary = {
-    id,
-    title: input.title,
-    url: handle.url,
-    updatedAt: createdAt,
-  }
-  index.change((d) => {
-    d.recipes[id] = { title: input.title, url: handle.url, updatedAt: createdAt }
+  const url = docUrl(id)
+  const summary: RecipeSummary = { id, title: input.title, url, updatedAt: createdAt }
+  const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  indexDoc.transact(() => {
+    indexDoc
+      .getMap(INDEX_MAP)
+      .set(id, entryMap({ title: input.title, url, updatedAt: createdAt }))
   })
   return summary
 }
 
 /** List all recipes (newest first) from the index document. */
-export async function listRecipes(index: DocHandle<RecipeIndexDoc>): Promise<RecipeSummary[]> {
-  const doc = await index.doc()
-  if (!doc) return []
-  return Object.entries(doc.recipes)
+export async function listRecipes(index: IndexHandle): Promise<RecipeSummary[]> {
+  const snap = await index.doc()
+  if (!snap) return []
+  return Object.entries(snap.recipes)
     .map(([id, entry]) => ({
       id,
       title: entry.title,
@@ -94,79 +174,104 @@ export async function listRecipes(index: DocHandle<RecipeIndexDoc>): Promise<Rec
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
 }
 
-/** Load a full recipe document by its Automerge URL. Returns plain (unfrozen) data. */
-export async function getRecipe(repo: Repo, url: string): Promise<Recipe | null> {
-  const handle = await repo.find<Recipe>(url as AutomergeUrl)
-  const doc = await handle.doc()
-  if (!doc) return null
+/** Load a full recipe document by its `yjs:` URL. Returns a plain object. */
+export async function getRecipe(repo: YjsStore, url: string): Promise<Recipe | null> {
+  const guid = guidFromUrl(url)
+  if (!guid) return null
+  const doc = await getOrCreateDoc(repo, guid)
+  const map = doc.getMap(RECIPE_MAP)
+  const title = map.get('title')
+  // A missing title means the document holds no recipe (e.g. deleted).
+  if (typeof title !== 'string') return null
+  const createdAt = map.get('createdAt')
+  const updatedAt = map.get('updatedAt')
   return {
-    title: doc.title,
-    ingredients: [...doc.ingredients],
-    steps: [...doc.steps],
-    photos: [...doc.photos],
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-    ...(doc.prepMinutes !== undefined ? { prepMinutes: doc.prepMinutes } : {}),
-    ...(doc.cookMinutes !== undefined ? { cookMinutes: doc.cookMinutes } : {}),
+    title,
+    ingredients: toStringArray(map.get('ingredients')),
+    steps: toStringArray(map.get('steps')),
+    photos: toStringArray(map.get('photos')),
+    createdAt: typeof createdAt === 'string' ? createdAt : '',
+    updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
+    ...(map.has('prepMinutes') ? { prepMinutes: map.get('prepMinutes') as number } : {}),
+    ...(map.has('cookMinutes') ? { cookMinutes: map.get('cookMinutes') as number } : {}),
   }
 }
 
 /** Patch a recipe document and refresh its index entry. */
 export async function updateRecipe(
-  repo: Repo,
-  index: DocHandle<RecipeIndexDoc>,
+  repo: YjsStore,
+  index: IndexHandle,
   id: string,
   patch: RecipePatch,
 ): Promise<void> {
-  const idx = await index.doc()
-  const entry = idx?.recipes[id]
+  const snap = await index.doc()
+  const entry = snap?.recipes[id]
   if (!entry) throw new Error(`recipe not found: ${id}`)
 
-  const handle = await repo.find<Recipe>(entry.url as AutomergeUrl)
+  const doc = await getOrCreateDoc(repo, guidFromUrl(entry.url) ?? id)
   const updatedAt = nowIso()
-  handle.change((d) => {
-    if (patch.title !== undefined) d.title = patch.title
-    if (patch.ingredients !== undefined) d.ingredients = patch.ingredients
-    if (patch.steps !== undefined) d.steps = patch.steps
-    if (patch.photos !== undefined) d.photos = patch.photos
+  doc.transact(() => {
+    const map = doc.getMap(RECIPE_MAP)
+    if (patch.title !== undefined) map.set('title', patch.title)
+    if (patch.ingredients !== undefined) replaceArray(map, 'ingredients', patch.ingredients)
+    if (patch.steps !== undefined) replaceArray(map, 'steps', patch.steps)
+    if (patch.photos !== undefined) replaceArray(map, 'photos', patch.photos)
     // Optional fields are only touched when the patch explicitly mentions them,
     // so a partial patch never clobbers them; explicit `undefined` clears.
     if ('prepMinutes' in patch) {
       if (patch.prepMinutes === undefined) {
-        delete d.prepMinutes
+        map.delete('prepMinutes')
       } else {
-        d.prepMinutes = patch.prepMinutes
+        map.set('prepMinutes', patch.prepMinutes)
       }
     }
     if ('cookMinutes' in patch) {
       if (patch.cookMinutes === undefined) {
-        delete d.cookMinutes
+        map.delete('cookMinutes')
       } else {
-        d.cookMinutes = patch.cookMinutes
+        map.set('cookMinutes', patch.cookMinutes)
       }
     }
-    d.updatedAt = updatedAt
+    map.set('updatedAt', updatedAt)
   })
-  index.change((d) => {
-    d.recipes[id].updatedAt = updatedAt
-    if (patch.title !== undefined) d.recipes[id].title = patch.title
+  const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  indexDoc.transact(() => {
+    indexDoc.getMap(INDEX_MAP).set(
+      id,
+      entryMap({
+        title: patch.title !== undefined ? patch.title : entry.title,
+        url: entry.url,
+        updatedAt,
+      }),
+    )
   })
 }
 
 /**
- * Remove a recipe from the index and delete its Automerge document so it no
- * longer loads from storage. Other recipes are untouched.
+ * Remove a recipe from the index and wipe its Y.Doc from IndexedDB so it no
+ * longer loads. Other recipes are untouched.
  */
 export async function deleteRecipe(
-  repo: Repo,
-  index: DocHandle<RecipeIndexDoc>,
+  repo: YjsStore,
+  index: IndexHandle,
   id: string,
 ): Promise<void> {
-  const idx = await index.doc()
-  const entry = idx?.recipes[id]
+  const snap = await index.doc()
+  const entry = snap?.recipes[id]
   if (!entry) return
-  index.change((d) => {
-    delete d.recipes[id]
+  const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  indexDoc.transact(() => {
+    indexDoc.getMap(INDEX_MAP).delete(id)
   })
-  repo.delete(entry.url as AutomergeUrl)
+  const guid = guidFromUrl(entry.url)
+  if (!guid) return
+  // Ensure the doc is loaded so we hold its persistence, then destroy the
+  // persistence and delete the doc's IndexedDB database.
+  await getOrCreateDoc(repo, guid)
+  const cached = repo.docs.get(guid)
+  repo.docs.delete(guid)
+  repo.pending.delete(guid)
+  if (cached) {
+    await cached.persistence.clearData()
+  }
 }

@@ -35,8 +35,8 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Precache the entire app shell, including the Automerge WASM blob
-        // (3.6 MB — above workbox's 2 MiB default precache limit).
+        // Precache the entire app shell. (The Automerge WASM blob this
+        // limit was raised for is gone — Yjs is pure JS.)
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm,woff2}'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         navigateFallback: 'index.html',
