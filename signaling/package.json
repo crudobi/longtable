@@ -1,0 +1,1 @@
+{"bin":{"longtable-signaling":"./server.mjs"},"dependencies":{"ws":"^8.18.0"},"description":"Longtable Phase 1 WebRTC signaling server — speaks the y-webrtc signaling protocol, signaling-only (no document storage, no payload logging)","engines":{"node":">=18"},"name":"@longtable/signaling","private":true,"scripts":{"start":"node ./server.mjs"},"type":"module","version":"0.1.0"}
