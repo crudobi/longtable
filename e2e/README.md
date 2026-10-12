@@ -120,6 +120,9 @@ openssl req -newkey rsa:2048 -keyout server.key -out server.csr -nodes -subj "/C
 printf "subjectAltName=IP:10.0.2.2\n" > ext.cnf
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 825 -extfile ext.cnf
 # 2. install the CA in the emulator's USER trust store (persists in userdata.img)
+#    NOTE: do this for EVERY emulator AVD (longtable-test AND longtable-test-2) —
+#    each AVD has its own userdata.img. Missing CA = wss:// signaling silently
+#    fails (WebSocket stuck in CONNECTING), y-webrtc never discovers peers.
 H=$(openssl x509 -inform PEM -subject_hash_old -in ca.crt | head -1)
 adb -s emulator-5554 root
 adb -s emulator-5554 shell mkdir -p /data/misc/user/0/cacerts-added

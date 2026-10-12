@@ -83,6 +83,7 @@ const onConnection = conn => {
     }
     switch (msg.type) {
       case 'subscribe':
+        if (process.env.SIGNAL_DEBUG) console.log('[signal] subscribe', msg.topics);
         for (const t of msg.topics || []) {
           if (!validTopic(t)) {
             continue
@@ -109,6 +110,7 @@ const onConnection = conn => {
         }
         break
       case 'publish': {
+        if (process.env.SIGNAL_DEBUG) console.log('[signal] publish', msg.topic, 'datatype=', typeof msg.data, 'val=', JSON.stringify(msg.data).slice(0, 200));
         if (!validTopic(msg.topic)) {
           break
         }
