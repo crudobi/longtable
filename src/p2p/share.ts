@@ -25,6 +25,11 @@ import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
  * emulator as 10.0.2.2). Production: the hub's wss:// URL.
  */
 export const DEFAULT_SIGNALING_URL = 'wss://10.0.2.2:4444'
+// TURN server for NAT traversal between emulators/devices.
+// The server only relays encrypted WebRTC packets; it never sees content.
+const TURN_URL = 'turn:10.0.2.2:3478'
+const TURN_USER = 'longtable'
+const TURN_PASS = 'dev-turn-password'
 
 const SHARES_KEY = 'longtable:shares'
 
@@ -118,7 +123,17 @@ async function joinRoom(
   let p = providers.get(room)
   if (!p) {
     const { WebrtcProvider } = await import('y-webrtc')
-    p = new WebrtcProvider(room, doc, { signaling: [signaling] })
+    p = new WebrtcProvider(room, doc, {
+      signaling: [signaling],
+      peerOpts: {
+        config: {
+          iceServers: [
+            { urls: 'stun:10.0.2.2:3478' },
+            { urls: TURN_URL, username: TURN_USER, credential: TURN_PASS },
+          ],
+        },
+      },
+    })
     providers.set(room, p)
     doc.on('update', notifyUpdate)
   }
