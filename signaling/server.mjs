@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+/**
+ * Longtable WebRTC signaling server — Phase 1 P2P.
+ *
+ * Speaks the y-webrtc signaling protocol (see PROTOCOL.md): JSON-over-WebSocket
+ * subscribe/unsubscribe/publish + ping/pong, routed by topic (room name).
+ *
+ * SIGNaling ONLY:
+ *  - no document storage, no persistence (topics exist only as in-memory
+ *    subscriber sets; empty topics are dropped)
+ *  - no payload logging — publish payloads are forwarded opaquely and never
+ *    inspected (rooms with a password are end-to-end encrypted anyway)
+ *  - aggregate counters only (connections, publishes), off unless SIGNAL_STATS=1
+ *
+ * Later this becomes the hub's signaling component; the protocol stays
+ * y-webrtc-compatible so any spec-compliant client works.
+ */
+
+import { WebSocketServer } from 'ws'
+import http from 'node:http'
+
+const PORT = Number(process.env.PORT || 4444)
+const MAX_PAYLOAD = 1 << 20 // 1 MiB — signaling frames (SDP/ICE) are tiny
+const MAX_TOPIC_LEN = 256
+const PING_INTERVAL = 30000
+const STATS = process.env.SIGNAL_STATS === '1'
+
+const WS_OPEN = 1
+
+/** topic -> Set<WebSocket> */
+const topics = new Map()
+
+let statConns = 0
+let statPublishes = 0
+
+/**
+ * @param {import('ws').WebSocket} conn
+ * @param {object} msg
+ */
+const send = (conn, msg) => {
+  if (conn.readyState !== WS_OPEN) {
+    return
+  }
+  try {
+    conn.send(JSON.stringify(msg))
+  } catch {
+    try {
+      conn.close()
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/** @param {string} t */
+const validTopic = t => typeof t === 'string' && t.length > 0 && t.length <= MAX_TOPIC_LEN
+
+/**
+ * @param {import('ws').WebSocket} conn
+ */
+const onConnection = conn => {
+  /** @type {Set<string>} */
+  const subscribed = new Set()
+  let alive = true
+  statConns++
+
+  conn.on('message', raw => {
+    let msg
+    try {
+      msg = JSON.parse(raw.toString())
+    } catch {
+      return // malformed JSON: drop
+    }
+    if (msg === null || typeof msg !== 'object' || typeof msg.type !== 'string') {
+      return
+    }
+    switch (msg.type) {
+      case 'subscribe':
+        for (const t of msg.topics || []) {
+          if (!validTopic(t)) {
+            continue
+          }
+          let set = topics.get(t)
+          if (set === undefined) {
+            set = new Set()
+            topics.set(t, set)
+          }
+          set.add(conn)
+          subscribed.add(t)
+        }
+        break
+      case 'unsubscribe':
+        for (const t of msg.topics || []) {
+          const set = topics.get(t)
+          if (set !== undefined) {
+            set.delete(conn)
+            if (set.size === 0) {
+              topics.delete(t)
+            }
+          }
+          subscribed.delete(t)
+        }
+        break
+      case 'publish': {
+        if (!validTopic(msg.topic)) {
+          break
+        }
+        const receivers = topics.get(msg.topic)
+        if (receivers !== undefined && receivers.size > 0) {
+          statPublishes++
+          // Payload is forwarded opaquely — never inspected or logged.
+          // Sender echo is suppressed (clients ignore their own peerId anyway).
+          const out = { type: 'publish', topic: msg.topic, data: msg.data, clients: receivers.size }
+          for (const r of receivers) {
+            if (r !== conn) {
+              send(r, out)
+            }
+          }
+        }
+        break
+      }
+      case 'ping':
+        send(conn, { type: 'pong' })
+        break
+      // unknown types: ignore
+    }
+  })
+
+  conn.on('pong', () => {
+    alive = true
+  })
+
+  const drop = () => {
+    for (const t of subscribed) {
+      const set = topics.get(t)
+      if (set !== undefined) {
+        set.delete(conn)
+        if (set.size === 0) {
+          topics.delete(t)
+        }
+      }
+    }
+    subscribed.clear()
+  }
+  conn.on('close', drop)
+  conn.on('error', () => {})
+
+  // Dead-socket watchdog (mirrors the reference server): WS-level ping every
+  // 30s; terminate if the peer never pongs.
+  const watchdog = setInterval(() => {
+    if (!alive) {
+      clearInterval(watchdog)
+      try {
+        conn.terminate()
+      } catch {
+        /* already gone */
+      }
+      return
+    }
+    alive = false
+    try {
+      conn.ping()
+    } catch {
+      clearInterval(watchdog)
+    }
+  }, PING_INTERVAL)
+  conn.on('close', () => clearInterval(watchdog))
+}
+
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD })
+wss.on('connection', onConnection)
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    const body = JSON.stringify({ ok: true, topics: topics.size })
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(body)
+    return
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' })
+  res.end('okay')
+})
+
+server.on('upgrade', (req, socket, head) => {
+  // Auth hook point for the hub later; currently open (LAN/P2P use).
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))
+})
+
+server.listen(PORT, () => {
+  console.log(`longtable signaling server listening on :${PORT}`)
+})
+
+if (STATS) {
+  setInterval(() => {
+    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes}`)
+  }, 5000).unref()
+}
