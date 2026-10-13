@@ -3,6 +3,7 @@
     "@automerge/automerge": "3.5.0",
     "@capacitor/android": "^7.6.9",
     "@capacitor/core": "^7.6.9",
+    "libsodium-wrappers": "^0.8.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-qr-code": "^2.2.0",
@@ -13,6 +14,7 @@
   "description": "Longtable Phase 0 — local-first recipe box. Local cookbook, no sync, no network.",
   "devDependencies": {
     "@capacitor/cli": "^7.6.9",
+    "@types/libsodium-wrappers": "^0.7.14",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
