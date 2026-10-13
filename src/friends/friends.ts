@@ -108,10 +108,12 @@ export function removeFriend(
 // Invite payloads
 // ---------------------------------------------------------------------------
 
-/** Derive the stable pairId (sha256 hex) from a base64 pair secret. */
+/** Derive the stable pairId (BLAKE2b-256 hex) from a base64 pair secret. */
 export async function pairIdFor(pairSecretB64: string): Promise<string> {
   await cryptoReady()
-  return u8ToHex(sodium.crypto_hash_sha256(base64ToU8(pairSecretB64)))
+  // BLAKE2b-256 via crypto_generichash: crypto_hash_sha256 lives only in
+  // the libsodium *sumo* wrappers build; the standard build (ours) omits it.
+  return u8ToHex(sodium.crypto_generichash(32, base64ToU8(pairSecretB64)))
 }
 
 export async function createFriendInvite(

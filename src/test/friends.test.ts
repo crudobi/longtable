@@ -27,8 +27,10 @@ import {
   verifyManifest,
 } from '../friends/shelf'
 import {
+  createFriendInvite,
   getFriend,
   listFriends,
+  pairIdFor,
   parseFriendInvite,
   removeFriend,
   saveFriend,
@@ -82,6 +84,25 @@ describe('friend records + invites', () => {
     expect(getFriend(rec.did, kv)?.name).toBe('Fay')
     removeFriend(rec.did, kv)
     expect(listFriends(kv)).toHaveLength(0)
+  })
+
+  it('pairId derivation is deterministic and invite round-trips', async () => {
+    // Regression: pairIdFor must only use libsodium functions present in
+    // the standard wrappers build (crypto_hash_sha256 is sumo-only and
+    // crashed pairing on device while unit tests stayed green).
+    const secret = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    const a = await pairIdFor(secret)
+    const b = await pairIdFor(secret)
+    expect(a).toBe(b)
+    expect(a).toMatch(/^[0-9a-f]{64}$/)
+
+    const me = await identityFromSeed(seed(7))
+    const invite = await createFriendInvite(me, 'Olga')
+    const parsed = parseFriendInvite(JSON.stringify(invite))
+    expect(parsed.did).toBe(me.did)
+    expect(parsed.room).toMatch(/^longtable-pair-[0-9a-f]{16}$/)
+    // Both sides derive the same pairId from the invite's secret.
+    expect(await pairIdFor(parsed.pairSecret)).toBe(await pairIdFor(invite.pairSecret))
   })
 
   it('rejects malformed invites', () => {
