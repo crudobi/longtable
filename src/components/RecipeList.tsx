@@ -12,6 +12,8 @@ interface Props {
   onDiscover?: () => void
   /** Open the hub settings (Phase 4). */
   onHubs?: () => void
+  /** Open the developer settings (localhost API, E9). */
+  onDeveloper?: () => void
 }
 
 function formatDate(iso: string): string {
@@ -19,7 +21,7 @@ function formatDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
 }
 
-export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs }: Props) {
+export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs, onDeveloper }: Props) {
   return (
     <div className="view" data-testid="recipe-list">
       <header className="app-header">
@@ -46,6 +48,11 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport
         {onHubs && (
           <button data-testid="open-hubs" onClick={onHubs}>
             Hubs
+          </button>
+        )}
+        {onDeveloper && (
+          <button data-testid="open-developer" onClick={onDeveloper}>
+            Developer
           </button>
         )}
       </header>

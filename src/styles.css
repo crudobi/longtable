@@ -562,3 +562,28 @@ ol.edit-list {
 
 .hub-list { list-style: none; padding: 0; }
 .hub-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
+
+/* Localhost API (developer settings) */
+.localapi-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.localapi-toggle-row input[type='checkbox'] {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+.localapi-token {
+  font-family: monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
+  background: var(--cream);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  margin: 4px 0;
+}

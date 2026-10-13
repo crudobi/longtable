@@ -30,6 +30,9 @@ import { DiscoverPanel } from './components/DiscoverPanel'
 import { ImportPanel } from './components/ImportPanel'
 import { friendlyError } from './friendlyError'
 import { HubSettingsModal } from './components/HubSettingsModal'
+import { LocalApiSettingsModal } from './components/LocalApiSettingsModal'
+import { createLocalApiHost, LocalApiError } from './localapi/host'
+import { setLocalApiHost, syncLocalApiServer } from './localapi/server'
 import {
   AtprotoClient,
   loadAppViewUrl,
@@ -44,6 +47,19 @@ import {
 } from './public/publish'
 import { searchAppView } from './public/discover'
 import type { Recipe, RecipeInput, RecipeSummary, VisibilityTier } from './types'
+
+/**
+ * Thrown by applyVisibility when a recipe is asked to go public without
+ * a publishing session. The UI catches it and opens the publishing
+ * settings instead of reporting an error; the localhost API host maps
+ * it to a plain 422 (nothing is written in either case).
+ */
+class VisibilitySessionError extends Error {
+  constructor() {
+    super('publishing sign-in needed')
+    this.name = 'VisibilitySessionError'
+  }
+}
 
 type View =
   | { name: 'list' }
@@ -69,6 +85,7 @@ export default function App() {
   const [discoverOpen, setDiscoverOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [hubsOpen, setHubsOpen] = useState(false)
+  const [developerOpen, setDeveloperOpen] = useState(false)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detailIdRef = useRef<string | null>(null)
 
@@ -176,7 +193,13 @@ export default function App() {
     [refresh, openDetail],
   )
 
-  const handleUpdate = useCallback(
+  /**
+   * The content-update flow itself, without UI navigation: store update
+   * plus the two republishes (friends-only share, public record). Used
+   * by the edit form AND the localhost API, so an API update takes
+   * exactly the UI's path.
+   */
+  const applyRecipeUpdate = useCallback(
     async (id: string, input: RecipeInput) => {
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
@@ -215,40 +238,56 @@ export default function App() {
           console.warn('public republish failed', e)
         }
       }
+    },
+    [],
+  )
+
+  const handleUpdate = useCallback(
+    async (id: string, input: RecipeInput) => {
+      await applyRecipeUpdate(id, input)
       await refresh()
       await openDetail(id)
     },
-    [refresh, openDetail],
+    [applyRecipeUpdate, refresh, openDetail],
   )
+
+  /**
+   * The delete flow itself, without the confirmation prompt or UI
+   * navigation: strip friends-only shares, remove the public record,
+   * then delete locally. Used by the detail view AND the localhost API.
+   */
+  const performDelete = useCallback(async (id: string) => {
+    // Strip friends-only shares of this recipe from friends' channels.
+    const idn = identityRef.current
+    if (idn) {
+      await unshareRecipeEverywhere(id, idn).catch((e) =>
+        console.warn('unshare failed', e),
+      )
+    }
+    // If it was published publicly, remove the ATProto record first.
+    if (getPublication(id)) {
+      const session = loadSession()
+      if (session) {
+        await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
+          (e) => console.warn('unpublish failed', e),
+        )
+      }
+    }
+    const repo = getRepo()
+    const index = await getOrCreateIndex(repo)
+    await deleteRecipe(repo, index, id)
+  }, [])
 
   const handleDelete = useCallback(
     async (id: string) => {
       const summary = summaries.find((s) => s.id === id)
       const name = summary?.title || 'this recipe'
       if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return
-      // Strip friends-only shares of this recipe from friends' channels.
-      const idn = identityRef.current
-      if (idn) {
-        await unshareRecipeEverywhere(id, idn).catch((e) =>
-          console.warn('unshare failed', e),
-        )
-      }
-      // If it was published publicly, remove the ATProto record first.
-      if (getPublication(id)) {
-        const session = loadSession()
-        if (session) {
-          await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
-            (e) => console.warn('unpublish failed', e),
-          )
-        }
-      }
-      const repo = getRepo()
-      const index = await getOrCreateIndex(repo)
-      await deleteRecipe(repo, index, id)
+      await performDelete(id)
       await refresh()
       setView({ name: 'list' })
     },
-    [summaries, refresh],
+    [summaries, performDelete, refresh],
   )
 
   const loadRecipeById = useCallback(async (id: string): Promise<Recipe | null> => {
@@ -261,72 +300,90 @@ export default function App() {
 
   /**
    * Visibility switching — the real byte movement between tiers:
-   *   → public:      requires an ATProto session (no session → open the
-   *                  publishing settings and abort, tier unchanged);
-   *                  ensure the pubkey binding, publish the signed record
-   *                  to the PDS, only then mark the recipe 'public'.
+   *   → public:      requires an ATProto session (no session →
+   *                  VisibilitySessionError; the UI wrapper opens the
+   *                  publishing settings, the localhost API answers a
+   *                  plain 422 — tier unchanged either way); ensure the
+   *                  pubkey binding, publish the signed record to the
+   *                  PDS, only then mark the recipe 'public'.
    *   → private:     unpublish the ATProto record first (if any); strip
    *                  friends-only shares everywhere (if friends-only);
    *                  then mark 'private'.
    *   → friends-only: unpublish the ATProto record first (if any); mark
-   *                  'friends-only'; open the friend picker (the existing
-   *                  friendShareId flow does the encrypted publishing).
+   *                  'friends-only'. (Choosing friends and publishing
+   *                  the encrypted shares is the friend picker's job —
+   *                  the UI wrapper opens it after this runs.)
+   * Shared by the detail view and the localhost API host.
    */
+  const applyVisibility = useCallback(
+    async (id: string, recipe: Recipe, tier: VisibilityTier) => {
+      const repo = getRepo()
+      const index = await getOrCreateIndex(repo)
+      const idn = identityRef.current
+      const publication = getPublication(id)
+      const unpublishIfNeeded = async () => {
+        if (!publication) return
+        const session = loadSession()
+        if (!session) return
+        const client = new AtprotoClient(session.pdsUrl, {
+          onSessionRefresh: (s) => saveSession(s),
+        })
+        await unpublishRecipe(client, session, id)
+      }
+
+      if (tier === 'public') {
+        const session = loadSession()
+        if (!session || !idn) throw new VisibilitySessionError()
+        const client = new AtprotoClient(session.pdsUrl, {
+          onSessionRefresh: (s) => saveSession(s),
+        })
+        await ensurePubkeyBinding(client, session, idn)
+        await publishRecipe(client, session, idn, { ...recipe, id })
+        await updateRecipe(repo, index, id, { visibility: 'public' })
+      } else if (tier === 'private') {
+        await unpublishIfNeeded()
+        if (recipe.visibility === 'friends-only' && idn) {
+          await unshareRecipeEverywhere(id, idn)
+        }
+        await updateRecipe(repo, index, id, { visibility: 'private' })
+      } else {
+        await unpublishIfNeeded()
+        await updateRecipe(repo, index, id, { visibility: 'friends-only' })
+      }
+    },
+    [],
+  )
+
   const handleSetVisibility = useCallback(
     async (id: string, recipe: Recipe, tier: VisibilityTier) => {
       try {
         setError(null)
-        const repo = getRepo()
-        const index = await getOrCreateIndex(repo)
-        const idn = identityRef.current
-        const publication = getPublication(id)
-        const unpublishIfNeeded = async () => {
-          if (!publication) return
-          const session = loadSession()
-          if (!session) return
-          const client = new AtprotoClient(session.pdsUrl, {
-            onSessionRefresh: (s) => saveSession(s),
-          })
-          await unpublishRecipe(client, session, id)
-        }
-
-        if (tier === 'public') {
-          const session = loadSession()
-          if (!session || !idn) {
-            setPublishSettingsOpen(true)
-            return
-          }
-          const client = new AtprotoClient(session.pdsUrl, {
-            onSessionRefresh: (s) => saveSession(s),
-          })
-          await ensurePubkeyBinding(client, session, idn)
-          await publishRecipe(client, session, idn, { ...recipe, id })
-          await updateRecipe(repo, index, id, { visibility: 'public' })
-        } else if (tier === 'private') {
-          await unpublishIfNeeded()
-          if (recipe.visibility === 'friends-only' && idn) {
-            await unshareRecipeEverywhere(id, idn)
-          }
-          await updateRecipe(repo, index, id, { visibility: 'private' })
-        } else {
-          await unpublishIfNeeded()
-          await updateRecipe(repo, index, id, { visibility: 'friends-only' })
-          await refresh()
-          await openDetail(id)
-          setFriendShareId(id)
-          return
-        }
+        await applyVisibility(id, recipe, tier)
         await refresh()
         await openDetail(id)
+        if (tier === 'friends-only') setFriendShareId(id)
       } catch (e) {
+        if (e instanceof VisibilitySessionError) {
+          setPublishSettingsOpen(true)
+          return
+        }
         setError(friendlyError(e, 'the publishing server'))
       }
     },
-    [refresh, openDetail],
+    [applyVisibility, refresh, openDetail],
   )
 
   const handleSetVisibilityRef = useRef(handleSetVisibility)
   handleSetVisibilityRef.current = handleSetVisibility
+
+  // Refs to the extracted flows, for the localhost API host below (the
+  // host is configured once, the refs keep it on the latest callbacks).
+  const applyRecipeUpdateRef = useRef(applyRecipeUpdate)
+  applyRecipeUpdateRef.current = applyRecipeUpdate
+  const performDeleteRef = useRef(performDelete)
+  performDeleteRef.current = performDelete
+  const applyVisibilityRef = useRef(applyVisibility)
+  applyVisibilityRef.current = applyVisibility
 
   // Phase 3 debug hooks (e2e proof): window.__ltPublic, installed when the
   // device identity lands — same pattern as installFriendsDebugHooks.
@@ -362,6 +419,45 @@ export default function App() {
         searchAppView(loadAppViewUrl(), { q, ingredients }),
     }
   }, [identity, loadRecipeById])
+
+  // Localhost API (E9): register the host the API router executes
+  // against — wired to the very flows the UI uses, so an API write
+  // republishes/unpublishes/unshares exactly like an in-app one — and
+  // start the loopback server if the user enabled it in Developer
+  // settings. Runs when the identity lands; the server then lives and
+  // dies with the app process.
+  useEffect(() => {
+    if (!identity) return
+    setLocalApiHost(
+      createLocalApiHost({
+        applyUpdate: (id, input) => applyRecipeUpdateRef.current(id, input),
+        applyDelete: (id) => performDeleteRef.current(id),
+        applyVisibility: async (id, recipe, tier) => {
+          try {
+            await applyVisibilityRef.current(id, recipe, tier)
+          } catch (e) {
+            if (e instanceof VisibilitySessionError) {
+              throw new LocalApiError(
+                422,
+                "That recipe can't be made public yet: no publishing " +
+                  'account is signed in on this device. Sign in under ' +
+                  'Publishing in the app first.',
+              )
+            }
+            throw e
+          }
+        },
+        canPublish: () => loadSession() != null,
+        getIdentityDid: async () => identityRef.current?.did ?? null,
+        onChanged: () => {
+          void refresh()
+        },
+      }),
+    )
+    void syncLocalApiServer().catch((e) =>
+      console.warn('localhost API start failed', e),
+    )
+  }, [identity, refresh])
 
   /**
    * Bulk import (Import panel): recipes arrive fully validated by the
@@ -431,6 +527,7 @@ export default function App() {
           onImport={() => setImportOpen(true)}
           onDiscover={() => setDiscoverOpen(true)}
           onHubs={() => setHubsOpen(true)}
+          onDeveloper={() => setDeveloperOpen(true)}
         />
       )}
       {view.name === 'detail' && current && (
@@ -505,6 +602,9 @@ export default function App() {
           onClose={() => setHubsOpen(false)}
           onChanged={() => void handleHubsChanged()}
         />
+      )}
+      {developerOpen && (
+        <LocalApiSettingsModal onClose={() => setDeveloperOpen(false)} />
       )}
       {friendShareId && identity && (
         <FriendShareModal
