@@ -33,6 +33,12 @@ const TURN_PASS = 'dev-turn-password'
 
 const SHARES_KEY = 'longtable:shares'
 
+/** ICE servers shared by every WebRTC provider (recipe shares, friends). */
+export const ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:10.0.2.2:3478' },
+  { urls: TURN_URL, username: TURN_USER, credential: TURN_PASS },
+]
+
 /** Encode a Uint8Array as base64 (browser-safe). */
 function u8ToBase64(u8: Uint8Array): string {
   let s = ''
@@ -149,10 +155,7 @@ async function joinRoom(
       signaling: [signaling],
       peerOpts: {
         config: {
-          iceServers: [
-            { urls: 'stun:10.0.2.2:3478' },
-            { urls: TURN_URL, username: TURN_USER, credential: TURN_PASS },
-          ],
+          iceServers: ICE_SERVERS,
         },
       },
     })
