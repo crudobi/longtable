@@ -13,6 +13,7 @@
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
 import { RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
+import { getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -20,9 +21,9 @@ import { RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
 
 /**
- * Default signaling server (wss:// — the app's https://localhost WebView blocks
- * insecure ws://). Phase 1 dev points at devbox (reachable from the
- * emulator as 10.0.2.2). Production: the hub's wss:// URL.
+ * The built-in default hub's signaling URL (kept for compatibility).
+ * New code resolves endpoints from the hub registry instead:
+ * `getActiveHub().signalingUrl`, `getIceServers()`, `getSignalingUrls()`.
  */
 export const DEFAULT_SIGNALING_URL = 'wss://10.0.2.2:4444'
 // TURN server for NAT traversal between emulators/devices.
@@ -33,7 +34,8 @@ const TURN_PASS = 'dev-turn-password'
 
 const SHARES_KEY = 'longtable:shares'
 
-/** ICE servers shared by every WebRTC provider (recipe shares, friends). */
+/** ICE servers for the built-in default hub (compat export; live code uses
+ * `getIceServers()` from the hub registry so the ACTIVE hub supplies TURN). */
 export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:10.0.2.2:3478' },
   { urls: TURN_URL, username: TURN_USER, credential: TURN_PASS },
@@ -152,10 +154,12 @@ async function joinRoom(
   if (!p) {
     const { WebrtcProvider } = await import('y-webrtc')
     p = new WebrtcProvider(room, doc, {
-      signaling: [signaling],
+      // Rendezvous list: this share's signaling first, then every hub in
+      // the registry — peers find each other on ANY live hub (Phase 4).
+      signaling: getSignalingUrls(signaling),
       peerOpts: {
         config: {
-          iceServers: ICE_SERVERS,
+          iceServers: getIceServers(),
         },
       },
     })
@@ -166,13 +170,29 @@ async function joinRoom(
 }
 
 /**
+ * Destroy every share provider (hub switch): the next join/rejoin rebuilds
+ * providers against the new active hub's endpoints. Docs and share records
+ * are untouched — switching hubs loses nothing.
+ */
+export function destroyAllShareProviders(): void {
+  for (const p of providers.values()) {
+    try {
+      p.destroy()
+    } catch {
+      /* already gone */
+    }
+  }
+  providers.clear()
+}
+
+/**
  * Host side: start sharing one of my recipes. Idempotent — calling twice
  * returns the same room. The returned payload is what goes in the QR code.
  */
 export async function shareRecipe(
   recipeId: string,
   title: string,
-  signaling: string = DEFAULT_SIGNALING_URL,
+  signaling: string = getActiveHub().signalingUrl,
 ): Promise<SharePayload> {
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, recipeId)

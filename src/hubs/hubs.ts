@@ -60,6 +60,27 @@ interface HubRegistry {
   activeId: string
 }
 
+/**
+ * The default store: localStorage where it exists (the app), else a
+ * process-local memory map (unit tests run under node, where touching
+ * `localStorage` throws). Endpoint resolution must never crash a caller
+ * that only wanted the default hub.
+ */
+const memoryFallback = new Map<string, string>()
+export function defaultKv(): KeyValueStore {
+  try {
+    if (typeof localStorage !== 'undefined') return localStorage
+  } catch {
+    /* fall through */
+  }
+  return {
+    getItem: (k) => (memoryFallback.has(k) ? memoryFallback.get(k)! : null),
+    setItem: (k, v) => {
+      memoryFallback.set(k, v)
+    },
+  }
+}
+
 function isHubConfig(o: unknown): o is HubConfig {
   if (typeof o !== 'object' || o === null) return false
   const h = o as Record<string, unknown>
@@ -105,19 +126,19 @@ function saveRegistry(reg: HubRegistry, kv: KeyValueStore): void {
 }
 
 /** All configured hubs, active hub first. */
-export function listHubs(kv: KeyValueStore = localStorage): HubConfig[] {
+export function listHubs(kv: KeyValueStore = defaultKv()): HubConfig[] {
   const reg = loadRegistry(kv)
   const active = reg.hubs.find((h) => h.id === reg.activeId) ?? reg.hubs[0]
   return [active, ...reg.hubs.filter((h) => h.id !== active.id)]
 }
 
 /** The currently selected hub. */
-export function getActiveHub(kv: KeyValueStore = localStorage): HubConfig {
+export function getActiveHub(kv: KeyValueStore = defaultKv()): HubConfig {
   return listHubs(kv)[0]
 }
 
 /** Select a hub by id. Purely an endpoint change — no data moves. */
-export function setActiveHub(id: string, kv: KeyValueStore = localStorage): HubConfig {
+export function setActiveHub(id: string, kv: KeyValueStore = defaultKv()): HubConfig {
   const reg = loadRegistry(kv)
   const hub = reg.hubs.find((h) => h.id === id)
   if (!hub) throw new Error(`unknown hub: ${id}`)
@@ -131,7 +152,7 @@ let idCounter = 0
 /** Add a hub; returns it (with its generated id). Does not activate it. */
 export function addHub(
   input: Omit<HubConfig, 'id'> & { id?: string },
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = defaultKv(),
 ): HubConfig {
   const reg = loadRegistry(kv)
   const id =
@@ -149,7 +170,7 @@ export function addHub(
 export function updateHub(
   id: string,
   patch: Partial<Omit<HubConfig, 'id'>>,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = defaultKv(),
 ): HubConfig {
   const reg = loadRegistry(kv)
   const i = reg.hubs.findIndex((h) => h.id === id)
@@ -166,7 +187,7 @@ export function updateHub(
  * The built-in default hub can be removed like any other once another hub
  * exists — a hub is just endpoints; nothing else references it.
  */
-export function removeHub(id: string, kv: KeyValueStore = localStorage): void {
+export function removeHub(id: string, kv: KeyValueStore = defaultKv()): void {
   const reg = loadRegistry(kv)
   if (reg.hubs.length <= 1) throw new Error('cannot remove the last hub')
   reg.hubs = reg.hubs.filter((h) => h.id !== id)
@@ -198,7 +219,7 @@ export function getIceServers(
  */
 export function getSignalingUrls(
   primary?: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = defaultKv(),
 ): string[] {
   const urls: string[] = []
   const push = (u?: string) => {

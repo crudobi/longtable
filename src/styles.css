@@ -515,3 +515,6 @@ ol.edit-list {
 .recipe-card .recipe-card-meta {
   display: block;
 }
+
+.hub-list { list-style: none; padding: 0; }
+.hub-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.5rem 0; border-bottom: 1px solid #ddd; }

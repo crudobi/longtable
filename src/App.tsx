@@ -13,10 +13,10 @@ import { RecipeDetail } from './components/RecipeDetail'
 import { RecipeForm } from './components/RecipeForm'
 import { ShareModal } from './components/ShareModal'
 import { JoinModal } from './components/JoinModal'
-import { onShareUpdate, rejoinShares, shareRecipe } from './p2p/share'
+import { destroyAllShareProviders, onShareUpdate, rejoinShares, shareRecipe } from './p2p/share'
 import type { SharePayload } from './p2p/share'
 import { getOrCreateIdentity, type Identity } from './identity/identity'
-import { onChannelUpdate, rejoinFriendChannels } from './friends/friends'
+import { disconnectAllFriendChannels, onChannelUpdate, rejoinFriendChannels } from './friends/friends'
 import {
   importReceivedShares,
   installFriendsDebugHooks,
@@ -27,6 +27,7 @@ import { FriendsPanel } from './components/FriendsPanel'
 import { FriendShareModal } from './components/FriendShareModal'
 import { PublishSettingsModal } from './components/PublishSettingsModal'
 import { DiscoverPanel } from './components/DiscoverPanel'
+import { HubSettingsModal } from './components/HubSettingsModal'
 import {
   AtprotoClient,
   loadAppViewUrl,
@@ -64,6 +65,7 @@ export default function App() {
   const [friendShareId, setFriendShareId] = useState<string | null>(null)
   const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
   const [discoverOpen, setDiscoverOpen] = useState(false)
+  const [hubsOpen, setHubsOpen] = useState(false)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detailIdRef = useRef<string | null>(null)
 
@@ -368,6 +370,21 @@ export default function App() {
     }
   }, [summaries])
 
+  /**
+   * Hub list/active hub changed (Phase 4): rebuild every network provider
+   * against the new endpoints. Providers are the ONLY thing rebuilt — docs,
+   * share records, friends, and identity are hub-independent, so the switch
+   * loses nothing.
+   */
+  const handleHubsChanged = useCallback(async () => {
+    destroyAllShareProviders()
+    disconnectAllFriendChannels()
+    await rejoinShares().catch((e) => console.warn('rejoin shares after hub change failed', e))
+    await rejoinFriendChannels().catch((e) =>
+      console.warn('rejoin friend channels after hub change failed', e),
+    )
+  }, [])
+
   const handleJoined = useCallback(async () => {
     setJoinOpen(false)
     await refresh()
@@ -392,6 +409,7 @@ export default function App() {
           onJoin={() => setJoinOpen(true)}
           onFriends={() => setFriendsOpen(true)}
           onDiscover={() => setDiscoverOpen(true)}
+          onHubs={() => setHubsOpen(true)}
         />
       )}
       {view.name === 'detail' && current && (
@@ -453,6 +471,12 @@ export default function App() {
         <DiscoverPanel
           onClose={() => setDiscoverOpen(false)}
           onSaveCopy={handleCreate}
+        />
+      )}
+      {hubsOpen && (
+        <HubSettingsModal
+          onClose={() => setHubsOpen(false)}
+          onChanged={() => void handleHubsChanged()}
         />
       )}
       {friendShareId && identity && (

@@ -14,6 +14,7 @@
  * into the optional onSessionRefresh callback so callers can persist them.
  */
 import type { KeyValueStore } from '../identity/identity'
+import { getActiveHub, updateHub } from '../hubs/hubs'
 
 export const SESSION_KEY = 'longtable:atproto-session'
 export const PUBLICATIONS_KEY = 'longtable:publications:v1'
@@ -111,14 +112,25 @@ export function clearSession(kv: PublicKv = localStorage): void {
 
 export function loadAppViewUrl(kv: PublicKv = localStorage): string {
   try {
-    return kv.getItem(APPVIEW_URL_KEY) || DEFAULT_APPVIEW_URL
+    // An explicitly saved URL (the Discover settings field) wins; otherwise
+    // the active hub supplies the AppView endpoint (Phase 4 multi-hub).
+    return kv.getItem(APPVIEW_URL_KEY) || getActiveHub().appviewUrl || DEFAULT_APPVIEW_URL
   } catch {
     return DEFAULT_APPVIEW_URL
   }
 }
 
 export function saveAppViewUrl(url: string, kv: PublicKv = localStorage): void {
-  kv.setItem(APPVIEW_URL_KEY, trimSlash(url))
+  const clean = trimSlash(url)
+  kv.setItem(APPVIEW_URL_KEY, clean)
+  // Keep the active hub in sync so the hub list shows where discovery
+  // actually points. Best-effort: a registry write failure must not break
+  // the explicit save above.
+  try {
+    updateHub(getActiveHub(kv).id, { appviewUrl: clean }, kv)
+  } catch {
+    /* registry unavailable — the explicit key still applies */
+  }
 }
 
 // ---------------------------------------------------------------------------

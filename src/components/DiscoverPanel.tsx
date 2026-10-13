@@ -14,6 +14,7 @@ import {
   type PublicRecipe,
   type PublicSearchResult,
 } from '../public/discover'
+import { getActiveHub } from '../hubs/hubs'
 
 interface DiscoverProps {
   onClose: () => void
@@ -173,7 +174,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
     // Photos live as blobs on the author's PDS. On the local testnet that
     // is the same PDS the settings point at; fall back to the canonical
     // local testnet address when this device has never signed in.
-    const pdsUrl = loadSession()?.pdsUrl || 'http://localhost:2583'
+    const pdsUrl = loadSession()?.pdsUrl || getActiveHub().pdsUrl
     const client = new AtprotoClient(pdsUrl)
     const input = await publicRecordToInput(rec, async (cid, blob) => {
       const buf = await client.getBlob(rec.did, cid)

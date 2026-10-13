@@ -26,7 +26,7 @@ import {
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, u8ToHex, utf8ToU8 } from '../identity/codec'
 import { getOrCreateDoc, getRepo, type YjsStore } from '../store/repo'
-import { DEFAULT_SIGNALING_URL, ICE_SERVERS } from '../p2p/share'
+import { getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
 
 const FRIENDS_KEY = 'longtable:friends'
@@ -119,7 +119,7 @@ export async function pairIdFor(pairSecretB64: string): Promise<string> {
 export async function createFriendInvite(
   identity: Identity,
   name: string,
-  signaling: string = DEFAULT_SIGNALING_URL,
+  signaling: string = getActiveHub().signalingUrl,
 ): Promise<FriendInvitePayload> {
   await cryptoReady()
   const room = `longtable-pair-${u8ToHex(sodium.randombytes_buf(8))}`
@@ -180,8 +180,10 @@ async function connectEphemeral(
 ): Promise<WebrtcProviderType> {
   const { WebrtcProvider } = await import('y-webrtc')
   return new WebrtcProvider(room, doc, {
-    signaling: [signaling],
-    peerOpts: { config: { iceServers: ICE_SERVERS } },
+    // Rendezvous on the invite's signaling AND every configured hub, so
+    // pairing succeeds as long as both sides share one live hub (Phase 4).
+    signaling: getSignalingUrls(signaling),
+    peerOpts: { config: { iceServers: getIceServers() } },
   })
 }
 
@@ -311,9 +313,11 @@ export async function joinFriendChannel(
   if (!channelProviders.has(friend.did)) {
     const { WebrtcProvider } = await import('y-webrtc')
     const provider = new WebrtcProvider(channelRoomFor(friend), doc, {
-      signaling: [friend.signaling],
+      // The friend's recorded signaling first, then every configured hub:
+      // the channel re-rendezvous on any live hub after a hub death.
+      signaling: getSignalingUrls(friend.signaling),
       password: friend.pairSecret,
-      peerOpts: { config: { iceServers: ICE_SERVERS } },
+      peerOpts: { config: { iceServers: getIceServers() } },
     })
     channelProviders.set(friend.did, provider)
   }
@@ -334,6 +338,16 @@ export function disconnectFriendChannel(friendDid: string): void {
   if (provider) {
     provider.destroy()
     channelProviders.delete(friendDid)
+  }
+}
+
+/**
+ * Destroy every friend-channel provider (hub switch). Channels rejoin via
+ * rejoinFriendChannels against the new hub's endpoints. Local data is kept.
+ */
+export function disconnectAllFriendChannels(): void {
+  for (const did of [...channelProviders.keys()]) {
+    disconnectFriendChannel(did)
   }
 }
 
