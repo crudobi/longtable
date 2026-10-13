@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "kitchen.longtable.pubkey",
+  "description": "Binds a Longtable device identity (did:key, Ed25519) to the account's ATProto DID. The signature is produced by the device key over 'longtable-pubkey:v1' + account DID + device DID + device public key, so the binding is verifiable from either side.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": [
+          "deviceDid",
+          "devicePublicKey",
+          "signature",
+          "createdAt"
+        ],
+        "properties": {
+          "deviceDid": {
+            "type": "string",
+            "format": "did"
+          },
+          "devicePublicKey": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "signature": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

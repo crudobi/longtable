@@ -1,0 +1,101 @@
+{
+  "lexicon": 1,
+  "id": "kitchen.longtable.recipe",
+  "description": "A public Longtable recipe. Schema.org-Recipe-shaped. Authorship is proven by the ATProto repo commit signature; deviceSignature additionally binds the record to the author's Longtable device key (see kitchen.longtable.pubkey).",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "name",
+          "ingredients",
+          "instructions",
+          "createdAt",
+          "longtableId"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 300,
+            "maxGraphemes": 128
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 3000
+          },
+          "ingredients": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "maxLength": 100
+          },
+          "instructions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 5000
+            },
+            "maxLength": 200
+          },
+          "prepTimeMinutes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10080
+          },
+          "cookTimeMinutes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10080
+          },
+          "recipeYield": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 20
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "blob",
+              "accept": [
+                "image/*"
+              ],
+              "maxSize": 2000000
+            },
+            "maxLength": 10
+          },
+          "deviceDid": {
+            "type": "string",
+            "format": "did"
+          },
+          "deviceSignature": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "datetime"
+          },
+          "longtableId": {
+            "type": "string",
+            "maxLength": 64
+          }
+        }
+      }
+    }
+  }
+}
