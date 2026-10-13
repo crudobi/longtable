@@ -113,7 +113,7 @@ export async function pairIdFor(pairSecretB64: string): Promise<string> {
   await cryptoReady()
   // BLAKE2b-256 via crypto_generichash: crypto_hash_sha256 lives only in
   // the libsodium *sumo* wrappers build; the standard build (ours) omits it.
-  return u8ToHex(sodium.crypto_generichash(32, base64ToU8(pairSecretB64)))
+  return u8ToHex(sodium.crypto_generichash(32, base64ToU8(pairSecretB64), null))
 }
 
 export async function createFriendInvite(
