@@ -1,10 +1,26 @@
-# Longtable — Phase 0: Local cookbook
+# Longtable — local-first, peer-to-peer recipes
 
 Longtable is a local-first P2P recipe-sharing app: your recipes live on your
-device, and you share them directly with friends — no platform account, no
-cloud service in the middle. Phase 0 is the local cookbook only: **no sync,
-no network**. Everything runs on-device; recipes live in Automerge documents
-in IndexedDB.
+devices, friends are the sync network, and public recipes are DID-signed
+records anyone can verify. No platform account, no cloud service in the
+middle, no telemetry.
+
+What works today:
+
+- **Cookbook** — create/edit/delete recipes with photos, fully offline.
+  One Yjs document per recipe in IndexedDB.
+- **Sharing** — one-off recipe rooms over WebRTC (QR/paste), with
+  concurrent edits merging losslessly.
+- **Friends** — pairing by invite code (device DIDs, no accounts),
+  friends-only recipes end-to-end encrypted per friend, with key
+  rotation on unfriend (forward-only: delivered copies stay readable —
+  the app says so, in those words, where you unfriend).
+- **Public publishing** — recipes marked public become signed
+  `kitchen.longtable.recipe` ATProto records on your own PDS, searchable
+  by name and ingredients through any hub's AppView within seconds.
+- **Hubs** — rendezvous/indexing only, never trusted with content.
+  One tarball, one config, one command to run one; clients keep a hub
+  list and lose nothing when a hub dies or is switched.
 
 ## Core principles
 
@@ -14,41 +30,60 @@ in IndexedDB.
   The design keeps hub operating cost near-zero so "free forever" is
   credible.
 - **Deliberately easy to use but modular and developer-extensible.**
-  Zero-setup local mode (no identity needed until you publish/share), module
-  boundaries at storage adapter, transport adapter, identity provider and
-  importers, plus a localhost API for scripting and integration.
+  Zero-setup local mode (no identity needed until you publish/share),
+  clean module boundaries (storage / sync / identity / friends /
+  publishing / hubs / importers), a versioned importer plugin API, and a
+  documented public protocol third parties can build against.
 - **Anti-centralization built into the functionality, not just policy.**
-  Anyone can run a hub (single binary); clients support multiple hubs and
-  hub switching with zero data loss; the app works hub-less (local-only +
-  manual pairing); custom TURN servers; portable DIDs, no platform account;
-  no telemetry / phone-home; public lexicon schemas and a documented sync
-  protocol so third-party clients are first-class.
+  Anyone can run a hub; clients support multiple hubs and switch with
+  zero data loss; the app works hub-less; portable DIDs; public lexicon
+  schemas + a documented protocol so third-party clients are first-class.
+
+## For developers
+
+- [docs/](docs/README.md) — the developer documentation index.
+- [docs/architecture.md](docs/architecture.md) — the module map: every
+  subsystem, its public interface, and its boundary rule.
+- [docs/importers.md](docs/importers.md) — write an importer (Importer
+  API v1); drop it in `src/importers/plugins/` and the app offers it.
+- [docs/public-protocol.md](docs/public-protocol.md) — the public
+  recipe protocol: lexicons, both signature schemes, the AppView API,
+  and the third-party read/verify flow.
+- [examples/third-party-client/](examples/third-party-client/) — a
+  runnable third-party client (official ATProto libraries only).
+- [examples/importers/markdown/](examples/importers/markdown/) — a
+  complete importer written from the docs alone (clean-room proof),
+  also shipped as a built-in drop-in plugin.
 
 ## Stack
 
-- Vite + React + TypeScript
-- PWA via `vite-plugin-pwa` (`generateSW`, precache everything,
-  `navigateFallback: index.html`)
-- Automerge: `@automerge/automerge` + `@automerge/automerge-repo` +
-  `@automerge/automerge-repo-storage-indexeddb`
+- Vite + React + TypeScript; PWA via `vite-plugin-pwa`
+- Yjs (`yjs` + `y-indexeddb` + `y-webrtc`): one doc per recipe
+- Identity/crypto: libsodium (Ed25519 device keys, `did:key`)
+- Public layer: ATProto (custom lexicons in `lexicons/`), hub AppView
+  (Node + SQLite FTS5)
 - Android wrapper: Capacitor 7 (app id `kitchen.longtable.app`)
-- Tests: vitest
+- Tests: vitest + an Appium device gate and oath proofs in `e2e/`
 
 ## Data model
 
-One Automerge document per recipe, persisted to IndexedDB. A dedicated
-`recipe-index` Automerge document maps the recipe list to doc URLs (its URL is
-kept in `localStorage` under `longtable:recipe-index-url`).
-
-Recipe schema: `title`, `ingredients[]`, `steps[]`, optional
-`prepMinutes`/`cookMinutes`, `photos[]` (data URLs), `createdAt`, `updatedAt`.
+One Yjs document per recipe, persisted to IndexedDB, plus one index
+document mapping the recipe list to doc URLs. Recipe schema: `title`,
+`ingredients[]`, `steps[]`, optional `prepMinutes`/`cookMinutes`,
+`photos[]` (data URLs), optional `visibility`
+(`private` | `friends-only` | `public`), `createdAt`, `updatedAt`.
+Visibility is enforced by where the bytes go — see
+[docs/architecture.md](docs/architecture.md).
 
 ## Network policy
 
-The app makes **zero** network requests of its own: no CDN fonts, no
-analytics, no external assets — everything is bundled. The single exception
-is the URL importer (`src/importers/urlImport.ts`, the app's only `fetch()`),
-which is strictly user-initiated and clearly labeled in the UI.
+No analytics, no telemetry, no phone-home, no CDN assets — everything is
+bundled, and local cooking works with the network off. The app contacts
+the network only for things the user asked for: fetching a page in the
+URL importer, sync/publishing via the user's configured hubs and PDS,
+and discovery search. This is audited, not just asserted:
+`e2e/telemetry-audit.sh` packet-captures a full session and fails on any
+unexpected endpoint.
 
 ## Develop
 
@@ -84,40 +119,41 @@ once to create `capacitor.config.ts`; `npx cap add android` generated
 `android/`. The first `./gradlew` run downloads its distribution (Gradle
 8.11.1) and the SDK Platform 35 package — run it in tmux on a flaky link.
 
-## Verify the zero-network property
+## Verify the no-telemetry property
 
-```sh
-npm run build
-cd dist && python3 ../tools/lt-server.py   # logging server on :8765
-# terminal 2: first load — creates a recipe via the UI, installs the SW
-env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_SYSTEM_BUS_ADDRESS \
-  chromium --headless=new --no-sandbox --remote-debugging-port=9333 \
-  --user-data-dir=/tmp/lt-profile about:blank &
-node tools/lt-cdp.mjs 9333 first
-# kill chromium, launch again with the SAME profile, then:
-node tools/lt-cdp.mjs 9333 second
-# /tmp/lt-requests.log must show ZERO requests during the second load
-```
+With the local services up (hub, signaling, testnet), run
+`e2e/telemetry-audit.sh`: it captures traffic during a defined app
+session (cold launches, friend-channel sync, a Discover search) and
+asserts the app contacted only the expected endpoints — configured
+hubs' signaling and the active AppView.
 
 ## Project structure
 
-- `src/` — React UI + app shell (`main.tsx`, `components/`, `test/`)
-- `src/store` — Automerge recipe store (one doc per recipe, `recipe-index`
-  doc, `localStorage` URL persistence)
-- `src/importers` — `photoImport.ts` (local photos → data URLs),
-  `urlImport.ts` (user-initiated URL import — the app's only `fetch()`)
-- `android/` — Capacitor native Android project (app id
-  `kitchen.longtable.app`)
-- `public/` — PWA icons, favicon, manifest assets
-- `tools/` — zero-network verification harness (`lt-server.py`,
-  `lt-cdp.mjs`)
+The full module map is [docs/architecture.md](docs/architecture.md).
+In brief:
+
+- `src/` — React UI + app shell; domain modules in `store/`,
+  `identity/`, `p2p/`, `friends/`, `public/`, `hubs/`, `importers/`
+- `appview/` — the hub AppView (verify-then-index, FTS5 search, media cache)
+- `hub/` — the single-artifact hub bundle (one tarball, one command)
+- `signaling/`, `services/` — signaling server; local ATProto testnet
+- `lexicons/` — the `kitchen.longtable.*` record schemas
+- `docs/`, `examples/` — developer documentation + runnable examples
+- `e2e/` — Appium device gate + the per-phase oath proofs
+- `android/` — Capacitor native Android project
 
 ## Test
 
 ```sh
 npx tsc --noEmit   # typecheck (also runs as part of npm run build)
 npx vitest run     # unit tests (npm test)
+bash e2e/run-e2e.sh  # Appium device gate (needs the emulator + Appium)
 ```
+
+Every commit to `main` runs the full pipeline on the build box
+(typecheck → unit tests → AppView tests → web build → APK → e2e gate →
+migration proof → publish; a red run publishes nothing). The per-phase
+oath proofs live in `e2e/proof-*.mjs`.
 
 ## License
 

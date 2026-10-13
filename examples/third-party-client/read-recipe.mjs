@@ -127,6 +127,44 @@ const verifyDetached = (sigB64, message, pubKeyBytes) =>
     pubKeyBytes,
   )
 
+/* Decode a did:key Ed25519 identity to its raw public key bytes.
+ * (The account-key helpers in @atproto/crypto don't cover Ed25519 —
+ * ATProto account keys are secp256k1/p256 — so the device key's
+ * multicodec framing is handled directly: base58btc of
+ * varint(0xed) || 0x01 || 32 key bytes.) */
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+function base58Decode(str) {
+  const bytes = [0]
+  for (const ch of str) {
+    const idx = B58.indexOf(ch)
+    if (idx < 0) throw new Error(`bad base58 character ${ch}`)
+    let carry = idx
+    for (let i = 0; i < bytes.length; i++) {
+      const v = bytes[i] * 58 + carry
+      bytes[i] = v & 0xff
+      carry = v >> 8
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff)
+      carry >>= 8
+    }
+  }
+  let zeros = 0
+  while (zeros < str.length && str[zeros] === '1') zeros++
+  const out = new Uint8Array(zeros + bytes.length)
+  out.set(bytes.reverse(), zeros)
+  return out
+}
+
+function deviceKeyFromDid(deviceDid) {
+  if (!deviceDid.startsWith('did:key:z')) throw new Error(`not a did:key: ${deviceDid}`)
+  const raw = base58Decode(deviceDid.slice('did:key:z'.length))
+  if (raw[0] !== 0xed || raw[1] !== 0x01 || raw.length !== 34) {
+    throw new Error('unexpected did:key payload for an Ed25519 key')
+  }
+  return raw.slice(2)
+}
+
 async function main() {
   await sodium.ready
   const args = process.argv.slice(2)
@@ -196,8 +234,10 @@ async function main() {
   /* ---- Step 5: verify the device-key binding */
   const devicePubKey = sodium.from_base64(binding.devicePublicKey, sodium.base64_variants.ORIGINAL)
   check('binding deviceDid matches the binding public key', () => {
-    const derived = formatDidKey('EdDSA', devicePubKey)
-    if (derived !== binding.deviceDid) throw new Error(`${derived} != ${binding.deviceDid}`)
+    const fromDid = deviceKeyFromDid(binding.deviceDid)
+    if (sodium.to_hex(fromDid) !== sodium.to_hex(devicePubKey)) {
+      throw new Error('deviceDid decodes to a different key than devicePublicKey')
+    }
     return binding.deviceDid.slice(0, 20) + '…'
   })
   check('binding signature verifies (device key over the binding string)', () => {

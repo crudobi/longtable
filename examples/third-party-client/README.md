@@ -20,6 +20,13 @@ It implements the protocol's read + verify flow:
 If every step passes, the recipe is genuinely the author's — no trust
 in the AppView, the hub, or this repository required.
 
+One implementation note the example demonstrates: `@atproto/crypto`'s
+key helpers cover the *account* key types (secp256k1, p256) but not
+Ed25519, which is what a Longtable *device* key is. The client therefore
+checks `deviceDid` ⇄ `devicePublicKey` by decoding the did:key
+multicodec framing directly (base58btc of `0xed 0x01 || key`) — about
+twenty lines, and it fails closed on any other key type.
+
 ## Run it
 
 ```sh
