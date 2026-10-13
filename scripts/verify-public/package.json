@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "@atproto/common": "^0.4.0",
+    "@atproto/crypto": "^0.4.0",
+    "@atproto/lexicon": "^0.4.0",
+    "@atproto/repo": "^0.6.0",
+    "libsodium-wrappers": "^0.8.4"
+  },
+  "description": "Independent third-party verifier for Longtable public records. Uses official ATProto libraries directly \u2014 none of the app's client code.",
+  "name": "longtable-verify-public",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0"
+}
