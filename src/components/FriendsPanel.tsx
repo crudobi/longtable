@@ -43,9 +43,15 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
   const pairingRef = useRef(false)
 
   const reload = useCallback(async () => {
+    // Import on open: channel docs may already hold shares the live
+    // update subscription has not imported yet (its App-level effect can
+    // be mid-teardown when an update lands). Importing here makes the
+    // shelf correct by construction whenever the user looks at it; the
+    // import is idempotent (per-share updatedAt check).
+    await importReceivedShares(identity).catch(() => 0)
     setFriends(listFriends())
     setReceived(await listReceivedShares())
-  }, [])
+  }, [identity])
 
   useEffect(() => {
     void reload()
