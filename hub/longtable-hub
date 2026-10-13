@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# longtable-hub — run a Longtable hub from this directory.
+#
+#   ./longtable-hub start    start the hub in the background
+#   ./longtable-hub stop     stop it
+#   ./longtable-hub status   is it up? + the endpoints clients use
+#   ./longtable-hub logs     follow the hub log
+#
+# Config: hub.conf.json in this directory (copy hub.conf.example.json).
+# Override the config path with LT_HUB_CONFIG=/path/to/other.json — that is
+# how you run several hubs on one machine.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+CONFIG="${LT_HUB_CONFIG:-./hub.conf.json}"
+
+if [ ! -f "$CONFIG" ]; then
+  echo "No config at $CONFIG — copy hub.conf.example.json to hub.conf.json first." >&2
+  exit 2
+fi
+
+# Resolve the data dir from the config (node is guaranteed: the hub is node).
+DATA_DIR="$(node -e '
+  const fs = require("fs"), path = require("path");
+  const cfgPath = path.resolve(process.argv[1]);
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+  const d = cfg.dataDir ?? "./data";
+  console.log(path.isAbsolute(d) ? d : path.resolve(path.dirname(cfgPath), d));
+' "$CONFIG")"
+mkdir -p "$DATA_DIR"
+PIDFILE="$DATA_DIR/hub.pid"
+LOGFILE="$DATA_DIR/hub.log"
+
+hub_pid() {
+  if [ -f "$PIDFILE" ]; then
+    local pid
+    pid="$(cat "$PIDFILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+case "${1:-}" in
+  start)
+    if pid="$(hub_pid)"; then
+      echo "Hub already running (pid $pid). Use ./longtable-hub status."
+      exit 0
+    fi
+    echo "Starting hub (config $CONFIG, data $DATA_DIR)…"
+    setsid nohup node hub.mjs --config "$CONFIG" >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 2
+    if pid="$(hub_pid)"; then
+      echo "Hub supervisor running (pid $pid). Endpoints: ./longtable-hub status"
+      echo "Log: $LOGFILE"
+    else
+      echo "Hub failed to start — last log lines:" >&2
+      tail -20 "$LOGFILE" >&2
+      exit 1
+    fi
+    ;;
+  stop)
+    if pid="$(hub_pid)"; then
+      # The supervisor is a session leader (setsid): signal the group so
+      # every child (web, signaling, turn, appview, pds) stops with it.
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" || true
+      fi
+      rm -f "$PIDFILE"
+      echo "Hub stopped."
+    else
+      echo "Hub is not running."
+    fi
+    ;;
+  status)
+    if pid="$(hub_pid)"; then
+      echo "Hub RUNNING (supervisor pid $pid, data $DATA_DIR)"
+    else
+      echo "Hub NOT running (data $DATA_DIR)"
+    fi
+    if [ -f "$DATA_DIR/hub-status.json" ]; then
+      node -e '
+        const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        console.log("Endpoints (give these to the app under Hubs → Add hub):");
+        for (const [k, v] of Object.entries(s.endpoints)) {
+          if (v) console.log(`  ${k}: ${v}`);
+        }
+      ' "$DATA_DIR/hub-status.json"
+    fi
+    ;;
+  logs)
+    tail -n 100 -f "$LOGFILE"
+    ;;
+  *)
+    echo "usage: ./longtable-hub start|stop|status|logs" >&2
+    exit 2
+    ;;
+esac
