@@ -195,17 +195,33 @@ export function removeHub(id: string, kv: KeyValueStore = defaultKv()): void {
   saveRegistry(reg, kv)
 }
 
-/** ICE servers for a hub (defaults to the active hub). */
+/**
+ * ICE servers from ALL configured hubs, the given (or active) hub first.
+ * The redundancy is the point (E8): if one hub's TURN is dead, peers can
+ * still relay via any other hub's TURN. Duplicate URLs are dropped —
+ * first occurrence wins, so the primary hub's credentials apply to a
+ * shared TURN endpoint.
+ */
 export function getIceServers(
-  hub: HubConfig = getActiveHub(),
+  hub?: HubConfig,
+  kv: KeyValueStore = defaultKv(),
 ): RTCIceServer[] {
+  const hubs = listHubs(kv)
+  const ordered = hub ? [hub, ...hubs.filter((h) => h.id !== hub.id)] : hubs
   const servers: RTCIceServer[] = []
-  if (hub.stunUrl) servers.push({ urls: hub.stunUrl })
-  if (hub.turnUrl) {
-    const turn: RTCIceServer = { urls: hub.turnUrl }
-    if (hub.turnUsername) turn.username = hub.turnUsername
-    if (hub.turnCredential) turn.credential = hub.turnCredential
-    servers.push(turn)
+  const seen = new Set<string>()
+  for (const h of ordered) {
+    if (h.stunUrl && !seen.has(h.stunUrl)) {
+      seen.add(h.stunUrl)
+      servers.push({ urls: h.stunUrl })
+    }
+    if (h.turnUrl && !seen.has(h.turnUrl)) {
+      seen.add(h.turnUrl)
+      const turn: RTCIceServer = { urls: h.turnUrl }
+      if (h.turnUsername) turn.username = h.turnUsername
+      if (h.turnCredential) turn.credential = h.turnCredential
+      servers.push(turn)
+    }
   }
   return servers
 }

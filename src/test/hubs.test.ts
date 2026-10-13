@@ -19,6 +19,7 @@ import {
   removeHub,
   setActiveHub,
   updateHub,
+  type HubConfig,
 } from '../hubs/hubs'
 
 function memKv(seed: Record<string, string> = {}): KeyValueStore & { map: Map<string, string> } {
@@ -88,14 +89,32 @@ describe('hub registry', () => {
     expect(getActiveHub(kv2).id).toBe(DEFAULT_HUB.id)
   })
 
-  it('builds ICE servers from the hub config', () => {
-    const servers = getIceServers({ ...DEFAULT_HUB, ...HUB_B, id: 'x' })
-    expect(servers).toEqual([
+  it('builds ICE servers from ALL hubs, primary first (TURN redundancy)', () => {
+    const kv = memKv()
+    const hubB = addHub({ ...HUB_B }, kv)
+    // Primary = hub B: its STUN/TURN lead, the default hub's follow.
+    expect(getIceServers(hubB, kv)).toEqual([
       { urls: 'stun:hub-b.example:3478' },
       { urls: 'turn:hub-b.example:3478', username: 'u', credential: 'p' },
+      { urls: 'stun:10.0.2.2:3478' },
+      { urls: 'turn:10.0.2.2:3478', username: 'longtable', credential: 'dev-turn-password' },
     ])
-    // a hub with no TURN configured yields STUN only (or nothing)
-    expect(getIceServers({ ...DEFAULT_HUB, stunUrl: undefined, turnUrl: undefined })).toEqual([])
+    // No primary: active hub first (the default hub is active here).
+    expect(getIceServers(undefined, kv)[0]).toEqual({ urls: 'stun:10.0.2.2:3478' })
+    // A primary with no TURN of its own still yields the other hubs' TURN:
+    // a dead or TURN-less hub never strands a peer.
+    const bare: HubConfig = { ...DEFAULT_HUB, id: 'bare', stunUrl: undefined, turnUrl: undefined }
+    const fromBare = getIceServers(bare, kv)
+    expect(fromBare).toContainEqual({
+      urls: 'turn:hub-b.example:3478',
+      username: 'u',
+      credential: 'p',
+    })
+    // A registry whose only hub has no TURN yields nothing.
+    const kv2 = memKv({
+      [HUBS_KEY]: JSON.stringify({ hubs: [{ ...bare }], activeId: 'bare' }),
+    })
+    expect(getIceServers(undefined, kv2)).toEqual([])
   })
 
   it('rendezvous list: primary first, then all hubs, deduplicated', () => {
