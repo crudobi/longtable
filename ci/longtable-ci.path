@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Longtable main branch ref for new commits
+
+[Path]
+PathChanged=/home/devbox/code/longtable/.git/refs/heads/main
+Unit=longtable-ci.service
+
+[Install]
+WantedBy=multi-user.target

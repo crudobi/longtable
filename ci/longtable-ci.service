@@ -1,0 +1,9 @@
+[Unit]
+Description=Longtable CI pipeline (commit-triggered, on-box)
+After=network.target
+
+[Service]
+Type=oneshot
+User=crudobi
+ExecStart=/home/devbox/ops/longtable-ci/run-pipeline.sh
+TimeoutStartSec=10800

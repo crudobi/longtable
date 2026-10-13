@@ -1,0 +1,10 @@
+[Unit]
+Description=Fallback trigger for Longtable CI (every 10 minutes; no-ops when main is unchanged)
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=longtable-ci.service
+
+[Install]
+WantedBy=timers.target
