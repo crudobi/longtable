@@ -99,24 +99,30 @@ reason, and everything else keeps working.
 ## Worked example
 
 A complete importer for a simple Markdown recipe format — one `# Title`,
-an `## Ingredients` list, an `## Steps` numbered list. (This exact
-module was written from this document alone, as the Phase 5 clean-room
-proof; it ships in `examples/importers/markdown/` and installs as a
-drop-in plugin.)
+an `## Ingredients` list, an `## Steps` numbered list — lives in
+[`examples/importers/markdown/`](../examples/importers/markdown/),
+together with its author's standalone self-test. It was written from
+this document alone (the Phase 5 clean-room proof) and installs
+verbatim as a drop-in plugin; that directory's README records the
+process and the author's friction notes on this document.
 
-```js
-export default {
-  apiVersion: 1,
-  id: 'markdown-recipe',
-  name: 'Markdown recipe',
-  description: 'A recipe written as a Markdown file.',
-  accepts: ['file', 'text'],
-  fileExtensions: ['.md', '.markdown', '.txt'],
-  import({ text }) {
-    // …parse sections, return [{ title, ingredients, steps }]
-  },
-}
-```
+Two clarifications that process surfaced:
+
+- **Who rejects a missing required field?** Both of you can. If your
+  format can tell *why* a recipe is unusable, throw your own specific
+  message from `import` — it's the one the user sees. The app validates
+  whatever you return, regardless; think of your errors as diagnostics
+  and the validator as the safety net.
+- **Returning zero recipes is an error.** An `import` that resolves
+  with an empty list is treated as "found no recipes in that source"
+  and imports nothing. If your format legitimately yields nothing,
+  throw a message saying so instead.
+- **Which input do you get?** The Import panel builds exactly one
+  `ImporterInput` per run, of a kind from your `accepts`: URL if you
+  declared `url` and the user entered one, else the chosen file, else
+  pasted text. If your `accepts` lists kinds you can't actually handle,
+  the contract still requires the listed ones to work — declare only
+  what you support.
 
 ## Reference importers (in `src/importers/`)
 
