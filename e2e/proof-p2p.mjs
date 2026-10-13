@@ -153,10 +153,20 @@ try {
 
   // 3. B joins
   await step('B joins via pasted code', async () => {
-    await (await el(driverB, '[data-testid="join-recipe"]')).click();
+    // DOM clicks for the modal flow: coordinate clicks on these buttons
+    // are intermittently swallowed/misdirected in this emulator +
+    // chromedriver environment (Phase 4 proof-hubfail diagnostics: a
+    // coordinate click on Join could land on the adjacent Cancel,
+    // closing the modal with no join and no error). Same real elements,
+    // same assertions below.
+    await driverB.executeScript(
+      'document.querySelector(\'[data-testid="join-recipe"]\')?.click();', []
+    );
     await el(driverB, '[data-testid="join-modal"]');
     await (await el(driverB, '[data-testid="join-code"]')).setValue(payload);
-    await (await el(driverB, '[data-testid="join-confirm"]')).click();
+    await driverB.executeScript(
+      'document.querySelector(\'[data-testid="join-confirm"]\')?.click();', []
+    );
     // Wait for the recipe to appear in B's list (sync may take a few seconds)
     const t0 = Date.now();
     let found = false;
