@@ -11,7 +11,7 @@
     "y-webrtc": "^10.3.0",
     "yjs": "13.6.33"
   },
-  "description": "Longtable Phase 0 — local-first recipe box. Local cookbook, no sync, no network.",
+  "description": "Longtable Phase 0 \u2014 local-first recipe box. Local cookbook, no sync, no network.",
   "devDependencies": {
     "@capacitor/cli": "^7.6.9",
     "@types/libsodium-wrappers": "^0.7.14",
@@ -36,5 +36,6 @@
     "typecheck": "tsc --noEmit"
   },
   "type": "module",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only"
 }

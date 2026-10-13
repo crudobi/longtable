@@ -13,3 +13,9 @@ are what third-party clients and verifiers validate against.
 
 Friends-only and private recipes never appear here — by design there is no
 lexicon for them; they never touch ATProto.
+
+## License
+
+These lexicon schemas are dedicated to the public domain under
+**CC0 1.0 Universal** (see `../LICENSE-CC0.txt` and `../LICENSING.md`).
+Implement them in anything, under any license.

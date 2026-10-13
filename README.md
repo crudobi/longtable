@@ -24,8 +24,8 @@ What works today:
 
 ## Core principles
 
-- **Open source.** Every line ships under a free license — AGPLv3 is
-  proposed (see License below), to be confirmed.
+- **Open source.** Every line ships under a free license — AGPLv3
+  (see License below).
 - **Free, non-commercial.** Funded by donations/grants, never tiers or ads.
   The design keeps hub operating cost near-zero so "free forever" is
   credible.
@@ -157,4 +157,7 @@ oath proofs live in `e2e/proof-*.mjs`.
 
 ## License
 
-AGPLv3 (proposed per project plan — to be confirmed). See `LICENSE`.
+Code: AGPLv3 — see `LICENSE`. The protocol, lexicons, and docs are
+CC0 1.0 so anyone can implement them freely — see `LICENSE-CC0.txt`.
+The full licensing map is in `LICENSING.md`; contributions are under
+the DCO (`CONTRIBUTING.md`); the name is covered by `TRADEMARKS.md`.

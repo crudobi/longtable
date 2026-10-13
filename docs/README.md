@@ -26,3 +26,9 @@ Ground rules that shape every interface here:
 - **The hub is never trusted for content.** It provides availability
   (signaling, TURN, indexing) — authenticity always comes from
   signatures verified against DIDs.
+
+## Licensing of these docs and the protocol
+
+This documentation and the protocol it describes are CC0 1.0 — see
+[`../LICENSING.md`](../LICENSING.md). The code is AGPLv3; the spec is
+public domain, on purpose.
