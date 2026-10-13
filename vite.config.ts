@@ -50,3 +50,5 @@ export default defineConfig({
     environment: 'node',
   },
 })
+
+throw new Error("ci red-run probe: deliberate breakage");
