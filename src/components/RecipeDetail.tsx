@@ -17,7 +17,7 @@ export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onShareFriends
   return (
     <div className="view" data-testid="recipe-detail">
       <header className="app-header">
-        <button className="ghost" onClick={onBack}>
+        <button className="ghost" data-testid="back-to-list" onClick={onBack}>
           ‹ Recipes
         </button>
         <div className="header-actions">

@@ -83,20 +83,33 @@ async function waitFor(driver, fn, timeout = 90000, interval = 2000) {
   }
 }
 
+
+async function clickAndWait(driver, clickSel, waitSel, timeout = 20000) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await (await driver.$(clickSel)).click()
+    const target = await driver.$(waitSel)
+    const ok = await target.waitForExist({ timeout }).catch(() => false)
+    if (ok) return target
+  }
+  throw new Error(`clickAndWait: ${waitSel} never appeared after clicking ${clickSel}`)
+}
+
 async function openFriends(driver) {
   const panel = await driver.$('[data-testid="friends-panel"]')
   if (await panel.isExisting()) return
-  // friends-open lives on the list view; navigate there if needed.
-  const openBtn = await driver.$('[data-testid="friends-open"]')
-  if (!(await openBtn.isExisting())) {
-    const back = await driver.$('[data-testid="back-to-list"]')
-    if (await back.isExisting()) {
-      await back.click()
-      await sleep(800)
+  // friends-open lives on the list view; navigate there if needed, with
+  // retries — view transitions can lag while channel traffic lands.
+  for (let i = 0; i < 20; i++) {
+    const openBtn = await driver.$('[data-testid="friends-open"]')
+    if (await openBtn.isExisting()) {
+      await openBtn.click()
+      break
     }
+    const back = await driver.$('[data-testid="back-to-list"]')
+    if (await back.isExisting()) await back.click()
+    await sleep(1000)
   }
-  await (await driver.$('[data-testid="friends-open"]')).click()
-  await panel.waitForExist({ timeout: 15000 })
+  await panel.waitForExist({ timeout: 20000 })
 }
 
 async function closeFriends(driver) {
@@ -216,20 +229,19 @@ async function main() {
     await closeFriends(C)
 
     // ---- A creates a recipe and shares it friends-only ------------------
-    await (await A.$('[data-testid="new-recipe"]')).click()
-    await (await A.$('[data-testid="recipe-title-input"]')).setValue('Midnight Soup')
-    await (await A.$('[data-testid="ingredient-input"]')).setValue('1 black garlic bulb')
+    await clickAndWait(A, '[data-testid="new-recipe"]', '[data-testid="field-title"]')
+    await (await A.$('[data-testid="field-title"]')).setValue('Midnight Soup')
+    await (await A.$('[data-testid="field-ingredient"]')).setValue('1 black garlic bulb')
     await (await A.$('[data-testid="add-ingredient"]')).click()
-    await (await A.$('[data-testid="step-input"]')).setValue('Simmer at midnight.')
+    await (await A.$('[data-testid="field-step"]')).setValue('Simmer at midnight.')
     await (await A.$('[data-testid="add-step"]')).click()
     await (await A.$('[data-testid="save-recipe"]')).click()
     const detailTitle = await A.$('[data-testid="recipe-title"]')
     await detailTitle.waitForExist({ timeout: 20000 })
     step('setup: A created “Midnight Soup”', (await detailTitle.getText()) === 'Midnight Soup')
 
-    await (await A.$('[data-testid="share-friends"]')).click()
-    const modal = await A.$('[data-testid="friend-share-modal"]')
-    await modal.waitForExist({ timeout: 15000 })
+    const modal = await clickAndWait(A, '[data-testid="share-friends"]', '[data-testid="friend-share-modal"]')
+    void modal
     const boxes = await A.$$('[data-testid="friend-check"]')
     if (boxes.length !== 2) throw new Error(`expected 2 friend checkboxes, got ${boxes.length}`)
     for (const box of boxes) await box.click()
@@ -287,8 +299,8 @@ async function main() {
     await (await A.$('[data-testid="back-to-list"]')).click().catch(() => {})
     const card = await A.$('button.recipe-card*=Midnight Soup')
     await card.click()
-    await (await A.$('[data-testid="edit-recipe"]')).click()
-    const titleInput = await A.$('[data-testid="recipe-title-input"]')
+    await clickAndWait(A, '[data-testid="edit-recipe"]', '[data-testid="field-title"]')
+    const titleInput = await A.$('[data-testid="field-title"]')
     await titleInput.setValue('Midnight Soup v2')
     await (await A.$('[data-testid="save-recipe"]')).click()
     const v2Title = await A.$('[data-testid="recipe-title"]')
