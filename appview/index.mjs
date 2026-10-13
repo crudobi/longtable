@@ -4,6 +4,7 @@
  * Env:
  *   APPVIEW_PORT  listen port            (default 3210)
  *   APPVIEW_DB    SQLite index path      (default ./appview.db)
+ *   APPVIEW_MEDIA media cache dir        (default: <db dir>/media)
  *   PDS_URL       local PDS base URL     (default http://localhost:2583)
  *   PLC_URL       local PLC base URL     (default http://localhost:2582)
  *
@@ -16,6 +17,7 @@ const app = createAppView({
   dbPath: process.env.APPVIEW_DB ?? './appview.db',
   pdsUrl: process.env.PDS_URL ?? 'http://localhost:2583',
   plcUrl: process.env.PLC_URL ?? 'http://localhost:2582',
+  mediaDir: process.env.APPVIEW_MEDIA || undefined,
 })
 
 await app.listen(port)

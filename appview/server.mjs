@@ -6,9 +6,11 @@
  * tests can call the module-level ingestClaim() hook against the live app.
  */
 import http from 'node:http'
+import path from 'node:path'
 import { RecipeIndex } from './db.mjs'
 import { createVerifiedRepoProvider } from './verify.mjs'
 import { createIngestor, setDefaultIngestor } from './ingest.mjs'
+import { createMediaCache } from './media.mjs'
 
 // The AppView is a PUBLIC read API: the Longtable app (origin
 // https://localhost in Capacitor, or any other hub client) fetches it
@@ -35,17 +37,30 @@ export function createAppView({
   dbPath = './appview.db',
   pdsUrl = 'http://localhost:2583',
   plcUrl = 'http://localhost:2582',
+  mediaDir,
   repoStateProvider,
   fetchImpl,
   log = console,
 } = {}) {
   const index = new RecipeIndex(dbPath)
+  // Public media cache: one directory next to the index DB by default.
+  // With an in-memory index and no explicit dir, the cache is disabled
+  // (unit tests pass a tmp dir when they exercise it).
+  const media =
+    mediaDir || dbPath !== ':memory:'
+      ? createMediaCache({
+          dir: mediaDir ?? path.join(path.dirname(path.resolve(dbPath)), 'media'),
+          pdsUrl,
+          fetchImpl: fetchImpl ?? fetch,
+          log,
+        })
+      : null
   const provider =
     repoStateProvider ?? createVerifiedRepoProvider({ pdsUrl, plcUrl, fetchImpl })
   const ingestor = createIngestor({ index, repoStateProvider: provider, pdsUrl, log })
   setDefaultIngestor(ingestor)
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'OPTIONS') {
         res.writeHead(204, CORS_HEADERS)
@@ -62,7 +77,27 @@ export function createAppView({
           ...ingestor.stats,
           total: index.count(),
           fts5: index.ftsEnabled,
+          media: media ? media.stats : null,
         })
+      }
+      if (req.method === 'GET' && path.startsWith('/media/')) {
+        const parts = path.split('/').filter(Boolean) // ['media', did, cid]
+        if (parts.length === 3 && media) {
+          const did = decodeURIComponent(parts[1])
+          const cid = decodeURIComponent(parts[2])
+          const blob = await media.get(did, cid)
+          if (blob) {
+            res.writeHead(200, {
+              'content-type': blob.contentType,
+              'content-length': blob.bytes.length,
+              'cache-control': 'public, max-age=31536000, immutable',
+              'x-longtable-media-cache': blob.fromCache ? 'hit' : 'miss',
+              ...CORS_HEADERS,
+            })
+            return res.end(blob.bytes)
+          }
+        }
+        return sendJson(res, 404, { error: 'media not found' })
       }
       if (req.method === 'GET' && path === '/search') {
         const q = url.searchParams.get('q') ?? undefined
@@ -97,6 +132,7 @@ export function createAppView({
   return {
     index,
     ingestor,
+    media,
     server,
     stats: ingestor.stats,
     listen(port) {
