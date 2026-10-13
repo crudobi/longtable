@@ -49,7 +49,7 @@ ready=""
 for i in $(seq 1 120); do
   if curl -sf http://localhost:18080/ >/dev/null 2>&1 \
      && curl -sf http://localhost:13210/health >/dev/null 2>&1 \
-     && curl -sk https://10.0.2.2:13211/health >/dev/null 2>&1 \
+     && curl -sk https://127.0.0.1:13211/health >/dev/null 2>&1 \
      && curl -sf http://localhost:12583/ >/dev/null 2>&1; then
     ready=1
     break

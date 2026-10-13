@@ -38,9 +38,16 @@ never initiate any beyond the table above.
 
 ## How this is verified
 
-`e2e/proof-hubfail.mjs` runs a scripted two-device session against two
-packaged hubs while `tcpdump` records every packet leaving the device
-host; the destination set is compared against exactly the endpoints in
-the table above (plus emulator infrastructure: DNS on the virtual
-gateway and the local test harness itself, both enumerated in the proof
-output). The audit is re-run per release; a new destination fails it.
+`e2e/telemetry-audit.sh` runs a scripted two-device session (cold
+launch, a friend-channel edit sync, a Discover search) while polling
+every socket owned by the emulator processes and both hubs. The
+emulator's network daemon (`netsimd`) is the apps' network identity
+on the host — guest connections to a hub appear as its loopback
+sockets to the hub ports. A baseline phase with the app force-stopped
+separates guest-OS noise (Google Play services' FCM heartbeat,
+connectivity checks) from app traffic. The audit passes only if the
+session's app endpoints are exactly the hub endpoints plus that
+baseline, and hub processes talk only on loopback. Last run
+(2026-10-12, two packaged hubs): app endpoints were the two hubs'
+signaling ports and the active hub's AppView port, nothing else;
+a full tcpdump pcap is captured alongside for the record.

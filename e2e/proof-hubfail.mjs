@@ -439,6 +439,33 @@ async function localInventory(driver) {
   }
 }
 
+/** Rich state dump for a failed floor join — distinguishes "join never
+ * ran", "join errored", "join completed but the list did not refresh". */
+async function floorDiagnostics(driver, payload) {
+  try {
+    const parts = []
+    parts.push(`payloadLen=${payload?.length ?? 0}`)
+    const err = await driver.$('[data-testid="join-error"]')
+    parts.push(`joinError=${(await err.isExisting()) ? await err.getText() : '(none)'}`)
+    const modal = await driver.$('[data-testid="join-modal"]')
+    parts.push(`joinModalOpen=${await modal.isExisting()}`)
+    const shares = await evalJs(driver, 'localStorage.getItem("longtable:shares") || "null"')
+    parts.push(`shares=${String(shares).slice(0, 160)}`)
+    const cards = await driver.$$('[data-testid="recipe-item"]')
+    const titles = []
+    for (const c of cards) titles.push(await c.getText())
+    parts.push(`cards=${JSON.stringify(titles).slice(0, 200)}`)
+    const codeLen = await evalJs(
+      driver,
+      'document.querySelector(\'[data-testid="join-code"]\')?.value.length ?? -1',
+    )
+    parts.push(`joinCodeLen=${codeLen}`)
+    return parts.join(' ')
+  } catch (e) {
+    return `diagnostics failed: ${e}`
+  }
+}
+
 async function main() {
   for (const serial of ['emulator-5554', 'emulator-5556']) {
     execFileSync(ADB, ['-s', serial, 'shell', 'pm', 'clear', 'kitchen.longtable.app'])
@@ -633,33 +660,22 @@ async function main() {
     const cardsBefore = (await localInventory(B)).cardCount
     await clickAndWait(B, '[data-testid="join-recipe"]', '[data-testid="join-modal"]')
     await setCodeValue(B, '[data-testid="join-code"]', payload)
-    await (await B.$('[data-testid="join-confirm"]')).click().catch(() => {})
+    // DOM click, deliberately: the Join and Cancel buttons sit side by
+    // side, and this harness's coordinate clicks have repeatedly landed
+    // on the wrong one (a "successful" run that closed the modal via
+    // Cancel: no error, no join, no shares record — caught by the floor
+    // diagnostics). The DOM click targets the exact element.
+    await evalJs(B, 'document.querySelector(\'[data-testid="join-confirm"]\')?.click()')
     const joined = await waitFor(
       B,
       async () => {
         const inv = await localInventory(B)
         return inv.cardCount > cardsBefore ? inv : null
       },
-      20000,
-    ).then(async (first) => {
-      if (first) return first
-      // Same swallowed-click guard as pairing: retry once at DOM level
-      // if the join modal is still open.
-      const m = await B.$('[data-testid="join-modal"]')
-      if (await m.isExisting()) {
-        await evalJs(B, 'document.querySelector(\'[data-testid="join-confirm"]\')?.click()')
-      }
-      return waitFor(
-        B,
-        async () => {
-          const inv = await localInventory(B)
-          return inv.cardCount > cardsBefore ? inv : null
-        },
-        60000,
-      )
-    })
+      60000,
+    )
     step('FLOOR: B joined from the pasted snapshot with zero hubs alive', !!joined,
-      joined ? '' : `join-error=${await (async () => { const e = await B.$('[data-testid="join-error"]'); return (await e.isExisting()) ? await e.getText() : '(none)' })()}`)
+      joined ? '' : (await floorDiagnostics(B, payload)))
     if (joined) {
       const bodyB = await openRecipeByTitle(B, 'Hubfail Stew v2')
       step(
