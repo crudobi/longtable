@@ -6,6 +6,8 @@ interface Props {
   onNew: () => void
   onJoin: () => void
   onFriends: () => void
+  /** Open the importer panel (Phase 5: Importer API v1 front door). */
+  onImport?: () => void
   /** Open the public-recipe discovery panel (Phase 3). */
   onDiscover?: () => void
   /** Open the hub settings (Phase 4). */
@@ -17,7 +19,7 @@ function formatDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
 }
 
-export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onDiscover, onHubs }: Props) {
+export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs }: Props) {
   return (
     <div className="view" data-testid="recipe-list">
       <header className="app-header">
@@ -28,6 +30,11 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onDiscov
         <button data-testid="join-recipe" onClick={onJoin}>
           Join shared
         </button>
+        {onImport && (
+          <button data-testid="open-import" onClick={onImport}>
+            Import
+          </button>
+        )}
         <button data-testid="friends-open" onClick={onFriends}>
           Friends
         </button>
@@ -43,9 +50,19 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onDiscov
         )}
       </header>
       {recipes.length === 0 ? (
-        <p className="empty">
-          No recipes yet. Add your first one — everything stays on this device.
-        </p>
+        <div className="empty empty-state" data-testid="cookbook-empty">
+          <p>
+            No recipes yet — this is your cookbook, and it lives on this
+            device. No account, no cloud.
+          </p>
+          <p>
+            Tap <strong>+ New recipe</strong> to write your first one, or{' '}
+            <strong>Import</strong> to bring recipes in from a web page, a
+            JSON file, or another app. When you're ready to share,{' '}
+            <strong>Friends</strong> pairs you with another cook and{' '}
+            <strong>Discover</strong> finds public recipes.
+          </p>
+        </div>
       ) : (
         <ul className="recipe-cards">
           {recipes.map((r) => (

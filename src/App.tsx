@@ -27,6 +27,8 @@ import { FriendsPanel } from './components/FriendsPanel'
 import { FriendShareModal } from './components/FriendShareModal'
 import { PublishSettingsModal } from './components/PublishSettingsModal'
 import { DiscoverPanel } from './components/DiscoverPanel'
+import { ImportPanel } from './components/ImportPanel'
+import { friendlyError } from './friendlyError'
 import { HubSettingsModal } from './components/HubSettingsModal'
 import {
   AtprotoClient,
@@ -65,6 +67,7 @@ export default function App() {
   const [friendShareId, setFriendShareId] = useState<string | null>(null)
   const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
   const [discoverOpen, setDiscoverOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
   const [hubsOpen, setHubsOpen] = useState(false)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detailIdRef = useRef<string | null>(null)
@@ -88,7 +91,7 @@ export default function App() {
       setView({ name: 'detail', id })
       window.scrollTo(0, 0)
     } catch (e) {
-      setError(String(e))
+      setError(friendlyError(e))
     }
   }, [])
 
@@ -125,7 +128,7 @@ export default function App() {
       }
       await refresh()
     })()
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(friendlyError(e)))
       .finally(() => setReady(true))
     // Rejoin P2P shares (peers rediscover via signaling and sync converges).
     void rejoinShares().catch((e) => console.warn('rejoin shares failed', e))
@@ -316,7 +319,7 @@ export default function App() {
         await refresh()
         await openDetail(id)
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        setError(friendlyError(e, 'the publishing server'))
       }
     },
     [refresh, openDetail],
@@ -360,13 +363,30 @@ export default function App() {
     }
   }, [identity, loadRecipeById])
 
+  /**
+   * Bulk import (Import panel): recipes arrive fully validated by the
+   * importer registry, so creation here is a straight loop — then one
+   * refresh. No navigation: the panel reports the imported titles.
+   */
+  const handleImportRecipes = useCallback(
+    async (inputs: RecipeInput[]) => {
+      const repo = getRepo()
+      const index = await getOrCreateIndex(repo)
+      for (const input of inputs) {
+        await createRecipe(repo, index, input)
+      }
+      await refresh()
+    },
+    [refresh],
+  )
+
   const handleShare = useCallback(async (id: string) => {
     try {
       const summary = summaries.find((s) => s.id === id)
       const payload = await shareRecipe(id, summary?.title ?? 'Shared recipe')
       setSharePayload(payload)
     } catch (e) {
-      setError(String(e))
+      setError(friendlyError(e))
     }
   }, [summaries])
 
@@ -408,6 +428,7 @@ export default function App() {
           onNew={() => setView({ name: 'new' })}
           onJoin={() => setJoinOpen(true)}
           onFriends={() => setFriendsOpen(true)}
+          onImport={() => setImportOpen(true)}
           onDiscover={() => setDiscoverOpen(true)}
           onHubs={() => setHubsOpen(true)}
         />
@@ -465,6 +486,12 @@ export default function App() {
         <PublishSettingsModal
           identity={identity}
           onClose={() => setPublishSettingsOpen(false)}
+        />
+      )}
+      {importOpen && (
+        <ImportPanel
+          onClose={() => setImportOpen(false)}
+          onImported={handleImportRecipes}
         />
       )}
       {discoverOpen && (
