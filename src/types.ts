@@ -10,6 +10,13 @@ export interface Recipe {
   cookMinutes?: number
   /** data URLs (image/*), downscaled on import */
   photos: string[]
+  /**
+   * Sharing tier (Phase 2). Absent/'private' = this device only.
+   * 'friends-only' = encrypted shares exist for chosen friends; the
+   * plaintext still lives only in this device's doc — encryption happens
+   * at publish time, never in the stored document.
+   */
+  visibility?: 'private' | 'friends-only'
   /** ISO-8601 timestamps */
   createdAt: string
   updatedAt: string
@@ -21,6 +28,7 @@ export type RecipeInput = Omit<Recipe, 'createdAt' | 'updatedAt'>
 /** Partial update — every field optional. */
 export interface RecipePatch {
   title?: string
+  visibility?: 'private' | 'friends-only'
   ingredients?: string[]
   steps?: string[]
   prepMinutes?: number

@@ -156,6 +156,7 @@ export async function createRecipe(
     map.set('photos', strArray(input.photos))
     map.set('createdAt', createdAt)
     map.set('updatedAt', updatedAt)
+    if (input.visibility !== undefined) map.set('visibility', input.visibility)
     // Only set optional fields when present.
     if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
     if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
@@ -225,6 +226,9 @@ export async function getRecipe(repo: YjsStore, url: string): Promise<Recipe | n
     photos: toStringArray(map.get('photos')),
     createdAt: typeof createdAt === 'string' ? createdAt : '',
     updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
+    ...(map.get('visibility') === 'friends-only'
+      ? { visibility: 'friends-only' as const }
+      : {}),
     ...(map.has('prepMinutes') ? { prepMinutes: map.get('prepMinutes') as number } : {}),
     ...(map.has('cookMinutes') ? { cookMinutes: map.get('cookMinutes') as number } : {}),
   }
@@ -246,6 +250,13 @@ export async function updateRecipe(
   doc.transact(() => {
     const map = doc.getMap(RECIPE_MAP)
     if (patch.title !== undefined) map.set('title', patch.title)
+    if ('visibility' in patch) {
+      if (patch.visibility === undefined || patch.visibility === 'private') {
+        map.delete('visibility')
+      } else {
+        map.set('visibility', patch.visibility)
+      }
+    }
     if (patch.ingredients !== undefined) replaceArray(map, 'ingredients', patch.ingredients)
     if (patch.steps !== undefined) replaceArray(map, 'steps', patch.steps)
     if (patch.photos !== undefined) replaceArray(map, 'photos', patch.photos)
