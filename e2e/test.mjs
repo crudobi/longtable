@@ -435,7 +435,11 @@ async function main() {
   });
 
   await step('developer settings: enabling shows address + token; health answers, recipes demand the token', async () => {
-    await (await el('[data-testid="localapi-toggle"]')).click();
+    // DOM click + effect verification (coordinate taps are unreliable here).
+    await driver.executeScript(
+      'document.querySelector(\'[data-testid="localapi-toggle"]\').click();',
+      []
+    );
     const addr = await (await el('[data-testid="localapi-address"]')).getText();
     assert(addr.includes('127.0.0.1:17337'), `unexpected address shown: ${addr}`);
     const token = (await (await el('[data-testid="localapi-token"]')).getText()).trim();
