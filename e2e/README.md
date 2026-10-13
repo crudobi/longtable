@@ -154,3 +154,24 @@ instead injects the fixture JPEG (`e2e/fixtures/photo.jpg`, 1600x1200) via
 `DataTransfer` + a bubbling `change` event: everything from the input's
 `onChange` onward (FileReader, canvas downscale, preview, save, detail) is the
 real app pipeline. The OS file picker itself is Android UI, not app code.
+
+## proof-friends — Phase 2 oath proof (3 emulators)
+
+```bash
+node e2e/proof-friends.mjs   # needs emulators 5554/5556/5558 + Appium + signaling + TURN
+```
+
+Oath: "Only the friends you choose can read what you share with friends."
+A (5554) pairs with B (5556) and C (5558) through the Friends panel paste
+flow (signed did:key handshake, mutual DID records verified), shares a
+recipe friends-only with both, and B/C render the shared-with-me shelf and
+open it. Stranger leg: C runs the app's real receive path
+(`window.__ltFriends.attemptWithShelfBytes`) on the captured A↔B shelf-doc
+bytes and decryption fails explicitly ("no key envelope addressed to me").
+Unfriend leg: A unfriends C (key rotates), edits the recipe; B receives and
+opens v2 while C's attempt on the new bytes fails again. 14 steps.
+
+Emulator 3 is AVD `longtable-test-3` (port 5558). Like the others it needs
+the fixture test CA in its user store
+(`/data/misc/user/0/cacerts-added/4060c87e.0`, content =
+`fixture-certs/ca.crt`) or wss signaling fails TLS and pairing times out.
