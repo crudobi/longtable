@@ -1,0 +1,1 @@
+{"dependencies":{"@atproto/api":"0.15.27","@atproto/dev-env":"0.3.215"},"description":"Local ATProto testnet for Longtable Phase 3: real PLC + real PDS from @atproto/dev-env, fully local.","name":"longtable-atproto-testnet","private":true,"scripts":{"seed":"node seed.mjs","smoke":"node smoke.mjs","start":"node start.mjs"},"type":"module","version":"0.1.0"}
