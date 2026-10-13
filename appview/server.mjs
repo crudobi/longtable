@@ -10,9 +10,24 @@ import { RecipeIndex } from './db.mjs'
 import { createVerifiedRepoProvider } from './verify.mjs'
 import { createIngestor, setDefaultIngestor } from './ingest.mjs'
 
+// The AppView is a PUBLIC read API: the Longtable app (origin
+// https://localhost in Capacitor, or any other hub client) fetches it
+// cross-origin, so every response carries CORS headers. Without them the
+// WebView blocks the app from reading search results at all.
+const CORS_HEADERS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, OPTIONS',
+  'access-control-allow-headers': 'content-type, authorization',
+  'access-control-max-age': '86400',
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj)
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) })
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    ...CORS_HEADERS,
+  })
   res.end(body)
 }
 
@@ -32,6 +47,10 @@ export function createAppView({
 
   const server = http.createServer((req, res) => {
     try {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, CORS_HEADERS)
+        return res.end()
+      }
       const url = new URL(req.url ?? '/', 'http://localhost')
       const path = url.pathname
 
