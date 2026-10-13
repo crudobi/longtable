@@ -321,7 +321,11 @@ node examples/localhost-api/client.mjs import markdown-recipe recipe.md
 
 A tiny native (Kotlin) plugin in the Android app owns a `ServerSocket`
 bound to `127.0.0.1` and nothing else — it parses HTTP, forwards each
-request to the app's JS layer, and writes the answer back. All
+request to the app's JS layer, and writes the answer back. (In the
+kernel's socket tables Android shows this as an IPv4-mapped IPv6
+listener, `::ffff:127.0.0.1` — the same loopback-only binding; the E9
+proof verifies connections via the device's real network interfaces
+are refused.) All
 routing, auth, validation, and storage live in `src/localapi/` in the
 app, executing against the same store and the same update / delete /
 visibility flows the UI uses. See

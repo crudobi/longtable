@@ -109,6 +109,25 @@ function runClient(args, token) {
   return JSON.parse(out);
 }
 
+/**
+ * Local addresses of every LISTEN socket on the API port, from the
+ * kernel's own tables (/proc/net/tcp + tcp6). The port is 17337 =
+ * 0x43B9; state 0A is LISTEN.
+ */
+function listenEntries() {
+  const out = [];
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    const table = adb('shell', 'cat', f);
+    for (const line of table.split('\n')) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length > 3 && cols[1].endsWith(':43B9') && cols[3] === '0A') {
+        out.push(cols[1]);
+      }
+    }
+  }
+  return out;
+}
+
 let token = '';
 let createdId = '';
 let importedId = '';
@@ -152,10 +171,9 @@ async function main() {
       answered = false;
     }
     assert(!answered, 'health answered while the API should be off');
-    const tcp = adb('shell', 'cat', '/proc/net/tcp');
-    const listen = tcp.split('\n').filter((l) => l.includes(':43B9') && l.trim().split(/\s+/)[3] === '0A');
-    assert(listen.length === 0, `unexpected listener on 17337: ${listen[0] || ''}`);
-    return 'connection refused; /proc/net/tcp has no :43B9 listener';
+    const listeners = listenEntries();
+    assert(listeners.length === 0, `unexpected listener on 17337: ${listeners[0] || ''}`);
+    return 'connection refused; no :43B9 listener in tcp/tcp6 tables';
   });
 
   await step('enable in Developer settings: address + 64-hex token appear', async () => {
@@ -185,21 +203,36 @@ async function main() {
     return `address ${addr}, token ${token.slice(0, 8)}…`;
   });
 
-  await step('socket binds 127.0.0.1 only (kernel-level check)', async () => {
-    let lines = [];
+  await step('socket binds loopback only (kernel tables + in-guest probes)', async () => {
+    let listeners = [];
     const t0 = Date.now();
     while (Date.now() - t0 < 15000) {
-      const tcp = adb('shell', 'cat', '/proc/net/tcp');
-      lines = tcp.split('\n').filter((l) => l.includes(':43B9') && l.trim().split(/\s+/)[3] === '0A');
-      if (lines.length) break;
+      listeners = listenEntries();
+      if (listeners.length) break;
       await sleep(750);
     }
-    assert(lines.length >= 1, 'no listener on 17337 after enabling');
-    for (const l of lines) {
-      const local = l.trim().split(/\s+/)[1];
-      assert(local.startsWith('0100007F:'), `listener is NOT loopback-only: ${local}`);
+    assert(listeners.length >= 1, 'no listener on 17337 after enabling');
+    // Android's Java stack binds the IPv4 loopback as an IPv4-mapped
+    // IPv6 socket (::ffff:127.0.0.1, in /proc/net/tcp6). Both spellings
+    // are loopback-only; anything else (above all a wildcard) fails.
+    const LOOPBACK = ['0100007F:43B9', '0000000000000000FFFF00000100007F:43B9'];
+    for (const local of listeners) {
+      assert(LOOPBACK.includes(local), `listener is NOT loopback-only: ${local}`);
     }
-    return `LISTEN ${lines[0].trim().split(/\s+/)[1]} (0100007F = 127.0.0.1)`;
+    // Belt and braces, from inside the guest: the app's own network
+    // interfaces (eth0/wlan0) must REFUSE the port, loopback must answer.
+    const ipOut = adb('shell', 'ip', '-4', 'addr');
+    const ips = [...ipOut.matchAll(/inet (\d+\.\d+\.\d+\.\d+)\//g)]
+      .map((m) => m[1])
+      .filter((ip) => ip !== '127.0.0.1');
+    assert(ips.length >= 1, 'no non-loopback guest IPs found to probe');
+    for (const ip of ips) {
+      const out = adb('shell', `nc -w 2 ${ip} ${PORT} </dev/null; echo rc=$?`);
+      assert(/rc=[1-9]/.test(out), `connecting via ${ip} unexpectedly succeeded`);
+    }
+    const loop = adb('shell', `nc -w 2 127.0.0.1 ${PORT} </dev/null; echo rc=$?`);
+    assert(loop.includes('HTTP/1.1'), 'loopback probe got no HTTP answer');
+    return `LISTEN ${listeners[0]}; refused on ${ips.join(', ')}; answers on 127.0.0.1`;
   });
 
   await step('health is open — via the docs-only example client', async () => {
