@@ -227,11 +227,19 @@ if (tlsProxies) {
 const status = writeStatus()
 
 // ------------------------------------------------------------ readiness ----
-function httpOk(port, pathName) {
+function httpOk(port, pathName, expectBody = null) {
   return new Promise((resolve) => {
     const req = http.get({ host: '127.0.0.1', port, path: pathName, timeout: 1500 }, (res) => {
-      res.resume()
-      resolve(res.statusCode > 0)
+      let body = ''
+      res.on('data', (c) => {
+        body += c
+      })
+      res.on('end', () => {
+        // Any HTTP response is NOT enough: another local service squatting
+        // on the port must not read as "ready" (bit us on :8081/:8082).
+        if (res.statusCode !== 200) return resolve(false)
+        resolve(expectBody ? body.includes(expectBody) : true)
+      })
     })
     req.on('error', () => resolve(false))
     req.on('timeout', () => {
@@ -252,9 +260,9 @@ function tcpOk(port) {
 }
 
 const checks = [
-  ['web', () => httpOk(webPort, '/')],
+  ['web', () => httpOk(webPort, '/', '<title>Longtable</title>')],
   ['signaling', () => tcpOk(signalingPort)],
-  ['appview', () => httpOk(appviewPort, '/health')],
+  ['appview', () => httpOk(appviewPort, '/health', '"ok":true')],
   ...(pdsEnabled ? [['pds', () => httpOk(pdsPort, '/')]] : []),
 ]
 const deadline = Date.now() + 120_000
