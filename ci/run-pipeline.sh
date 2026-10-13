@@ -73,6 +73,10 @@ do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_unit()      { (cd "$WT" && npm test); }
 do_build()     { (cd "$WT" && npm run build); }
+# The AppView is a standalone subpackage (own package.json + lockfile);
+# its unit tests cover ingest filtering, verify-then-index and FTS5
+# search. Runs in the pristine worktree like every other stage.
+do_appview()   { (cd "$WT/appview" && npm ci --no-audit --no-fund && npm test); }
 do_capsync()   { (cd "$WT" && npx cap sync android); }
 do_apk()       { (cd "$WT/android" && ./gradlew assembleDebug --console=plain); }
 # The e2e harness is box infrastructure and runs from the repo checkout
@@ -137,6 +141,7 @@ run_one() {
     stage npm-ci          do_npm_ci    &&
     stage typecheck       do_typecheck &&
     stage unit-tests      do_unit      &&
+    stage appview-tests   do_appview   &&
     stage web-build       do_build     &&
     stage cap-sync        do_capsync   &&
     stage apk             do_apk       &&

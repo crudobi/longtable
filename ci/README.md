@@ -29,15 +29,21 @@ leaks into a build — and runs, in order:
 2. `npm-ci` — `npm ci`
 3. `typecheck` — `tsc --noEmit`
 4. `unit-tests` — `vitest run`
-5. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
-6. `cap-sync` — `npx cap sync android`
-7. `apk` — `gradlew assembleDebug` (JDK 21)
-8. `e2e-gate` — `e2e/run-e2e.sh <new apk>` (17 steps)
-9. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
+5. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
+   its own vitest suite (ingest filtering, verify-then-index rejection,
+   FTS5 search, HTTP API + CORS). The service-dependent proofs
+   (`e2e/proof-public.mjs`, `appview` e2e) run against the standing local
+   testnet instead — they need live PLC/PDS/AppView processes and fixed
+   ports, which a pristine-worktree stage cannot own.
+6. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
+7. `cap-sync` — `npx cap sync android`
+8. `apk` — `gradlew assembleDebug` (JDK 21)
+9. `e2e-gate` — `e2e/run-e2e.sh <new apk>` (17 steps)
+10. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
    recipe, the new APK upgrades over it, data must survive. Runs on
    **every** commit — this is the test whose absence let the Phase 1
    storage swap orphan user data, and it does not get tiered away.
-10. `publish` — copies the APK to
+11. `publish` — copies the APK to
     `/home/devbox/builds/longtable/longtable-debug.apk`
 
 A run stops at the first failed stage and **does not publish**. Runs are
