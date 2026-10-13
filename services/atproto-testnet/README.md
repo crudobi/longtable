@@ -97,3 +97,26 @@ Handles under `.test` (a PDS `serviceHandleDomains` entry in dev-env)
 resolve **only inside this local network**. `olga.test` is not a DNS name
 and means nothing outside this testnet; likewise `did:plc:...` DIDs
 minted here exist only in the local PLC.
+
+## TLS proxy for emulator/app access (tls-proxy.mjs)
+
+The Longtable app runs on an https://localhost origin (Capacitor), so from
+the Android emulator it cannot fetch the plain-http PDS/AppView (mixed
+content + Android cleartext policy). `tls-proxy.mjs` terminates TLS with
+the e2e fixture CA server cert (SAN IP:10.0.2.2, already in the emulators
+
+## TLS proxy for emulator/app access (tls-proxy.mjs)
+
+The Longtable app runs on an https://localhost origin (Capacitor), so from
+the Android emulator it cannot fetch the plain-http PDS/AppView (mixed
+content + Android cleartext policy). `tls-proxy.mjs` terminates TLS with
+the e2e fixture CA server cert (SAN IP:10.0.2.2, already in the emulators'
+user trust store) and forwards to the local http services:
+
+    node tls-proxy.mjs 2584 http://localhost:2583   # PDS  -> https://10.0.2.2:2584
+    node tls-proxy.mjs 3211 http://localhost:3210   # AppView -> https://10.0.2.2:3211
+
+Point the app's publish settings at https://10.0.2.2:2584 and its AppView
+URL at https://10.0.2.2:3211 when testing on the emulator. Host-side tools
+keep using the plain http URLs. (e2e/proof-public.mjs depends on both
+proxies running.)
