@@ -21,8 +21,8 @@ import { dirname } from 'node:path'
 const require = createRequire(import.meta.url)
 const { BskyAgent } = require('@atproto/api')
 
-const PDS_URL = 'http://localhost:2583'
-const ACCOUNTS_FILE = '/home/devbox/ops/longtable-atproto/accounts.json'
+const PDS_URL = process.env.PDS_URL ?? 'http://localhost:2583'
+const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE ?? '/home/devbox/ops/longtable-atproto/accounts.json'
 const PASSWORD = 'test-account-password'
 
 const SPECS = [
