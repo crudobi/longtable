@@ -3,6 +3,7 @@ import type { Identity } from '../identity/identity'
 import { listFriends } from '../friends/friends'
 import { getRecipeKey } from '../friends/shelf'
 import { shareRecipeWithFriends } from '../friends/service'
+import { friendlyError } from '../friendlyError'
 
 interface Props {
   recipeId: string
@@ -40,7 +41,7 @@ export function FriendShareModal({ recipeId, recipeTitle, identity, onClose, onD
       await shareRecipeWithFriends(recipeId, [...checked], identity)
       onDone()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       setBusy(false)
     }
@@ -54,6 +55,11 @@ export function FriendShareModal({ recipeId, recipeTitle, identity, onClose, onD
           The recipe is encrypted on this device; only the friends you pick
           receive a key. Unchecking a friend re-keys the recipe so they stop
           receiving updates.
+        </p>
+        <p className="muted" data-testid="friend-share-caveat">
+          One thing unfriending can't do: copies a friend has already
+          received stay readable on their device. It stops new versions,
+          not what's already been delivered.
         </p>
         {friends.length === 0 ? (
           <p className="empty" data-testid="friend-share-empty">

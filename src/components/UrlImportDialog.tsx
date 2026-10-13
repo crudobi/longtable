@@ -8,8 +8,9 @@ interface Props {
 }
 
 /**
- * URL import dialog. Clearly labeled: fetching a page is the user's choice
- * and is the only network request the app ever makes.
+ * URL import dialog (prefill mode of the built-in web-page importer):
+ * fetching the page is the user's explicit choice; the form is filled
+ * from what the page declares, and nothing is saved until they tap Save.
  */
 export function UrlImportDialog({ onImport, onClose }: Props) {
   const [url, setUrl] = useState('')
@@ -44,9 +45,9 @@ export function UrlImportDialog({ onImport, onClose }: Props) {
       >
         <h2>Import from URL</h2>
         <p className="dialog-note">
-          Paste a recipe page link. Longtable fetches that page once, reads its
-          recipe metadata, and fills the form. This is the only time the app
-          ever contacts the network.
+          Paste a recipe page link. Longtable fetches that page once, reads
+          its recipe data, and fills the form — nothing is saved until you
+          tap Save, and the recipe then lives on this device like any other.
         </p>
         <input
           type="url"

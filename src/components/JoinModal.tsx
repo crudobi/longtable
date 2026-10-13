@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { joinShare, parseSharePayload } from '../p2p/share'
+import { friendlyError } from '../friendlyError'
 
 interface Props {
   onJoined: () => void
@@ -19,7 +20,7 @@ export function JoinModal({ onJoined, onClose }: Props) {
       await joinShare(payload)
       onJoined()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       setBusy(false)
     }

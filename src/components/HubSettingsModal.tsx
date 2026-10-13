@@ -7,6 +7,7 @@ import {
   setActiveHub,
   type HubConfig,
 } from '../hubs/hubs'
+import { friendlyError } from '../friendlyError'
 
 interface Props {
   onClose: () => void
@@ -47,7 +48,7 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
       refresh()
       onChanged?.()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     }
   }
 
@@ -58,7 +59,7 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
       refresh()
       onChanged?.()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     }
   }
 
@@ -91,7 +92,7 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
       // Adding a hub the user just typed usually means "use this one".
       activate(hub.id)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     }
   }
 
@@ -138,7 +139,7 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
         <label className="field-label" htmlFor="hub-name">Name</label>
         <input id="hub-name" type="text" data-testid="field-hub-name" value={name}
           onChange={(e) => setName(e.target.value)} />
-        <label className="field-label" htmlFor="hub-signaling">Signaling URL (wss)</label>
+        <label className="field-label" htmlFor="hub-signaling">Signaling URL (starts with wss://)</label>
         <input id="hub-signaling" type="url" placeholder="wss://hub.example:4444" data-testid="field-hub-signaling" value={signaling}
           onChange={(e) => setSignaling(e.target.value)} />
         <label className="field-label" htmlFor="hub-turn">TURN URL (optional)</label>
@@ -150,10 +151,10 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
         <label className="field-label" htmlFor="hub-turn-pass">TURN password</label>
         <input id="hub-turn-pass" type="password" data-testid="field-hub-turn-pass" value={turnPass}
           onChange={(e) => setTurnPass(e.target.value)} />
-        <label className="field-label" htmlFor="hub-appview">AppView URL</label>
+        <label className="field-label" htmlFor="hub-appview">Discovery (AppView) URL</label>
         <input id="hub-appview" type="url" placeholder="https://hub.example:3211" data-testid="field-hub-appview" value={appview}
           onChange={(e) => setAppview(e.target.value)} />
-        <label className="field-label" htmlFor="hub-pds">PDS URL</label>
+        <label className="field-label" htmlFor="hub-pds">Publishing (PDS) URL</label>
         <input id="hub-pds" type="url" placeholder="https://hub.example:2584" data-testid="field-hub-pds" value={pds}
           onChange={(e) => setPds(e.target.value)} />
 

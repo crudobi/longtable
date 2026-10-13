@@ -15,6 +15,7 @@ import {
   type PublicSearchResult,
 } from '../public/discover'
 import { getActiveHub } from '../hubs/hubs'
+import { friendlyError } from '../friendlyError'
 
 interface DiscoverProps {
   onClose: () => void
@@ -48,7 +49,7 @@ export function PublicRecipeView({
     try {
       await onSaveCopy()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       setBusy(false)
     }
@@ -149,7 +150,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
       setResults(found)
       setSearched(true)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e, 'the discovery service'))
     } finally {
       setBusy(false)
     }
@@ -162,7 +163,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
       const url = appViewUrl.trim() || loadAppViewUrl()
       setSelected(await fetchPublicRecipe(url, r.did, r.rkey))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e, 'the discovery service'))
     } finally {
       setBusy(false)
     }
@@ -200,7 +201,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
               Public recipes are published by their authors on ATProto.
               Saving a copy imports it into your local recipe box.
             </p>
-            <label className="field-label" htmlFor="appview-url">AppView URL</label>
+            <label className="field-label" htmlFor="appview-url">Discovery service (AppView) URL</label>
             <input
               id="appview-url"
               type="url"
@@ -208,6 +209,10 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
               value={appViewUrl}
               onChange={(e) => setAppViewUrl(e.target.value)}
             />
+            <p className="muted">
+              Usually set by your hub — change it only if you use a different
+              discovery service.
+            </p>
             <label className="field-label" htmlFor="discover-q">Search by name</label>
             <input
               id="discover-q"
@@ -240,8 +245,17 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
                 Close
               </button>
             </div>
+            {!searched && results.length === 0 && (
+              <p className="empty" data-testid="discover-hint">
+                Search for a dish by name, or list ingredients you have —
+                for example “eggs, spinach” — to find public recipes that
+                use them.
+              </p>
+            )}
             {searched && results.length === 0 && (
-              <p className="empty">No public recipes matched.</p>
+              <p className="empty" data-testid="discover-no-results">
+                No public recipes matched — try a shorter name or fewer ingredients.
+              </p>
             )}
             <ul className="recipe-cards">
               {results.map((r) => (

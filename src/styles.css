@@ -6,7 +6,7 @@
   --cream: #f7f4ec;
   --paper: #fffdf7;
   --ink: #23281f;
-  --muted: #6b6f60;
+  --muted: #5a5d4e; /* >= 5.5:1 on --cream/--paper */
   --line: #e3ddcd;
   --danger: #a33b2e;
   --radius: 12px;
@@ -42,6 +42,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 8px 0 16px;
 }
@@ -69,7 +70,24 @@ button {
   color: var(--ink);
   border-radius: 10px;
   padding: 8px 14px;
+  min-height: 44px; /* comfortable touch target */
   cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--green-dark);
+  outline-offset: 2px;
+}
+
+select {
+  font: inherit;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  min-height: 44px;
 }
 
 button.primary {
@@ -103,6 +121,17 @@ button:disabled {
   text-align: center;
   padding: 48px 24px;
   line-height: 1.5;
+}
+
+/* First-run welcome block: left-aligned prose reads better than centered. */
+.empty-state {
+  text-align: left;
+  max-width: 34rem;
+  margin: 0 auto;
+}
+
+.empty-state p {
+  margin: 0 0 12px;
 }
 
 .recipe-cards {
@@ -215,8 +244,8 @@ section h2 {
   color: #fff;
   border: none;
   border-radius: 50%;
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   padding: 0;
   line-height: 1;
 }
@@ -290,6 +319,11 @@ ol.edit-list {
   font-size: 1.3rem;
   padding: 0 6px;
   line-height: 1;
+  min-width: 40px;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .add-row {
@@ -390,7 +424,7 @@ ol.edit-list {
 }
 
 .modal {
-  background: #fff;
+  background: var(--paper);
   border-radius: 14px;
   padding: 20px;
   max-width: 420px;
@@ -406,7 +440,7 @@ ol.edit-list {
 }
 
 .modal .muted {
-  color: #666;
+  color: var(--muted);
   font-size: 0.9rem;
   line-height: 1.5;
   margin: 8px 0;
@@ -417,11 +451,21 @@ ol.edit-list {
   box-sizing: border-box;
   font-family: monospace;
   font-size: 0.75rem;
-  border: 1px solid #ddd;
+  border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
   margin: 8px 0;
   word-break: break-all;
+}
+
+.modal h3 {
+  margin: 22px 0 6px;
+  font-size: 1rem;
+}
+
+.modal input[type='file'] {
+  font: inherit;
+  padding: 6px 0;
 }
 
 .modal-actions {
@@ -469,7 +513,7 @@ ol.edit-list {
   align-items: center;
   gap: 10px;
   padding: 8px 0;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--line);
 }
 .friend-name-text {
   font-weight: 600;
@@ -517,4 +561,4 @@ ol.edit-list {
 }
 
 .hub-list { list-style: none; padding: 0; }
-.hub-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+.hub-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }

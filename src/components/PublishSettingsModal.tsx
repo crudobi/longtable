@@ -8,6 +8,7 @@ import {
   saveSession,
   type AtprotoSession,
 } from '../public/atproto'
+import { friendlyError } from '../friendlyError'
 
 interface Props {
   identity: Identity | null
@@ -72,7 +73,7 @@ export function PublishSettingsModal({ identity, onClose, onSessionChanged }: Pr
       onSessionChanged?.()
       await checkBinding(sess)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e, 'the publishing server'))
     } finally {
       setBusy(false)
     }
@@ -88,11 +89,14 @@ export function PublishSettingsModal({ identity, onClose, onSessionChanged }: Pr
   return (
     <div className="modal-backdrop" data-testid="publish-settings-modal">
       <div className="modal" role="dialog" aria-label="Publishing settings">
-        <h2>Public publishing (ATProto)</h2>
+        <h2>Publishing account</h2>
         <p className="muted">
-          Publishing puts a signed copy of a recipe on your PDS so anyone can
-          find it in Discover. Private and friends-only recipes never leave
-          this device (friends-only stays encrypted).
+          Publishing is optional, and only for recipes you mark public: it
+          puts a signed copy of the recipe on your publishing server (an
+          ATProto PDS) so anyone can find it in Discover. Private and
+          friends-only recipes never leave this device (friends-only stays
+          encrypted). Signing in here uses an existing ATProto account —
+          your cookbook itself needs no account at all.
         </p>
 
         <p className="status" data-testid="atproto-session-status">
@@ -117,7 +121,7 @@ export function PublishSettingsModal({ identity, onClose, onSessionChanged }: Pr
 
         {!session && (
           <>
-            <label className="field-label" htmlFor="pds-url">PDS URL</label>
+            <label className="field-label" htmlFor="pds-url">Publishing server (PDS) URL</label>
             <input
               id="pds-url"
               type="url"
@@ -144,6 +148,10 @@ export function PublishSettingsModal({ identity, onClose, onSessionChanged }: Pr
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
+            <p className="muted">
+              Use an app password from your account's settings — not your main
+              account password. It is used once to sign in and never stored.
+            </p>
           </>
         )}
 

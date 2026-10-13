@@ -19,6 +19,7 @@ import {
   unfriendAndRekey,
   type ReceivedShareInfo,
 } from '../friends/service'
+import { friendlyError } from '../friendlyError'
 
 interface Props {
   identity: Identity
@@ -76,7 +77,7 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
     } catch (e) {
       // Timeout is normal if nobody scans; only surface real errors while
       // the panel is still open.
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       pairingRef.current = false
     }
@@ -98,23 +99,23 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
       await reload()
       onChanged()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       setBusy(false)
     }
   }
 
   const unfriend = async (friend: FriendRecord) => {
-    if (!window.confirm(`Remove ${friend.name || shortDid(friend.did)} as a friend? Recipes you shared with them will be re-keyed so they stop receiving updates.`)) return
+    if (!window.confirm(`Remove ${friend.name || shortDid(friend.did)} as a friend? They will stop receiving updates to recipes you shared — those recipes get re-keyed. But recipes they have already received stay readable on their device: unfriending can't take back a copy that's already been delivered.`)) return
     setBusy(true)
     setError(null)
     try {
       await unfriendAndRekey(friend.did, identity)
-      setStatus(`${friend.name || 'Friend'} removed and your recipes re-keyed.`)
+      setStatus(`${friend.name || 'Friend'} removed. Your shared recipes were re-keyed, so they'll get no new versions — copies they already had stay on their device.`)
       await reload()
       onChanged()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(friendlyError(e))
     } finally {
       setBusy(false)
     }
@@ -189,8 +190,17 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
         </div>
 
         <h3>Your friends</h3>
+        <p className="muted" data-testid="unfriend-caveat">
+          About unfriending: it stops future updates — recipes you shared
+          are re-keyed, so an ex-friend can't read new versions. Copies a
+          friend has already received stay readable on their device; once a
+          recipe has been delivered, it can't be taken back.
+        </p>
         {friends.length === 0 ? (
-          <p className="empty" data-testid="friend-empty">No friends yet.</p>
+          <p className="empty" data-testid="friend-empty">
+            No friends yet — pair with the invite code above; it takes about
+            a minute once your friend pastes it.
+          </p>
         ) : (
           <ul className="friend-list">
             {friends.map((f) => (
