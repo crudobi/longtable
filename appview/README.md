@@ -146,7 +146,10 @@ curl localhost:3210/health
 ```sh
 npm test          # vitest unit tests: FTS search, ingredient AND, reconcile
                   # diff/delete via a fake repo-state provider seam, and
-                  # ingestClaim forgery rejection (test/*.test.mjs)
+                  # ingestClaim forgery rejection (test/*.appview-test.mjs —
+                  # the suffix keeps the root package's CI vitest sweep,
+                  # which runs without appview's node_modules, from trying
+                  # to execute this subpackage's tests)
 npm run test:e2e  # e2e/appview.e2e.mjs against the live local testnet:
                   # author publishes -> searchable (latency printed);
                   # attacker publishes same name -> both, own DIDs;
