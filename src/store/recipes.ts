@@ -228,7 +228,9 @@ export async function getRecipe(repo: YjsStore, url: string): Promise<Recipe | n
     updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
     ...(map.get('visibility') === 'friends-only'
       ? { visibility: 'friends-only' as const }
-      : {}),
+      : map.get('visibility') === 'public'
+        ? { visibility: 'public' as const }
+        : {}),
     ...(map.has('prepMinutes') ? { prepMinutes: map.get('prepMinutes') as number } : {}),
     ...(map.has('cookMinutes') ? { cookMinutes: map.get('cookMinutes') as number } : {}),
   }

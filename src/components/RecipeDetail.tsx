@@ -1,4 +1,4 @@
-import type { Recipe } from '../types'
+import type { Recipe, VisibilityTier } from '../types'
 
 interface Props {
   recipe: Recipe
@@ -7,13 +7,32 @@ interface Props {
   onShare: () => void
   onShareFriends: () => void
   onBack: () => void
+  /**
+   * Set the visibility tier (Phase 3). App implements the real byte
+   * movement: public publishes a signed ATProto record, leaving public
+   * deletes it, friends-only opens the friend picker. Optional so the
+   * detail view still renders without publishing wired up.
+   */
+  onSetVisibility?: (recipe: Recipe, tier: VisibilityTier) => void
+  /** Open the ATProto publishing settings (also used when going public signed-out). */
+  onOpenPublishSettings?: () => void
 }
 
 function formatMinutes(min?: number): string {
   return min === undefined ? '—' : `${min} min`
 }
 
-export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onShareFriends, onBack }: Props) {
+export function RecipeDetail({
+  recipe,
+  onEdit,
+  onDelete,
+  onShare,
+  onShareFriends,
+  onBack,
+  onSetVisibility,
+  onOpenPublishSettings,
+}: Props) {
+  const tier: VisibilityTier = recipe.visibility ?? 'private'
   return (
     <div className="view" data-testid="recipe-detail">
       <header className="app-header">
@@ -44,6 +63,50 @@ export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onShareFriends
         <p className="badge" data-testid="visibility-badge">
           Friends-only — encrypted for chosen friends
         </p>
+      )}
+      {recipe.visibility === 'public' && (
+        <p className="badge" data-testid="visibility-badge">
+          Public — published for anyone to find
+        </p>
+      )}
+
+      {onSetVisibility && (
+        <div className="visibility-control" data-testid="visibility-control">
+          <span className="visibility-label">Visibility:</span>
+          <button
+            data-testid="visibility-private"
+            className={tier === 'private' ? 'primary' : undefined}
+            aria-pressed={tier === 'private'}
+            onClick={() => onSetVisibility(recipe, 'private')}
+          >
+            Private{tier === 'private' ? ' ✓' : ''}
+          </button>
+          <button
+            data-testid="visibility-friends"
+            className={tier === 'friends-only' ? 'primary' : undefined}
+            aria-pressed={tier === 'friends-only'}
+            onClick={() => onSetVisibility(recipe, 'friends-only')}
+          >
+            Friends only{tier === 'friends-only' ? ' ✓' : ''}
+          </button>
+          <button
+            data-testid="visibility-public"
+            className={tier === 'public' ? 'primary' : undefined}
+            aria-pressed={tier === 'public'}
+            onClick={() => onSetVisibility(recipe, 'public')}
+          >
+            Public{tier === 'public' ? ' ✓' : ''}
+          </button>
+          {onOpenPublishSettings && (
+            <button
+              className="ghost"
+              data-testid="open-publish-settings"
+              onClick={onOpenPublishSettings}
+            >
+              Publishing settings
+            </button>
+          )}
+        </div>
       )}
 
       <div className="times">

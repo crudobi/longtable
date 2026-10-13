@@ -25,7 +25,22 @@ import {
 } from './friends/service'
 import { FriendsPanel } from './components/FriendsPanel'
 import { FriendShareModal } from './components/FriendShareModal'
-import type { Recipe, RecipeInput, RecipeSummary } from './types'
+import { PublishSettingsModal } from './components/PublishSettingsModal'
+import { DiscoverPanel } from './components/DiscoverPanel'
+import {
+  AtprotoClient,
+  loadAppViewUrl,
+  loadSession,
+  saveSession,
+} from './public/atproto'
+import {
+  ensurePubkeyBinding,
+  getPublication,
+  publishRecipe,
+  unpublishRecipe,
+} from './public/publish'
+import { searchAppView } from './public/discover'
+import type { Recipe, RecipeInput, RecipeSummary, VisibilityTier } from './types'
 
 type View =
   | { name: 'list' }
@@ -47,6 +62,8 @@ export default function App() {
   const identityRef = useRef<Identity | null>(null)
   const [friendsOpen, setFriendsOpen] = useState(false)
   const [friendShareId, setFriendShareId] = useState<string | null>(null)
+  const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
+  const [discoverOpen, setDiscoverOpen] = useState(false)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detailIdRef = useRef<string | null>(null)
 
@@ -174,6 +191,25 @@ export default function App() {
           console.warn('republish failed', e),
         )
       }
+      // If this recipe is public with a live publication, republish the
+      // fresh content (new blobs + a fresh device signature) to the PDS.
+      if (idn) {
+        try {
+          const session = loadSession()
+          if (session && getPublication(id)) {
+            const entry = (await index.doc())?.recipes[id]
+            const fresh = entry ? await getRecipe(repo, entry.url) : null
+            if (fresh && fresh.visibility === 'public') {
+              const client = new AtprotoClient(session.pdsUrl, {
+                onSessionRefresh: (s) => saveSession(s),
+              })
+              await publishRecipe(client, session, idn, { ...fresh, id })
+            }
+          }
+        } catch (e) {
+          console.warn('public republish failed', e)
+        }
+      }
       await refresh()
       await openDetail(id)
     },
@@ -192,6 +228,15 @@ export default function App() {
           console.warn('unshare failed', e),
         )
       }
+      // If it was published publicly, remove the ATProto record first.
+      if (getPublication(id)) {
+        const session = loadSession()
+        if (session) {
+          await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
+            (e) => console.warn('unpublish failed', e),
+          )
+        }
+      }
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
       await deleteRecipe(repo, index, id)
@@ -200,6 +245,118 @@ export default function App() {
     },
     [summaries, refresh],
   )
+
+  const loadRecipeById = useCallback(async (id: string): Promise<Recipe | null> => {
+    const repo = getRepo()
+    const index = await getOrCreateIndex(repo)
+    const entry = (await index.doc())?.recipes[id]
+    if (!entry) return null
+    return getRecipe(repo, entry.url)
+  }, [])
+
+  /**
+   * Visibility switching — the real byte movement between tiers:
+   *   → public:      requires an ATProto session (no session → open the
+   *                  publishing settings and abort, tier unchanged);
+   *                  ensure the pubkey binding, publish the signed record
+   *                  to the PDS, only then mark the recipe 'public'.
+   *   → private:     unpublish the ATProto record first (if any); strip
+   *                  friends-only shares everywhere (if friends-only);
+   *                  then mark 'private'.
+   *   → friends-only: unpublish the ATProto record first (if any); mark
+   *                  'friends-only'; open the friend picker (the existing
+   *                  friendShareId flow does the encrypted publishing).
+   */
+  const handleSetVisibility = useCallback(
+    async (id: string, recipe: Recipe, tier: VisibilityTier) => {
+      try {
+        setError(null)
+        const repo = getRepo()
+        const index = await getOrCreateIndex(repo)
+        const idn = identityRef.current
+        const publication = getPublication(id)
+        const unpublishIfNeeded = async () => {
+          if (!publication) return
+          const session = loadSession()
+          if (!session) return
+          const client = new AtprotoClient(session.pdsUrl, {
+            onSessionRefresh: (s) => saveSession(s),
+          })
+          await unpublishRecipe(client, session, id)
+        }
+
+        if (tier === 'public') {
+          const session = loadSession()
+          if (!session || !idn) {
+            setPublishSettingsOpen(true)
+            return
+          }
+          const client = new AtprotoClient(session.pdsUrl, {
+            onSessionRefresh: (s) => saveSession(s),
+          })
+          await ensurePubkeyBinding(client, session, idn)
+          await publishRecipe(client, session, idn, { ...recipe, id })
+          await updateRecipe(repo, index, id, { visibility: 'public' })
+        } else if (tier === 'private') {
+          await unpublishIfNeeded()
+          if (recipe.visibility === 'friends-only' && idn) {
+            await unshareRecipeEverywhere(id, idn)
+          }
+          await updateRecipe(repo, index, id, { visibility: 'private' })
+        } else {
+          await unpublishIfNeeded()
+          await updateRecipe(repo, index, id, { visibility: 'friends-only' })
+          await refresh()
+          await openDetail(id)
+          setFriendShareId(id)
+          return
+        }
+        await refresh()
+        await openDetail(id)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    },
+    [refresh, openDetail],
+  )
+
+  const handleSetVisibilityRef = useRef(handleSetVisibility)
+  handleSetVisibilityRef.current = handleSetVisibility
+
+  // Phase 3 debug hooks (e2e proof): window.__ltPublic, installed when the
+  // device identity lands — same pattern as installFriendsDebugHooks.
+  useEffect(() => {
+    if (!identity) return
+    const w = window as unknown as { __ltPublic?: unknown }
+    w.__ltPublic = {
+      getSession: () => loadSession(),
+      publishById: async (id: string) => {
+        const session = loadSession()
+        if (!session) throw new Error('no ATProto session')
+        const rec = await loadRecipeById(id)
+        if (!rec) throw new Error(`recipe not found: ${id}`)
+        const client = new AtprotoClient(session.pdsUrl, {
+          onSessionRefresh: (s) => saveSession(s),
+        })
+        return publishRecipe(client, session, identity, { ...rec, id })
+      },
+      unpublishById: async (id: string) => {
+        const session = loadSession()
+        if (!session) throw new Error('no ATProto session')
+        const client = new AtprotoClient(session.pdsUrl, {
+          onSessionRefresh: (s) => saveSession(s),
+        })
+        await unpublishRecipe(client, session, id)
+      },
+      setVisibilityById: async (id: string, tier: VisibilityTier) => {
+        const rec = await loadRecipeById(id)
+        if (!rec) throw new Error(`recipe not found: ${id}`)
+        await handleSetVisibilityRef.current(id, rec, tier)
+      },
+      search: (q?: string, ingredients?: string[] | string) =>
+        searchAppView(loadAppViewUrl(), { q, ingredients }),
+    }
+  }, [identity, loadRecipeById])
 
   const handleShare = useCallback(async (id: string) => {
     try {
@@ -234,6 +391,7 @@ export default function App() {
           onNew={() => setView({ name: 'new' })}
           onJoin={() => setJoinOpen(true)}
           onFriends={() => setFriendsOpen(true)}
+          onDiscover={() => setDiscoverOpen(true)}
         />
       )}
       {view.name === 'detail' && current && (
@@ -244,6 +402,8 @@ export default function App() {
           onShare={() => void handleShare(view.id)}
           onShareFriends={() => setFriendShareId(view.id)}
           onBack={() => setView({ name: 'list' })}
+          onSetVisibility={(r, tier) => void handleSetVisibility(view.id, r, tier)}
+          onOpenPublishSettings={() => setPublishSettingsOpen(true)}
         />
       )}
       {view.name === 'new' && (
@@ -281,6 +441,18 @@ export default function App() {
           onClose={() => setFriendsOpen(false)}
           onOpenRecipe={(localId) => void openDetail(localId)}
           onChanged={() => void refresh()}
+        />
+      )}
+      {publishSettingsOpen && (
+        <PublishSettingsModal
+          identity={identity}
+          onClose={() => setPublishSettingsOpen(false)}
+        />
+      )}
+      {discoverOpen && (
+        <DiscoverPanel
+          onClose={() => setDiscoverOpen(false)}
+          onSaveCopy={handleCreate}
         />
       )}
       {friendShareId && identity && (

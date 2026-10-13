@@ -484,3 +484,34 @@ ol.edit-list {
   flex: 1;
   text-align: left;
 }
+
+/* Phase 3: visibility control + discovery */
+.visibility-control {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.visibility-label {
+  font-weight: 600;
+  color: var(--muted);
+}
+.visibility-control button[aria-pressed='true'] {
+  font-weight: 700;
+}
+.modal input[type='text'],
+.modal input[type='url'],
+.modal input[type='password'] {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+}
+.recipe-card .recipe-card-meta {
+  display: block;
+}
