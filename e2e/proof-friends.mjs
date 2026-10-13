@@ -97,26 +97,32 @@ async function clickAndWait(driver, clickSel, waitSel, timeout = 20000) {
 async function openFriends(driver) {
   const panel = await driver.$('[data-testid="friends-panel"]')
   if (await panel.isExisting()) return
-  // friends-open lives on the list view; navigate there if needed, with
-  // retries — view transitions can lag while channel traffic lands.
+  // friends-open lives on the list view; navigate there if needed. DOM
+  // clicks with effect verification: coordinate clicks in this emulator
+  // environment are intermittently swallowed, and an unverified open
+  // leaves the proof polling a panel that never mounted.
   for (let i = 0; i < 20; i++) {
-    const openBtn = await driver.$('[data-testid="friends-open"]')
-    if (await openBtn.isExisting()) {
-      await openBtn.click()
-      break
+    const onList = await evalJs(driver, '!!document.querySelector(\'[data-testid="friends-open"]\')')
+    if (onList) {
+      await evalJs(driver, 'document.querySelector(\'[data-testid="friends-open"]\').click()')
+    } else {
+      await evalJs(driver, 'document.querySelector(\'[data-testid="back-to-list"]\')?.click()')
     }
-    const back = await driver.$('[data-testid="back-to-list"]')
-    if (await back.isExisting()) await back.click()
-    await sleep(1000)
+    await sleep(900)
+    if (await panel.isExisting()) return
   }
   await panel.waitForExist({ timeout: 20000 })
 }
 
 async function closeFriends(driver) {
   const panel = await driver.$('[data-testid="friends-panel"]')
-  if (await panel.isExisting()) {
-    await (await driver.$('[data-testid="close-friends"]')).click()
-    await sleep(600)
+  // Verified DOM close: a swallowed coordinate click here once left the
+  // panel mounted with pairing-time state for an entire proof run —
+  // the shelf never re-rendered even though the share had synced and
+  // imported underneath. Loop until the panel is actually gone.
+  for (let i = 0; i < 10 && (await panel.isExisting()); i++) {
+    await evalJs(driver, 'document.querySelector(\'[data-testid="close-friends"]\')?.click()')
+    await sleep(700)
   }
 }
 
@@ -167,6 +173,16 @@ async function joinWith(driver, code) {
 
 async function friendCount(driver) {
   return (await driver.$$('[data-testid="friend-item"]')).length
+}
+
+
+async function clickShelfItem(driver, title) {
+  const ok = await evalJs(driver, `(() => {
+    const items = document.querySelectorAll('[data-testid="shelf-item"]')
+    for (const it of items) { if (it.textContent.includes(${JSON.stringify(title)})) { it.click(); return true } }
+    return false
+  })()`)
+  if (!ok) throw new Error('shelf item not found for DOM click: ' + title)
 }
 
 async function shelfHas(driver, title) {
@@ -255,7 +271,7 @@ async function main() {
     const shelfB = await shelfHas(B, 'Midnight Soup')
     step('friend shelf: B sees “Midnight Soup”', !!shelfB)
     if (shelfB) {
-      await shelfB.click()
+      await clickShelfItem(B, "Midnight Soup")
       const t = await B.$('[data-testid="recipe-title"]')
       await t.waitForExist({ timeout: 20000 })
       const body = await (await B.$('[data-testid="recipe-detail"]')).getText()
@@ -311,7 +327,7 @@ async function main() {
     const shelfB2 = await shelfHas(B, 'Midnight Soup v2')
     step('after unfriend: B still receives updates (v2 on shelf)', !!shelfB2)
     if (shelfB2) {
-      await shelfB2.click()
+      await clickShelfItem(B, "Midnight Soup v2")
       const t = await B.$('[data-testid="recipe-title"]')
       await t.waitForExist({ timeout: 20000 })
       step('after unfriend: B opens v2', (await t.getText()) === 'Midnight Soup v2')
