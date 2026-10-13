@@ -5,6 +5,7 @@ interface Props {
   onEdit: () => void
   onDelete: () => void
   onShare: () => void
+  onShareFriends: () => void
   onBack: () => void
 }
 
@@ -12,7 +13,7 @@ function formatMinutes(min?: number): string {
   return min === undefined ? '—' : `${min} min`
 }
 
-export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onBack }: Props) {
+export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onShareFriends, onBack }: Props) {
   return (
     <div className="view" data-testid="recipe-detail">
       <header className="app-header">
@@ -29,12 +30,21 @@ export function RecipeDetail({ recipe, onEdit, onDelete, onShare, onBack }: Prop
           <button data-testid="share-recipe" onClick={onShare}>
             Share
           </button>
+          <button data-testid="share-friends" onClick={onShareFriends}>
+            Share with friends
+          </button>
         </div>
       </header>
 
       <h1 className="detail-title" data-testid="recipe-title">
         {recipe.title || 'Untitled'}
       </h1>
+
+      {recipe.visibility === 'friends-only' && (
+        <p className="badge" data-testid="visibility-badge">
+          Friends-only — encrypted for chosen friends
+        </p>
+      )}
 
       <div className="times">
         <span>

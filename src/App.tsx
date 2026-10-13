@@ -15,6 +15,16 @@ import { ShareModal } from './components/ShareModal'
 import { JoinModal } from './components/JoinModal'
 import { onShareUpdate, rejoinShares, shareRecipe } from './p2p/share'
 import type { SharePayload } from './p2p/share'
+import { getOrCreateIdentity, type Identity } from './identity/identity'
+import { onChannelUpdate, rejoinFriendChannels } from './friends/friends'
+import {
+  importReceivedShares,
+  installFriendsDebugHooks,
+  republishIfShared,
+  unshareRecipeEverywhere,
+} from './friends/service'
+import { FriendsPanel } from './components/FriendsPanel'
+import { FriendShareModal } from './components/FriendShareModal'
 import type { Recipe, RecipeInput, RecipeSummary } from './types'
 
 type View =
@@ -33,6 +43,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [sharePayload, setSharePayload] = useState<SharePayload | null>(null)
   const [joinOpen, setJoinOpen] = useState(false)
+  const [identity, setIdentity] = useState<Identity | null>(null)
+  const identityRef = useRef<Identity | null>(null)
+  const [friendsOpen, setFriendsOpen] = useState(false)
+  const [friendShareId, setFriendShareId] = useState<string | null>(null)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detailIdRef = useRef<string | null>(null)
 
@@ -76,12 +90,39 @@ export default function App() {
       } catch (e) {
         console.warn('automerge migration failed', e)
       }
+      // Phase 2 identity: load (or create) the device DID, rejoin friend
+      // channels, and import any friends-only shares waiting in them.
+      try {
+        const id = await getOrCreateIdentity()
+        identityRef.current = id
+        setIdentity(id)
+        installFriendsDebugHooks(id)
+        await rejoinFriendChannels()
+        await importReceivedShares(id).catch((e) =>
+          console.warn('import received shares failed', e),
+        )
+      } catch (e) {
+        console.warn('identity setup failed', e)
+      }
       await refresh()
     })()
       .catch((e) => setError(String(e)))
       .finally(() => setReady(true))
     // Rejoin P2P shares (peers rediscover via signaling and sync converges).
     void rejoinShares().catch((e) => console.warn('rejoin shares failed', e))
+    // Friends-only channel updates: a friend published or republished a
+    // share — decrypt what's addressed to me and refresh.
+    let channelTimer: ReturnType<typeof setTimeout> | null = null
+    const unsubChannel = onChannelUpdate(() => {
+      const id = identityRef.current
+      if (!id) return
+      if (channelTimer) clearTimeout(channelTimer)
+      channelTimer = setTimeout(() => {
+        void importReceivedShares(id)
+          .then(() => refresh())
+          .catch((e) => console.warn('channel import failed', e))
+      }, 800)
+    })
     // Live refresh when a shared doc updates (local or remote edit).
     // Debounced: a burst of keystrokes or sync updates refreshes once.
     const unsubscribe = onShareUpdate(() => {
@@ -95,6 +136,8 @@ export default function App() {
     })
     return () => {
       unsubscribe()
+      unsubChannel()
+      if (channelTimer) clearTimeout(channelTimer)
       if (refreshTimer.current) clearTimeout(refreshTimer.current)
     }
   }, [refresh, openDetail])
@@ -123,6 +166,14 @@ export default function App() {
         prepMinutes: input.prepMinutes,
         cookMinutes: input.cookMinutes,
       })
+      // If this recipe is shared friends-only, republish the new version
+      // (encrypted, same key) to its authorized friends.
+      const idn = identityRef.current
+      if (idn) {
+        await republishIfShared(id, idn).catch((e) =>
+          console.warn('republish failed', e),
+        )
+      }
       await refresh()
       await openDetail(id)
     },
@@ -134,6 +185,13 @@ export default function App() {
       const summary = summaries.find((s) => s.id === id)
       const name = summary?.title || 'this recipe'
       if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return
+      // Strip friends-only shares of this recipe from friends' channels.
+      const idn = identityRef.current
+      if (idn) {
+        await unshareRecipeEverywhere(id, idn).catch((e) =>
+          console.warn('unshare failed', e),
+        )
+      }
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
       await deleteRecipe(repo, index, id)
@@ -175,6 +233,7 @@ export default function App() {
           onOpen={openDetail}
           onNew={() => setView({ name: 'new' })}
           onJoin={() => setJoinOpen(true)}
+          onFriends={() => setFriendsOpen(true)}
         />
       )}
       {view.name === 'detail' && current && (
@@ -183,6 +242,7 @@ export default function App() {
           onEdit={() => setView({ name: 'edit', id: view.id })}
           onDelete={() => void handleDelete(view.id)}
           onShare={() => void handleShare(view.id)}
+          onShareFriends={() => setFriendShareId(view.id)}
           onBack={() => setView({ name: 'list' })}
         />
       )}
@@ -214,6 +274,26 @@ export default function App() {
       )}
       {joinOpen && (
         <JoinModal onJoined={() => void handleJoined()} onClose={() => setJoinOpen(false)} />
+      )}
+      {friendsOpen && identity && (
+        <FriendsPanel
+          identity={identity}
+          onClose={() => setFriendsOpen(false)}
+          onOpenRecipe={(localId) => void openDetail(localId)}
+          onChanged={() => void refresh()}
+        />
+      )}
+      {friendShareId && identity && (
+        <FriendShareModal
+          recipeId={friendShareId}
+          recipeTitle={summaries.find((r) => r.id === friendShareId)?.title ?? 'recipe'}
+          identity={identity}
+          onClose={() => setFriendShareId(null)}
+          onDone={() => {
+            setFriendShareId(null)
+            void refresh()
+          }}
+        />
       )}
     </div>
   )

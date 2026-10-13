@@ -440,3 +440,47 @@ ol.edit-list {
   border-radius: 10px;
   margin: 12px 0;
 }
+
+/* Phase 2: friends */
+.modal-wide {
+  max-width: 560px;
+}
+.field-label {
+  display: block;
+  margin: 16px 0 6px;
+  font-weight: 600;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #e8f0e8;
+  color: #2f5d2f;
+  font-size: 0.85rem;
+  margin: 4px 0 8px;
+}
+.friend-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+.friend-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #eee;
+}
+.friend-name-text {
+  font-weight: 600;
+}
+.friend-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.friend-item .recipe-card {
+  flex: 1;
+  text-align: left;
+}
