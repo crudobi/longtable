@@ -423,6 +423,43 @@ async function main() {
     return 'imported via registry UI, listed in cookbook';
   });
 
+  await step('developer settings: localhost API is off by default and explains itself', async () => {
+    await (await el('[data-testid="open-developer"]')).click();
+    await el('[data-testid="developer-modal"]');
+    const toggle = await el('[data-testid="localapi-toggle"]');
+    assert(!(await toggle.isSelected()), 'localhost API should start off');
+    const t = await bodyText();
+    assert(t.includes('127.0.0.1'), 'modal does not explain the loopback-only address');
+    assert(t.includes('off unless you turn it on'), 'modal does not state the off-by-default posture');
+    return 'off by default; loopback + opt-in explained';
+  });
+
+  await step('developer settings: enabling shows address + token; health answers, recipes demand the token', async () => {
+    await (await el('[data-testid="localapi-toggle"]')).click();
+    const addr = await (await el('[data-testid="localapi-address"]')).getText();
+    assert(addr.includes('127.0.0.1:17337'), `unexpected address shown: ${addr}`);
+    const token = (await (await el('[data-testid="localapi-token"]')).getText()).trim();
+    assert(/^[0-9a-f]{64}$/.test(token), 'token not shown as 64 hex chars');
+    // Reach the on-device socket from the host via adb's loopback forward.
+    try { adb('forward', '--remove', 'tcp:17337'); } catch { /* not set */ }
+    adb('forward', 'tcp:17337', 'tcp:17337');
+    let health = null;
+    for (let i = 0; i < 15 && !health; i++) {
+      try {
+        health = execFileSync('curl', ['-sf', '--max-time', '4', 'http://127.0.0.1:17337/v1/health'], { encoding: 'utf8' });
+      } catch { await new Promise((r) => setTimeout(r, 1000)); }
+    }
+    assert(health && JSON.parse(health).ok === true, `health did not answer ok: ${health}`);
+    const noAuth = execFileSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '4', 'http://127.0.0.1:17337/v1/recipes'], { encoding: 'utf8' });
+    assert(noAuth === '401', `expected 401 without token, got ${noAuth}`);
+    const withAuth = execFileSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '4', '-H', `Authorization: Bearer ${token}`, 'http://127.0.0.1:17337/v1/recipes'], { encoding: 'utf8' });
+    assert(withAuth === '200', `expected 200 with token, got ${withAuth}`);
+    await (await el('[data-testid="close-developer"]')).click();
+    const modal = await $d('[data-testid="developer-modal"]');
+    await modal.waitForExist({ reverse: true, timeout: 10000 });
+    return 'health open; /v1/recipes 401 without token, 200 with it';
+  });
+
   await step('no fatal crash at end', async () => {
     const fatals = await fatalCrashes();
     assert(fatals.length === 0, fatals[0]);
