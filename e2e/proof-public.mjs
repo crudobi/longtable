@@ -282,8 +282,17 @@ async function main() {
     await (await A.$('[data-testid="field-appview-url"]')).setValue(APPVIEW_EMU)
     await (await A.$('[data-testid="field-discover-q"]')).setValue(STEW)
     await (await A.$('[data-testid="discover-search"]')).click()
-    const resultEl = await A.$('[data-testid="discover-result"]')
-    await resultEl.waitForExist({ timeout: 30000 })
+    await (await A.$('[data-testid="discover-result"]')).waitForExist({ timeout: 30000 })
+    // Pick the AUTHOR's result explicitly: the AppView index persists
+    // across proof runs, so a prior run's attacker mimic (same title)
+    // can also match the search. Clicking the first result is a coin
+    // flip — select by the author DID fragment shown on the card.
+    const didFrag = AUTHOR.did.slice(8, 18)
+    let resultEl = null
+    for (const el of await A.$$('[data-testid="discover-result"]')) {
+      if ((await el.getText()).includes(didFrag)) { resultEl = el; break }
+    }
+    if (!resultEl) throw new Error('discover results contain no card from the author DID')
     await resultEl.click()
     await (await A.$('[data-testid="public-recipe-view"]')).waitForExist({ timeout: 20000 })
     const authorShown = await (await A.$('[data-testid="public-author"]')).getText()
