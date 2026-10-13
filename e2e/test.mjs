@@ -161,6 +161,16 @@ async function main() {
     return 'header "Longtable", empty-state list';
   });
 
+  await step('first run: empty cookbook explains what to do next', async () => {
+    const empty = await el('[data-testid="cookbook-empty"]');
+    const t = await empty.getText();
+    assert(t.includes('No recipes yet'), 'empty state missing the headline');
+    assert(t.includes('New recipe'), 'empty state does not point at New recipe');
+    assert(t.includes('Import'), 'empty state does not point at Import');
+    assert(t.includes('on this device'), 'empty state does not state local storage');
+    return 'welcome copy + next steps present';
+  });
+
   await step('no fatal crash on launch', async () => {
     const fatals = await fatalCrashes();
     assert(fatals.length === 0, fatals[0]);
@@ -359,6 +369,58 @@ async function main() {
     assert((await bodyText()).includes('200g flour'), 'ingredients not prefilled');
     await cancelForm();
     return 'prefilled title + ingredients';
+  });
+
+  await step('friends panel states the unfriend caveat plainly', async () => {
+    await (await el('[data-testid="friends-open"]')).click();
+    await el('[data-testid="friends-panel"]');
+    const caveat = await el('[data-testid="unfriend-caveat"]');
+    const t = await caveat.getText();
+    assert(t.includes('stay readable'), 'caveat does not say delivered copies stay readable');
+    assert(t.includes("can't read new versions"), 'caveat does not state forward-only revocation');
+    await (await el('[data-testid="close-friends"]')).click();
+    const panel = await $d('[data-testid="friends-panel"]');
+    await panel.waitForExist({ reverse: true, timeout: 10000 });
+    return 'caveat visible without starting an unfriend';
+  });
+
+  await step('import panel: JSON importer adds a recipe to the cookbook', async () => {
+    await (await el('[data-testid="open-import"]')).click();
+    await el('[data-testid="import-panel"]');
+    // Pick the JSON importer in the registry-driven <select> (React
+    // controlled component: native value setter + bubbling change).
+    await driver.executeScript(
+      'var s = document.querySelector(\'[data-testid="importer-select"]\');' +
+      'var setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;' +
+      'setter.call(s, "longtable-json");' +
+      's.dispatchEvent(new Event("change", { bubbles: true }));',
+      []
+    );
+    // Feed the file input a JSON file via DataTransfer (same technique as
+    // the photo step: chromedriver does no file detection for sendKeys).
+    const json = JSON.stringify({
+      title: 'E2E Imported Stew',
+      ingredients: ['rice', 'beans'],
+      steps: ['Simmer everything.'],
+      prepMinutes: 10,
+    });
+    await driver.executeScript(
+      'var file = new File([arguments[0]], "recipes.json", { type: "application/json" });' +
+      'var dt = new DataTransfer(); dt.items.add(file);' +
+      'var input = document.querySelector(\'[data-testid="import-file"]\');' +
+      'input.files = dt.files;' +
+      'input.dispatchEvent(new Event("change", { bubbles: true }));',
+      [json]
+    );
+    await (await el('[data-testid="run-import"]')).click();
+    const result = await el('[data-testid="import-result"]', 20000);
+    const msg = await result.getText();
+    assert(msg.includes('E2E Imported Stew'), `import result wrong: "${msg}"`);
+    await (await el('[data-testid="close-import"]')).click();
+    const panel = await $d('[data-testid="import-panel"]');
+    await panel.waitForExist({ reverse: true, timeout: 10000 });
+    assert((await bodyText()).includes('E2E Imported Stew'), 'imported recipe not in list');
+    return 'imported via registry UI, listed in cookbook';
   });
 
   await step('no fatal crash at end', async () => {
