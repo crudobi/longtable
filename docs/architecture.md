@@ -15,6 +15,7 @@ src/
   public/     ATProto publishing, discovery, the visibility byte-paths
   hubs/       hub registry (endpoints only — never content)
   importers/  Importer API v1: contract, registry, reference importers
+  localapi/   localhost HTTP API: router, host seam, settings, server
   components/ React UI (panels/modals; no business logic)
 appview/      hub-side public index (verify-then-index, FTS5 search)
 hub/          the single-artifact hub bundle (all hub roles, one tarball)
@@ -151,6 +152,45 @@ reference importers `urlImporterAdapter.ts` (web pages, JSON-LD/
 OpenGraph), `jsonImporter.ts`, `mealieImporter.ts`, plus
 `photoImport.ts` (local photo attach + downscale).
 
+## localapi — `src/localapi/`
+
+The localhost API (E9): an HTTP API on the device itself, for scripts
+and local integrations. Specified for users in
+[localhost-api.md](localhost-api.md).
+
+- `settings.ts` — enabled flag, port, per-install bearer token in
+  localStorage (`longtable:localapi`). Off by default; the token is
+  minted on first enable. Additive local state, not recipe storage.
+- `plugin.ts` — the JS side of the `LocalApi` Capacitor plugin
+  (`registerPlugin`), plus `localApiAvailable()` feature detection
+  (the settings UI explains the Android-only limit where it's absent).
+- `server.ts` — lifecycle: registers the plugin's `request` listener
+  once, dispatches through the router against current settings,
+  starts/stops the native socket to match the toggle
+  (`syncLocalApiServer`, idempotent; App calls it at startup and the
+  settings panel calls it on every change).
+- `router.ts` — the whole HTTP surface as one pure function
+  (`handleApiRequest`): auth (everything but `GET /v1/health` needs
+  the bearer token), routes, validation (the importer contract's
+  validator), tier rules, `{ error }` bodies with correct statuses.
+- `host.ts` — `LocalApiHost`, the seam the router executes against,
+  and `createLocalApiHost`. App wires its hooks to the UI's own flows
+  (`applyRecipeUpdate`, `performDelete`, `applyVisibility` in
+  `App.tsx`), so API writes republish/unpublish/unshare exactly like
+  in-app ones. Friends are exposed as names + DIDs only — key material
+  never crosses this seam.
+
+The native half is
+`android/app/src/main/java/kitchen/longtable/app/LocalApiPlugin.kt`:
+a `ServerSocket` bound to **127.0.0.1 only**, just enough HTTP/1.1
+framing, and a request-id-correlated forward to the JS layer. It
+contains no recipe logic and no auth decisions. It lives only while
+the app process does (no foreground service).
+
+**Boundary:** the API is a client of the same flows as the UI, never
+a shortcut around them — visibility byte-paths, importer validation,
+and friends-only encryption are all upstream of it by construction.
+
 ## appview — `appview/` (Node)
 
 The hub's public index. `ingest.mjs` consumes the PDS repo firehose
@@ -178,7 +218,8 @@ and optionally a managed PDS. Anyone can run one; clients carry a hub
 React panels/modals over the modules above: `RecipeList`,
 `RecipeDetail`, `RecipeForm`, `FriendsPanel`, `FriendShareModal`,
 `ShareModal`, `JoinModal`, `DiscoverPanel`, `ImportPanel`,
-`PublishSettingsModal`, `HubSettingsModal`, `UrlImportDialog`.
+`PublishSettingsModal`, `HubSettingsModal`, `LocalApiSettingsModal`
+(the Developer panel), `UrlImportDialog`.
 All user-facing failures render through `src/friendlyError.ts`
 (plain-language mapping; raw transport errors never reach the UI).
 
@@ -190,7 +231,8 @@ All user-facing failures render through `src/friendlyError.ts`
   unfriend caveat, the importer UI.
 - Oath proofs: `e2e/proof-*.mjs` (P2P convergence, friends-only
   confidentiality incl. unfriend/re-key, public forge-resistance +
-  privacy audit, storage migration, hub-death failover) and
+  privacy audit, storage migration, hub-death failover, the localhost
+  API end-to-end via its docs-only example client) and
   `e2e/telemetry-audit.sh`.
 - CI: every commit to `main` runs typecheck → unit tests → AppView
   tests → web build → cap sync → APK → e2e gate → migration proof →

@@ -10,8 +10,10 @@ This documentation is the contract surface for third-party developers.
 | [architecture.md](architecture.md) | The module map: every subsystem, its public interface, and the boundaries an extension should build against. |
 | [importers.md](importers.md) | The Importer API v1: how to write an importer module that the app loads and offers in its Import panel. |
 | [public-protocol.md](public-protocol.md) | The public recipe protocol: lexicons, the device-key binding, the signature schemes, and the AppView API — enough to read, write, and verify public recipes without this app. |
+| [localhost-api.md](localhost-api.md) | The localhost API: an opt-in, token-guarded HTTP API on the user's own device for scripting and local integrations (list / search / create / update / delete / import). |
 | [../lexicons/](../lexicons/) | The `kitchen.longtable.*` lexicon JSON schemas (the normative record shapes). |
 | [../examples/third-party-client/](../examples/third-party-client/) | A runnable third-party client that finds a public recipe through an AppView and verifies it end-to-end using only official ATProto libraries. |
+| [../examples/localhost-api/](../examples/localhost-api/) | A dependency-free command-line client for the localhost API, written from localhost-api.md alone. |
 
 Ground rules that shape every interface here:
 
