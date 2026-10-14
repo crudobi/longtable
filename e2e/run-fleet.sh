@@ -308,11 +308,22 @@ install_apk_all() {
 
 # Functional per-device network verification (WebSocket + HTTPS + ICE inside
 # the app WebView; see e2e/probe-net.mjs). A device that fails this would
-# fail every network proof downstream with far less clear logs.
+# fail every network proof downstream with far less clear logs. Each
+# device is probed up to 3 times with a settle pause: in the first
+# minutes after an emulator boots, its WebView networking can stall
+# transiently (connects hang, STUN unanswered) and then recover on its
+# own — a permanently broken device (e.g. WiFi never associated) fails
+# all three probes and fails the run, as it should.
 probe_all() {
-  local s rc=0
+  local s attempt ok rc=0
   for s in emulator-5554 emulator-5556 emulator-5558; do
-    ( cd "$REPO" && node e2e/probe-net.mjs "$s" ) || rc=1
+    ok=0
+    for attempt in 1 2 3; do
+      if ( cd "$REPO" && node e2e/probe-net.mjs "$s" ); then ok=1; break; fi
+      say "net-verify: $s probe attempt $attempt failed — waiting 20s and re-probing"
+      sleep 20
+    done
+    [ "$ok" = "1" ] || rc=1
   done
   return $rc
 }
@@ -321,7 +332,7 @@ do_provision_phase() {
   run_step fleet-provision 1500 "$FLEET" provision --all || return 1
   run_step services 600 "$0" __services || return 1
   run_step install-apk 300 "$0" __install-apk || return 1
-  run_step net-verify 600 "$0" __probe-all || return 1
+  run_step net-verify 900 "$0" __probe-all || return 1
 }
 
 # Serial sets per proof (app-data reset + install targets).
