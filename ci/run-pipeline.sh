@@ -41,6 +41,7 @@ fi
 # --- stage bookkeeping ------------------------------------------------------
 STAGE_RESULTS=""   # "name:ok:seconds,name:fail:seconds,..."
 FAILED_STAGE=""
+FLEET_UP=""        # set once fleet provisioning is attempted
 APK_MD5=""
 
 stage() {
@@ -84,6 +85,23 @@ do_apk()       { (cd "$WT/android" && ./gradlew assembleDebug --console=plain); 
 # worktree-built APK.
 do_e2e()       { "$REPO/e2e/run-e2e.sh" "$WT/$APK_REL"; }
 do_migration() { (cd "$REPO/e2e" && APK="$WT/$APK_REL" node proof-migration.mjs); }
+# The fleet suite (e2e/run-fleet.sh) is driven stage-by-stage so
+# status.json keeps per-proof granularity. The pipeline already holds
+# pipeline.lock, so the orchestrator runs with LT_FLEET_NO_LOCK=1 (its
+# own flock would deadlock against ours). FLEET_UP is set BEFORE the
+# provision call so the post-chain teardown runs even when provisioning
+# fails halfway with emulators already booted.
+do_fleet_provision() {
+  FLEET_UP=1
+  APK="$WT/$APK_REL" LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" provision
+}
+do_proof() { # proof-name
+  APK="$WT/$APK_REL" LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" run "$1"
+}
+do_fleet_teardown() {
+  LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" teardown
+}
+
 do_publish() {
   cp "$WT/$APK_REL" "$PUBLISH_APK.tmp"
   mv "$PUBLISH_APK.tmp" "$PUBLISH_APK"
@@ -132,7 +150,7 @@ run_one() {
   run_id="$(date +%Y%m%d-%H%M%S)-$short"
   log="$LOGS/$run_id.log"
   started=$(date -Iseconds)
-  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""
+  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; FLEET_UP=""
   local t0=$SECONDS
   say "run $run_id commit $TARGET_HASH"
   {
@@ -145,11 +163,32 @@ run_one() {
     stage web-build       do_build     &&
     stage cap-sync        do_capsync   &&
     stage apk             do_apk       &&
+    stage fleet-provision do_fleet_provision &&
     stage e2e-gate        do_e2e       &&
     stage migration-proof do_migration &&
+    stage proof-p2p       do_proof proof-p2p &&
+    stage proof-friends   do_proof proof-friends &&
+    stage proof-public    do_proof proof-public &&
+    stage proof-thirdparty do_proof proof-thirdparty &&
+    stage proof-importer  do_proof proof-importer &&
+    stage proof-localapi  do_proof proof-localapi &&
+    stage proof-hubfail   do_proof proof-hubfail &&
     stage publish         do_publish
     true
   } >>"$log" 2>&1
+  if [ -n "$FLEET_UP" ]; then
+    {
+      say "=== stage: fleet-teardown (post-chain; runs pass or fail)"
+      tt0=$SECONDS
+      if do_fleet_teardown; then
+        STAGE_RESULTS="${STAGE_RESULTS}fleet-teardown:ok:$((SECONDS-tt0)),"
+        say "--- stage fleet-teardown OK ($((SECONDS-tt0))s)"
+      else
+        STAGE_RESULTS="${STAGE_RESULTS}fleet-teardown:fail:$((SECONDS-tt0)),"
+        say "--- stage fleet-teardown FAILED ($((SECONDS-tt0))s) — emulators may still be running; investigate"
+      fi
+    } >>"$log" 2>&1
+  fi
   finished=$(date -Iseconds)
   if [ -n "$FAILED_STAGE" ]; then result=failed; else result=success; fi
   write_status "$result" "$started" "$finished" "$((SECONDS-t0))" "$log"

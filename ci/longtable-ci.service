@@ -6,4 +6,4 @@ After=network.target
 Type=oneshot
 User=crudobi
 ExecStart=/home/devbox/ops/longtable-ci/run-pipeline.sh
-TimeoutStartSec=10800
+TimeoutStartSec=21600
