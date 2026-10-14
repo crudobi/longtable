@@ -30,7 +30,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 
 const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb'
-const APK = '/home/devbox/builds/longtable/longtable-debug.apk'
+const APK = process.env.APK || '/home/devbox/builds/longtable/longtable-debug.apk'
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
 const ACCOUNTS = JSON.parse(
   fs.readFileSync('/home/devbox/ops/longtable-atproto/accounts.json', 'utf8'),
