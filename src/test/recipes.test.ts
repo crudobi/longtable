@@ -274,4 +274,78 @@ describe('recipe store', () => {
 
     delete (globalThis as any).localStorage
   })
+
+  it('partitioned save with unchanged title does not revert a concurrent rename', async () => {
+    // Regression test for the proof-p2p post-heal convergence flake.
+    // Two devices share a recipe, partition, and edit concurrently: A
+    // renames the title while B saves the edit form with the title
+    // untouched (only an ingredient added). updateRecipe used to re-set
+    // every scalar unconditionally, so B's save minted a concurrent title
+    // item carrying the OLD title; Y.Map conflict resolution awards the
+    // key to the item from the higher clientID, so whenever B's random
+    // per-install clientID outranked A's, the merge silently reverted
+    // the rename on BOTH devices (sync itself converged fine). Seeding
+    // B with the higher clientID makes that ordering deterministic:
+    // pre-fix this test fails, post-fix the rename survives.
+    const Y = await import('yjs')
+    const { getOrCreateDoc, INDEX_GUID } = await import('../store/repo')
+
+    const mkLocalStorage = (clientId: number) => {
+      const store = new Map<string, string>([
+        ['longtable:client-id', String(clientId)],
+      ])
+      return {
+        getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+        setItem: (k: string, v: string) => void store.set(k, v),
+        removeItem: (k: string) => void store.delete(k),
+      }
+    }
+    const syncDoc = async (fromRepo: unknown, toRepo: unknown, guid: string) => {
+      const from = await getOrCreateDoc(fromRepo as never, guid)
+      const to = await getOrCreateDoc(toRepo as never, guid)
+      Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)))
+    }
+
+    // Device A (lower clientID) creates the recipe.
+    ;(globalThis as any).localStorage = mkLocalStorage(100000001)
+    const repoA = makeRepo()
+    const indexA = await getOrCreateIndex(repoA, memoryStore())
+    const summary = await createRecipe(repoA, indexA, sample('Pancakes'))
+    const guid = summary.url.replace('yjs:', '')
+
+    // Device B (higher clientID) receives the recipe + index (the join).
+    ;(globalThis as any).localStorage = mkLocalStorage(4000000000)
+    const repoB = makeRepo()
+    const indexB = await getOrCreateIndex(repoB, memoryStore())
+    await syncDoc(repoA, repoB, guid)
+    await syncDoc(repoA, repoB, INDEX_GUID)
+    const joined = await getRecipe(repoB, summary.url)
+    expect(joined?.title).toBe('Pancakes')
+
+    // Partition: A renames; B saves the full form with the title untouched.
+    ;(globalThis as any).localStorage = mkLocalStorage(100000001)
+    await updateRecipe(repoA, indexA, summary.id, { title: 'Pancakes REMIXED' })
+    ;(globalThis as any).localStorage = mkLocalStorage(4000000000)
+    await updateRecipe(repoB, indexB, summary.id, {
+      title: 'Pancakes',
+      ingredients: ['2 cups flour', '1 tsp salt', '1 tbsp sugar'],
+      steps: ['Mix everything.', 'Bake 20 min.'],
+      photos: [],
+      prepMinutes: 10,
+      cookMinutes: 20,
+    })
+
+    // Heal: exchange updates both ways.
+    await syncDoc(repoA, repoB, guid)
+    await syncDoc(repoB, repoA, guid)
+
+    const finalA = await getRecipe(repoA, summary.url)
+    const finalB = await getRecipe(repoB, summary.url)
+    expect(finalA?.title).toBe('Pancakes REMIXED')
+    expect(finalB?.title).toBe('Pancakes REMIXED')
+    expect(finalA?.ingredients).toContain('1 tbsp sugar')
+    expect(finalB?.ingredients).toContain('1 tbsp sugar')
+
+    delete (globalThis as any).localStorage
+  })
 })

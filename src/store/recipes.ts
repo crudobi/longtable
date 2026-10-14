@@ -251,12 +251,25 @@ export async function updateRecipe(
   const updatedAt = nowIso()
   doc.transact(() => {
     const map = doc.getMap(RECIPE_MAP)
-    if (patch.title !== undefined) map.set('title', patch.title)
+    // Skip scalar writes whose value is unchanged (same rationale as
+    // replaceArray's identical-content guard): map.set() mints a new Yjs
+    // item even for an identical value, and that item is a *concurrent*
+    // write against any peer edit made while partitioned. Y.Map conflict
+    // resolution awards the key to the item from the higher clientID, so
+    // an unchanged-value write from the higher-ID peer silently reverts
+    // the other peer's genuine edit on merge. That was the proof-p2p
+    // post-heal flake: a form save re-wrote the old title, and whenever
+    // the saver's random per-install clientID outranked the renamer's,
+    // both devices converged onto the pre-rename title.
+    const setIfChanged = (key: string, value: unknown) => {
+      if (map.get(key) !== value) map.set(key, value)
+    }
+    if (patch.title !== undefined) setIfChanged('title', patch.title)
     if ('visibility' in patch) {
       if (patch.visibility === undefined || patch.visibility === 'private') {
         map.delete('visibility')
       } else {
-        map.set('visibility', patch.visibility)
+        setIfChanged('visibility', patch.visibility)
       }
     }
     if (patch.ingredients !== undefined) replaceArray(map, 'ingredients', patch.ingredients)
@@ -268,14 +281,14 @@ export async function updateRecipe(
       if (patch.prepMinutes === undefined) {
         map.delete('prepMinutes')
       } else {
-        map.set('prepMinutes', patch.prepMinutes)
+        setIfChanged('prepMinutes', patch.prepMinutes)
       }
     }
     if ('cookMinutes' in patch) {
       if (patch.cookMinutes === undefined) {
         map.delete('cookMinutes')
       } else {
-        map.set('cookMinutes', patch.cookMinutes)
+        setIfChanged('cookMinutes', patch.cookMinutes)
       }
     }
     map.set('updatedAt', updatedAt)
