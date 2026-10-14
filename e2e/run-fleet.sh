@@ -78,6 +78,14 @@ PKG=kitchen.longtable.app
 APK="${APK:-/home/devbox/builds/longtable/longtable-debug.apk}"
 ADB=/home/devbox/tools/android-sdk/platform-tools/adb
 
+# Absolute path to this script, for self-invocation of the internal
+# __services/__install-apk/__probe-all subcommands. $0 alone is not
+# enough: when the script is started by a relative path (e.g.
+# `e2e/run-fleet.sh provision` from the repo root) and the main flow
+# later cd's into $E2E_DIR, a relative $0 no longer resolves and the
+# provision phase dies with "failed to run command 'e2e/run-fleet.sh'".
+SELF=$(readlink -f "$0")
+
 export PATH=/usr/local/bin:/usr/bin:/bin
 export HOME="${HOME:-/home/crudobi}"
 export JAVA_HOME=/home/devbox/tools/jdk-21
@@ -330,9 +338,9 @@ probe_all() {
 
 do_provision_phase() {
   run_step fleet-provision 1500 "$FLEET" provision --all || return 1
-  run_step services 600 "$0" __services || return 1
-  run_step install-apk 300 "$0" __install-apk || return 1
-  run_step net-verify 900 "$0" __probe-all || return 1
+  run_step services 600 "$SELF" __services || return 1
+  run_step install-apk 300 "$SELF" __install-apk || return 1
+  run_step net-verify 900 "$SELF" __probe-all || return 1
 }
 
 # Serial sets per proof (app-data reset + install targets).
