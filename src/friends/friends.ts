@@ -6,8 +6,10 @@
  *   1. One device shows a friend invite (QR / paste code) containing its DID,
  *      a one-time pairing room, and a random pair secret.
  *   2. Both devices join the pairing room and exchange signed "hello"s —
- *      each proves possession of its DID's secret key by signing the room
- *      name, so a copied DID alone can't impersonate anyone.
+ *      each proves possession of its DID's secret key by signing a hello
+ *      that binds its DID, the room, and the pair secret's BLAKE2b-256
+ *      hash (v2), so a copied DID — or a hello replayed from another
+ *      pairing — can't impersonate anyone.
  *   3. Both persist a friend record and derive a persistent friend channel:
  *      a y-webrtc room whose name and password come from the pair secret
  *      (known only to the two devices, exchanged out-of-band in the invite).
@@ -38,7 +40,7 @@ export interface FriendRecord {
   name: string
   /** Base64 pair secret exchanged in the invite (channel name + password). */
   pairSecret: string
-  /** sha256 hex of the pair secret; basis for channel room/doc names. */
+  /** BLAKE2b-256 hex of the pair secret; basis for channel room/doc names. */
   pairId: string
   /** Signaling server both devices met on; channels rejoin through it. */
   signaling: string
@@ -163,14 +165,25 @@ export function parseFriendInvite(text: string): FriendInvitePayload {
 interface Hello {
   did: string
   name: string
-  /** base64 detached signature over `longtable-pair:<room>:<did>`. */
+  /** base64 detached signature over the v2 hello message (see helloMessage). */
   sig: string
 }
 
 const HELLO_MAP = 'pairing'
 
-function helloMessage(room: string, did: string): Uint8Array {
-  return utf8ToU8(`longtable-pair:${room}:${did}`)
+/**
+ * The exact bytes a pairing hello signs (v2):
+ *   longtable-pair:v2:<room>:<did>:<pairId>
+ * where pairId is the pair secret's BLAKE2b-256 hex (pairIdFor). The v1
+ * message bound only room+did, so anyone who learned the room name (it
+ * transits the signaling server in plaintext) could race the real guest
+ * and get their own DID bound as the inviter's "friend". Under v2 a hello
+ * also proves possession of the pair secret, which only the invite holder
+ * has; a racer's hello cannot verify against the inviter's pairId.
+ * Exported for unit tests.
+ */
+export function helloMessage(room: string, did: string, pairId: string): Uint8Array {
+  return utf8ToU8(`longtable-pair:v2:${room}:${did}:${pairId}`)
 }
 
 async function connectEphemeral(
@@ -202,12 +215,13 @@ export async function runPairing(
   timeoutMs = 90000,
 ): Promise<FriendRecord> {
   await cryptoReady()
+  const pairId = await pairIdFor(invite.pairSecret)
   const doc = new Y.Doc()
   const provider = await connectEphemeral(invite.room, doc, invite.signaling)
   try {
     const sig = await signDetached(
       identity,
-      helloMessage(invite.room, identity.did),
+      helloMessage(invite.room, identity.did, pairId),
     )
     const mine: Hello = { did: identity.did, name: myName, sig: u8ToBase64(sig) }
     doc.transact(() => {
@@ -233,7 +247,7 @@ export async function runPairing(
         }
         const ok = await verifyDetached(
           hello.did,
-          helloMessage(invite.room, hello.did),
+          helloMessage(invite.room, hello.did, pairId),
           base64ToU8(hello.sig),
         )
         if (!ok) {
@@ -243,7 +257,7 @@ export async function runPairing(
           did: hello.did,
           name: typeof hello.name === 'string' ? hello.name : '',
           pairSecret: invite.pairSecret,
-          pairId: await pairIdFor(invite.pairSecret),
+          pairId,
           signaling: invite.signaling,
           addedAt: new Date().toISOString(),
         }

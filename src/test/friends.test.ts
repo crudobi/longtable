@@ -11,7 +11,13 @@
 import 'fake-indexeddb/auto'
 import * as Y from 'yjs'
 import { describe, expect, it } from 'vitest'
-import { identityFromSeed, type Identity } from '../identity/identity'
+import {
+  identityFromSeed,
+  signDetached,
+  verifyDetached,
+  type Identity,
+} from '../identity/identity'
+import { u8ToBase64, utf8ToU8 } from '../identity/codec'
 import {
   decryptRecipePayload,
   dropRecipeKey,
@@ -29,6 +35,7 @@ import {
 import {
   createFriendInvite,
   getFriend,
+  helloMessage,
   listFriends,
   pairIdFor,
   parseFriendInvite,
@@ -113,6 +120,47 @@ describe('friend records + invites', () => {
         JSON.stringify({ v: 2, kind: 'friend', did: 'did:plc:nope' }),
       ),
     ).toThrow()
+  })
+})
+
+describe('pairing hello (v2)', () => {
+  const ROOM = 'longtable-pair-0123456789abcdef'
+  const SECRET_A = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  const SECRET_B = u8ToBase64(new Uint8Array(32).fill(3))
+
+  it('hello message is the exact v2 string binding room, did, and pair-secret hash', async () => {
+    const me = await identityFromSeed(seed(9))
+    const pairId = await pairIdFor(SECRET_A)
+    const msg = helloMessage(ROOM, me.did, pairId)
+    expect(new TextDecoder().decode(msg)).toBe(
+      `longtable-pair:v2:${ROOM}:${me.did}:${pairId}`,
+    )
+  })
+
+  it('a hello verifies only under the same pair secret — never under v1 or another secret', async () => {
+    const me = await identityFromSeed(seed(10))
+    const pairIdA = await pairIdFor(SECRET_A)
+    const sig = await signDetached(me, helloMessage(ROOM, me.did, pairIdA))
+    // The genuine pairing partner (same invite, same secret) accepts.
+    expect(
+      await verifyDetached(me.did, helloMessage(ROOM, me.did, pairIdA), sig),
+    ).toBe(true)
+    // A racer who saw the room name but never held the invite: their pairId
+    // differs, so the real hello does not verify for them — and any hello
+    // THEY sign cannot verify against the inviter's pairId either.
+    const pairIdB = await pairIdFor(SECRET_B)
+    expect(pairIdB).not.toBe(pairIdA)
+    expect(
+      await verifyDetached(me.did, helloMessage(ROOM, me.did, pairIdB), sig),
+    ).toBe(false)
+    // The pre-v2 message shape no longer verifies.
+    expect(
+      await verifyDetached(
+        me.did,
+        utf8ToU8(`longtable-pair:${ROOM}:${me.did}`),
+        sig,
+      ),
+    ).toBe(false)
   })
 })
 
