@@ -56,7 +56,7 @@ async function ensureAccount(spec) {
       password: PASSWORD,
     })
     console.log(`[seed] created ${spec.handle} -> ${res.data.did}`)
-    return res.data.did
+    return { did: res.data.did, password: PASSWORD }
   } catch (createErr) {
     // Already exists (in this testnet lifetime): log in and reuse its
     // DID. Try this run's password first, then the stored one.
@@ -69,7 +69,11 @@ async function ensureAccount(spec) {
         console.log(
           `[seed] ${spec.handle} already exists, logged in -> ${res.data.did} (create failed with: ${createErr.message})`,
         )
-        return res.data.did
+        // Return the password that WORKED — the caller writes it back to
+        // the accounts file. (Writing this run's fresh random here when
+        // the stored password was the one that authenticated would poison
+        // the file: the next run could then log in with neither.)
+        return { did: res.data.did, password: pw }
       } catch {
         /* try the next candidate */
       }
@@ -81,8 +85,8 @@ async function ensureAccount(spec) {
 
 const accounts = {}
 for (const spec of SPECS) {
-  const did = await ensureAccount(spec)
-  accounts[spec.key] = { handle: spec.handle, password: PASSWORD, did }
+  const { did, password } = await ensureAccount(spec)
+  accounts[spec.key] = { handle: spec.handle, password, did }
 }
 
 await mkdir(dirname(ACCOUNTS_FILE), { recursive: true })
@@ -93,9 +97,11 @@ for (const spec of SPECS) {
 }
 if (GENERATED) {
   console.log('[seed] ------------------------------------------------------------')
-  console.log('[seed] GENERATED seed password — shown once, store it now:')
-  console.log(`[seed]   ${PASSWORD}`)
-  console.log('[seed] It is also stored in the accounts file; treat that file')
-  console.log('[seed] as a secret. Set LT_SEED_PASSWORD to choose your own.')
+  console.log('[seed] Seed password(s) — shown once, store them now:')
+  for (const spec of SPECS) {
+    console.log(`[seed]   ${spec.handle}: ${accounts[spec.key].password}`)
+  }
+  console.log('[seed] They are also stored in the accounts file; treat that')
+  console.log('[seed] file as a secret. Set LT_SEED_PASSWORD to choose your own.')
   console.log('[seed] ------------------------------------------------------------')
 }
