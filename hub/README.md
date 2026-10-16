@@ -74,8 +74,11 @@ cd ../..
 ```
 
 This creates the two starter accounts and writes their handles,
-passwords, and DIDs to `data/accounts.json`. (The PDS port in `PDS_URL`
-must match `pds.pdsPort` in your config.)
+passwords, and DIDs to `data/accounts.json`. The password is generated
+by the seed run and printed once in its output (or set
+`LT_SEED_PASSWORD` to choose it) — there is deliberately no default
+password, and `data/accounts.json` should be treated as a secret.
+(The PDS port in `PDS_URL` must match `pds.pdsPort` in your config.)
 
 ## Point the app at your hub
 

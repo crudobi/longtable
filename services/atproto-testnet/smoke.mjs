@@ -29,12 +29,12 @@ function step(name, ok, detail) {
   if (!ok) failures++
 }
 
-let author = { handle: 'olga.test', password: 'test-account-password', did: null }
+let author = { handle: 'olga.test', password: process.env.LT_SEED_PASSWORD ?? null, did: null }
 try {
   const parsed = JSON.parse(await readFile(ACCOUNTS_FILE, 'utf8'))
   if (parsed.author) author = { ...author, ...parsed.author }
 } catch {
-  console.log(`[smoke] no accounts file at ${ACCOUNTS_FILE}; using seed defaults`)
+  console.log(`[smoke] no accounts file at ${ACCOUNTS_FILE}; run seed first (or set LT_SEED_PASSWORD)`)
 }
 
 const agent = new BskyAgent({ service: PDS_URL })

@@ -75,16 +75,20 @@ Stop it with `tmux kill-session -t lt-atproto`, or Ctrl-C / SIGTERM —
 
 ## Seeded accounts
 
-`npm run seed` creates two accounts on the local PDS (password for both:
-`test-account-password`) and writes the result to
-**`/home/devbox/ops/longtable-atproto/accounts.json`**:
+`npm run seed` creates two accounts on the local PDS and writes the
+result to **`/home/devbox/ops/longtable-atproto/accounts.json`**:
 
 ```json
 {
-  "author":   { "handle": "olga.test",    "password": "test-account-password", "did": "did:plc:..." },
-  "attacker": { "handle": "mallory.test", "password": "test-account-password", "did": "did:plc:..." }
+  "author":   { "handle": "olga.test",    "password": "<generated at seed time>", "did": "did:plc:..." },
+  "attacker": { "handle": "mallory.test", "password": "<generated at seed time>", "did": "did:plc:..." }
 }
 ```
+
+The password is **generated fresh by each seed run** and printed once
+in the seed output (set `LT_SEED_PASSWORD` to choose one instead).
+There is no shared default password — treat `accounts.json` as a
+secret.
 
 (emails: `olga@test.local` / `mallory@test.local`.) The seed is idempotent
 within one testnet lifetime: if an account already exists it logs in
