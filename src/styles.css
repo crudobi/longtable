@@ -485,6 +485,15 @@ ol.edit-list {
   margin: 12px 0;
 }
 
+.qr-video {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  background: #000;
+  border-radius: 10px;
+  margin: 12px 0;
+}
+
 /* Phase 2: friends */
 .modal-wide {
   max-width: 560px;

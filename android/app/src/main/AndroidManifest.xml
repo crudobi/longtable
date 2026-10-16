@@ -38,4 +38,10 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- QR code scanning (M-J): the join flows offer camera scanning as
+         an alternative to pasting a code. Not required for install: a
+         device without a camera, or a user who denies the permission,
+         falls back to pasting. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 </manifest>

@@ -20,6 +20,8 @@ import {
   type ReceivedShareInfo,
 } from '../friends/service'
 import { friendlyError } from '../friendlyError'
+import { currentScanCapability } from '../qrscan'
+import { QrScannerModal } from './QrScannerModal'
 
 interface Props {
   identity: Identity
@@ -41,6 +43,8 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [received, setReceived] = useState<ReceivedShareInfo[]>([])
+  const [scannerOpen, setScannerOpen] = useState(false)
+  const scan = currentScanCapability()
   const pairingRef = useRef(false)
 
   const reload = useCallback(async () => {
@@ -83,12 +87,13 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
     }
   }, [identity, myName, reload, onChanged])
 
-  const join = async () => {
+  const join = async (text?: string) => {
     setError(null)
     setStatus(null)
     setBusy(true)
     try {
-      const inv = parseFriendInvite(joinCode)
+      // Scanned or pasted, the text takes the exact same parse path.
+      const inv = parseFriendInvite(text ?? joinCode)
       setDisplayName(myName)
       const rec = await runPairing(identity, myName, inv, inv.did)
       setStatus(`You are now friends with ${rec.name || shortDid(rec.did)}.`)
@@ -179,6 +184,15 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
           aria-label="Friend invite code to join"
         />
         <div className="modal-actions">
+          {scan.ok && (
+            <button
+              data-testid="friend-join-scan"
+              disabled={busy}
+              onClick={() => setScannerOpen(true)}
+            >
+              Scan a code
+            </button>
+          )}
           <button
             className="primary"
             data-testid="friend-join-confirm"
@@ -188,6 +202,11 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
             {busy ? 'Pairing…' : 'Pair with this friend'}
           </button>
         </div>
+        {!scan.ok && (
+          <p className="muted" data-testid="friend-join-scan-unavailable">
+            {scan.reason} Pasting the code still works.
+          </p>
+        )}
 
         <h3>Your friends</h3>
         <p className="muted" data-testid="unfriend-caveat">
@@ -259,6 +278,17 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
           </button>
         </div>
       </div>
+      {scannerOpen && (
+        <QrScannerModal
+          title="Scan a friend's invite code"
+          onClose={() => setScannerOpen(false)}
+          onScanned={(text) => {
+            setScannerOpen(false)
+            setJoinCode(text)
+            void join(text)
+          }}
+        />
+      )}
     </div>
   )
 }
