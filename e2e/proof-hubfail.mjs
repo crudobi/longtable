@@ -368,10 +368,18 @@ async function joinWith(driver, code) {
   const hasFriend = async () =>
     (await driver.$$('[data-testid="friend-item"]')).length >= 1 ? true : null
   await (await driver.$('[data-testid="friend-join-confirm"]')).click().catch(() => {})
-  let ok = await waitFor(driver, hasFriend, 20000)
+  // Poll WITHOUT re-clicking first: on a loaded fleet the pairing
+  // handshake (signaling rendezvous + TURN relay + hello) can take
+  // ~45s, and re-clicking join-confirm at 20s restarted the guest join
+  // mid-handshake — the restarted attempt then overran the invite's
+  // 90s TTL and pairing failed deterministically (observed 2026-10-15
+  // with the box under cross-workstream build load; a single-click run
+  // of this same proof passed 17/17). The re-click remains, but only
+  // after 100s, as a guard against a genuinely missed first click.
+  let ok = await waitFor(driver, hasFriend, 100000)
   if (!ok) {
     await evalJs(driver, 'document.querySelector(\'[data-testid="friend-join-confirm"]\')?.click()')
-    ok = await waitFor(driver, hasFriend, 100000)
+    ok = await waitFor(driver, hasFriend, 60000)
   }
   if (!ok) throw new Error('pairing did not complete on the guest side')
 }
