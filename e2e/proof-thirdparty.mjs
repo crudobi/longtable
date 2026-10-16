@@ -129,6 +129,9 @@ async function main() {
     step('app: recipe created', true, TITLE)
 
     // Flip public: with no session the app opens publishing settings.
+    // Going public asks for confirmation first (M-K); confirm on the
+    // user's behalf — same pattern as proof-friends' unfriend leg.
+    await evalJs('window.confirm = () => true')
     await (await $('[data-testid="visibility-public"]')).click()
     await (await $('[data-testid="field-pds-url"]')).waitForExist({ timeout: 20000 })
     await (await $('[data-testid="field-pds-url"]')).setValue(PDS_EMU)

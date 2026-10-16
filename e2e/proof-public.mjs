@@ -249,6 +249,10 @@ async function main() {
     await (await A.$('[data-testid="close-publish-settings"]')).click()
     await sleep(600)
 
+    // Going public asks for confirmation first (M-K); the harness
+    // confirms on the user's behalf — same pattern as proof-friends'
+    // unfriend leg.
+    await evalJs(A, 'window.confirm = () => true')
     const t0 = Date.now()
     await (await A.$('[data-testid="visibility-public"]')).click()
     const found = await pollUntil(async () => {
