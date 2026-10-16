@@ -29,6 +29,7 @@ import { PublishSettingsModal } from './components/PublishSettingsModal'
 import { DiscoverPanel } from './components/DiscoverPanel'
 import { ImportPanel } from './components/ImportPanel'
 import { friendlyError } from './friendlyError'
+import { DEBUG_HOOKS_ENABLED } from './debugHooks'
 import { HubSettingsModal } from './components/HubSettingsModal'
 import { LocalApiSettingsModal } from './components/LocalApiSettingsModal'
 import { createLocalApiHost, LocalApiError } from './localapi/host'
@@ -135,7 +136,7 @@ export default function App() {
         const id = await getOrCreateIdentity()
         identityRef.current = id
         setIdentity(id)
-        installFriendsDebugHooks(id)
+        if (DEBUG_HOOKS_ENABLED) installFriendsDebugHooks(id)
         await rejoinFriendChannels()
         await importReceivedShares(id).catch((e) =>
           console.warn('import received shares failed', e),
@@ -387,8 +388,10 @@ export default function App() {
 
   // Phase 3 debug hooks (e2e proof): window.__ltPublic, installed when the
   // device identity lands — same pattern as installFriendsDebugHooks.
+  // Gated by DEBUG_HOOKS_ENABLED (src/debugHooks.ts): CI proof builds
+  // only; the published artifact never installs this.
   useEffect(() => {
-    if (!identity) return
+    if (!identity || !DEBUG_HOOKS_ENABLED) return
     const w = window as unknown as { __ltPublic?: unknown }
     w.__ltPublic = {
       getSession: () => loadSession(),
