@@ -22,7 +22,7 @@
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
 import { RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
-import { getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
+import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -35,20 +35,13 @@ import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
  * `getActiveHub().signalingUrl`, `getIceServers()`, `getSignalingUrls()`.
  */
 export const DEFAULT_SIGNALING_URL = 'wss://10.0.2.2:4444'
-// TURN server for NAT traversal between emulators/devices.
-// The server only relays encrypted WebRTC packets; it never sees content.
-const TURN_URL = 'turn:10.0.2.2:3478'
-const TURN_USER = 'longtable'
-const TURN_PASS = 'dev-turn-password'
-
 const SHARES_KEY = 'longtable:shares'
 
 /** ICE servers for the built-in default hub (compat export; live code uses
- * `getIceServers()` from the hub registry so the ACTIVE hub supplies TURN). */
-export const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:10.0.2.2:3478' },
-  { urls: TURN_URL, username: TURN_USER, credential: TURN_PASS },
-]
+ * `getIceServers()` from the hub registry so the ACTIVE hub supplies TURN.
+ * Any TURN credential comes from the registry / build-time injection —
+ * never from a source constant). */
+export const ICE_SERVERS: RTCIceServer[] = getIceServers(DEFAULT_HUB)
 
 /** Encode a Uint8Array as base64 (browser-safe). */
 function u8ToBase64(u8: Uint8Array): string {

@@ -102,19 +102,33 @@ do_unit()      { (cd "$WT" && npm test); }
 # pins the wiring: if the hooks ever vanish from the proof bundle, the
 # proofs would fail obscurely — fail here, loudly, instead.
 do_build()     {
-  (cd "$WT" && VITE_LT_DEBUG_HOOKS=1 npm run build) &&
+  local turn_pw=""
+  if [ -f "$STATE/dev-turn-password" ]; then turn_pw=$(cat "$STATE/dev-turn-password"); fi
+  (cd "$WT" && VITE_LT_DEBUG_HOOKS=1 VITE_LT_DEV_TURN_PASSWORD="$turn_pw" npm run build) &&
   grep -rq '__ltFriends' "$WT/dist/assets" &&
   grep -rq '__ltPublic' "$WT/dist/assets"
 }
-# Release build: same tree, hooks OFF, rebuilt after all proofs pass;
-# its APK is the one do_publish ships. Fails closed if either hook
-# string survives in the bundle.
+# Release build: same tree, hooks OFF and no dev TURN password
+# injected, rebuilt after all proofs pass; its APK is the one
+# do_publish ships. Fails closed if a hook string or any dev TURN
+# credential (the burned one, or the rotated one) survives in the
+# bundle.
 do_release_build() {
-  (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS npm run build) &&
+  (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS -u VITE_LT_DEV_TURN_PASSWORD npm run build) &&
   ! grep -rq '__ltFriends' "$WT/dist/assets" &&
   ! grep -rq '__ltPublic' "$WT/dist/assets" &&
+  ! grep -rqF 'dev-turn-password' "$WT/dist/assets" &&
+  release_turn_clean &&
   (cd "$WT" && npx cap sync android) &&
   (cd "$WT/android" && ./gradlew assembleDebug --console=plain)
+}
+# The rotated dev TURN password must not ship either. The pattern is
+# read from the ops password file (grep -f), so the value itself never
+# appears on a command line or in a log.
+release_turn_clean() {
+  if [ -s "$STATE/dev-turn-password" ]; then
+    ! grep -rqF -f "$STATE/dev-turn-password" "$WT/dist/assets"
+  fi
 }
 # The AppView is a standalone subpackage (own package.json + lockfile);
 # its unit tests cover ingest filtering, verify-then-index and FTS5

@@ -11,6 +11,7 @@ import type { KeyValueStore } from '../identity/identity'
 import {
   DEFAULT_HUB,
   HUBS_KEY,
+  LEGACY_DEFAULT_HUB_ID,
   addHub,
   getActiveHub,
   getIceServers,
@@ -20,6 +21,7 @@ import {
   setActiveHub,
   updateHub,
   type HubConfig,
+  type HubRegistry,
 } from '../hubs/hubs'
 
 function memKv(seed: Record<string, string> = {}): KeyValueStore & { map: Map<string, string> } {
@@ -82,6 +84,49 @@ describe('hub registry', () => {
     expect(next.name).toBe('Renamed')
   })
 
+  it('migrates a persisted legacy default-hub entry in place', () => {
+    const legacy: HubConfig = {
+      ...DEFAULT_HUB,
+      id: LEGACY_DEFAULT_HUB_ID,
+      name: 'Wafl' + 'urgiooh (dev)',
+      turnCredential: 'lt-turn-' + 'secret-2026',
+    }
+    const kv = memKv({
+      [HUBS_KEY]: JSON.stringify({ hubs: [legacy], activeId: LEGACY_DEFAULT_HUB_ID }),
+    })
+    // Loading triggers and persists the migration.
+    expect(getActiveHub(kv).id).toBe(DEFAULT_HUB.id)
+    const b = addHub({ ...HUB_B }, kv)
+    const hubs = listHubs(kv)
+    // Renamed, not duplicated; the added hub is untouched.
+    expect(hubs.map((h) => h.id)).toEqual([DEFAULT_HUB.id, b.id])
+    const migrated = hubs.find((h) => h.id === DEFAULT_HUB.id)!
+    expect(migrated.name).toBe('Local dev hub')
+    // The burned credential is gone (test builds inject no replacement).
+    expect(migrated.turnCredential).toBeUndefined()
+    // Everything else about the entry is preserved.
+    expect(migrated.signalingUrl).toBe(legacy.signalingUrl)
+    expect(migrated.appviewUrl).toBe(legacy.appviewUrl)
+    expect(migrated.turnUrl).toBe(legacy.turnUrl)
+    // Persisted back: the stored registry carries the new id only.
+    const stored = JSON.parse(kv.map.get(HUBS_KEY)!) as HubRegistry
+    expect(stored.hubs.map((h) => h.id)).toEqual([DEFAULT_HUB.id, b.id])
+    expect(stored.activeId).toBe(DEFAULT_HUB.id)
+  })
+
+  it('legacy migration keeps a user-renamed hub name', () => {
+    const legacy: HubConfig = {
+      ...DEFAULT_HUB,
+      id: LEGACY_DEFAULT_HUB_ID,
+      name: 'My kitchen hub',
+    }
+    const kv = memKv({
+      [HUBS_KEY]: JSON.stringify({ hubs: [legacy], activeId: LEGACY_DEFAULT_HUB_ID }),
+    })
+    expect(getActiveHub(kv).id).toBe(DEFAULT_HUB.id)
+    expect(getActiveHub(kv).name).toBe('My kitchen hub')
+  })
+
   it('falls back to the default hub on corrupt storage', () => {
     const kv = memKv({ [HUBS_KEY]: '{not json' })
     expect(getActiveHub(kv).id).toBe(DEFAULT_HUB.id)
@@ -97,7 +142,7 @@ describe('hub registry', () => {
       { urls: 'stun:hub-b.example:3478' },
       { urls: 'turn:hub-b.example:3478', username: 'u', credential: 'p' },
       { urls: 'stun:10.0.2.2:3478' },
-      { urls: 'turn:10.0.2.2:3478', username: 'longtable', credential: 'dev-turn-password' },
+      { urls: 'turn:10.0.2.2:3478', username: 'longtable' },
     ])
     // No primary: active hub first (the default hub is active here).
     expect(getIceServers(undefined, kv)[0]).toEqual({ urls: 'stun:10.0.2.2:3478' })

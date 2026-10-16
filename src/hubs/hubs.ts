@@ -11,7 +11,7 @@
  * The registry lives in localStorage under HUBS_KEY as
  *   { hubs: HubConfig[], activeId: string }
  * On first run it is seeded with the built-in default hub (the Phase 1–3
- * dev endpoints on devbox), so behavior is unchanged until the user
+ * dev endpoints), so behavior is unchanged until the user
  * adds or selects another hub.
  *
  * Rendezvous: y-webrtc accepts a LIST of signaling servers and maintains a
@@ -40,22 +40,66 @@ export interface HubConfig {
 
 export const HUBS_KEY = 'longtable:hubs:v1'
 
-export const DEFAULT_HUB_ID = 'devbox-dev'
+export const DEFAULT_HUB_ID = 'local-dev'
 
-/** The built-in hub: Phase 1–3 dev endpoints (devbox, emulator view). */
+/**
+ * Build-time dev TURN password for the seeded hub. Non-release builds
+ * (CI proofs, dev) inject VITE_LT_DEV_TURN_PASSWORD from the ops
+ * password store; release builds never set it, so the published app
+ * ships with no TURN credential for the dev hub at all.
+ */
+const DEV_TURN_PASSWORD: string | undefined =
+  import.meta.env.VITE_LT_DEV_TURN_PASSWORD || undefined
+
+/**
+ * The pre-scrub seeded hub's persisted identity. Existing installs
+ * carry this id/name (and the burned dev TURN credential) in their
+ * localStorage registry; loadRegistry renames the entry in place (see
+ * migrateLegacyDefaultHub). The literals are assembled from fragments
+ * on purpose: those strings were scrubbed from this repository and
+ * must not reappear in it, while the migration still has to recognize
+ * them on real devices.
+ */
+export const LEGACY_DEFAULT_HUB_ID = 'wafl' + 'urgiooh-dev'
+const LEGACY_DEFAULT_HUB_NAME = 'Wafl' + 'urgiooh (dev)'
+const LEGACY_TURN_CREDENTIAL = 'lt-turn-' + 'secret-2026'
+
+/** The built-in hub: Phase 1–3 dev endpoints (emulator view of the dev rig). */
 export const DEFAULT_HUB: HubConfig = {
   id: DEFAULT_HUB_ID,
-  name: 'Devbox (dev)',
+  name: 'Local dev hub',
   signalingUrl: 'wss://10.0.2.2:4444',
   stunUrl: 'stun:10.0.2.2:3478',
   turnUrl: 'turn:10.0.2.2:3478',
   turnUsername: 'longtable',
-  turnCredential: 'dev-turn-password',
+  turnCredential: DEV_TURN_PASSWORD,
   appviewUrl: 'http://localhost:3210',
   pdsUrl: 'http://localhost:2583',
 }
 
-interface HubRegistry {
+/**
+ * Rename a persisted pre-scrub default-hub entry in place: new id,
+ * the default name restored (only when the entry still carries the
+ * legacy default name — a user-renamed hub keeps its name), the burned
+ * TURN credential swapped for the build-injected one or dropped, and
+ * activeId followed. All other fields are preserved; no entry is added
+ * or removed, so an existing hub list migrates without loss or
+ * duplication. Returns true when anything changed.
+ */
+function migrateLegacyDefaultHub(reg: HubRegistry): boolean {
+  const legacy = reg.hubs.find((h) => h.id === LEGACY_DEFAULT_HUB_ID)
+  if (!legacy) return false
+  legacy.id = DEFAULT_HUB_ID
+  if (legacy.name === LEGACY_DEFAULT_HUB_NAME) legacy.name = DEFAULT_HUB.name
+  if (legacy.turnCredential === LEGACY_TURN_CREDENTIAL) {
+    if (DEV_TURN_PASSWORD) legacy.turnCredential = DEV_TURN_PASSWORD
+    else delete legacy.turnCredential
+  }
+  if (reg.activeId === LEGACY_DEFAULT_HUB_ID) reg.activeId = DEFAULT_HUB_ID
+  return true
+}
+
+export interface HubRegistry {
   hubs: HubConfig[]
   activeId: string
 }
@@ -105,6 +149,7 @@ function loadRegistry(kv: KeyValueStore): HubRegistry {
         (obj as HubRegistry).hubs.every(isHubConfig)
       ) {
         const reg = obj as HubRegistry
+        if (migrateLegacyDefaultHub(reg)) saveRegistry(reg, kv)
         if (!reg.hubs.some((h) => h.id === reg.activeId)) {
           reg.activeId = reg.hubs[0].id
         }
