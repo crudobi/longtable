@@ -97,6 +97,7 @@ do_checkout() {
 }
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
+do_lint()      { (cd "$WT" && npm run lint); }
 do_unit()      { (cd "$WT" && npm test); }
 # Proof build: debug hooks ON (VITE_LT_DEBUG_HOOKS=1). The assertion
 # pins the wiring: if the hooks ever vanish from the proof bundle, the
@@ -214,6 +215,7 @@ run_one() {
     stage checkout        do_checkout  &&
     stage npm-ci          do_npm_ci    &&
     stage typecheck       do_typecheck &&
+    stage lint            do_lint      &&
     stage unit-tests      do_unit      &&
     stage appview-tests   do_appview   &&
     stage web-build       do_build     &&

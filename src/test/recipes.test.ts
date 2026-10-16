@@ -22,6 +22,13 @@ import type { RecipeInput } from '../types'
 let dbCounter = 0
 let kv: KeyValueStore
 
+/** Minimal structural view of a Y.Map's private item map, for the
+ * restart test that asserts on item clocks (Yjs exposes no public API
+ * for this). */
+interface YMapItemView {
+  _map: Map<string, { id: { client: number; clock: number } }>
+}
+
 const makeRepo = () => {
   dbCounter += 1
   return createRepo(`longtable-test-${dbCounter}`)
@@ -225,7 +232,7 @@ describe('recipe store', () => {
     for (const doc of [docA2, docB]) {
       const m = doc.getMap('recipe')
       expect(m.get('title')).toBe('Merge Soup REMIXED')
-      const ings = (m.get('ingredients') as any).toArray()
+      const ings = (m.get('ingredients') as { toArray: () => string[] }).toArray()
       expect(ings).toEqual(['2 cups flour', '1 tsp salt', '1 tbsp sugar'])
     }
   })
@@ -238,7 +245,7 @@ describe('recipe store', () => {
       setItem: (k: string, v: string) => void store.set(k, v),
       removeItem: (k: string) => void store.delete(k),
     }
-    ;(globalThis as any).localStorage = ls
+    ;(globalThis as { localStorage?: unknown }).localStorage = ls
 
     const { getOrCreateDoc } = await import('../store/repo')
     const Y = await import('yjs')
@@ -249,20 +256,20 @@ describe('recipe store', () => {
     const doc1 = await getOrCreateDoc(repo, 'restart-doc')
     const cid1 = doc1.clientID
     doc1.getMap('recipe').set('title', 'v1')
-    const item1 = (doc1.getMap('recipe') as any)._map.get('title')
+    const item1 = (doc1.getMap('recipe') as unknown as YMapItemView)._map.get('title')!
     const clock1 = item1.id.clock
 
     // Simulate app restart: drop the repo (clears the doc cache) but keep
     // localStorage (stable clientID) and IndexedDB (persisted updates).
-    ;(repo as any).docs.clear()
-    ;(repo as any).pending.clear()
+    ;repo.docs.clear()
+    ;repo.pending.clear()
     const doc2 = await getOrCreateDoc(repo, 'restart-doc')
     expect(doc2.clientID).toBe(cid1)
     expect(doc2.getMap('recipe').get('title')).toBe('v1')
 
     // Edit after restart: clock must continue, not reset to 0.
     doc2.getMap('recipe').set('title', 'v2')
-    const item2 = (doc2.getMap('recipe') as any)._map.get('title')
+    const item2 = (doc2.getMap('recipe') as unknown as YMapItemView)._map.get('title')!
     expect(item2.id.client).toBe(cid1)
     expect(item2.id.clock).toBeGreaterThan(clock1)
 
@@ -272,7 +279,7 @@ describe('recipe store', () => {
     Y.applyUpdate(docB, Y.encodeStateAsUpdate(doc2))
     expect(docB.getMap('recipe').get('title')).toBe('v2')
 
-    delete (globalThis as any).localStorage
+    delete (globalThis as { localStorage?: unknown }).localStorage
   })
 
   it('partitioned save with unchanged title does not revert a concurrent rename', async () => {
@@ -307,14 +314,14 @@ describe('recipe store', () => {
     }
 
     // Device A (lower clientID) creates the recipe.
-    ;(globalThis as any).localStorage = mkLocalStorage(100000001)
+    ;(globalThis as { localStorage?: unknown }).localStorage = mkLocalStorage(100000001)
     const repoA = makeRepo()
     const indexA = await getOrCreateIndex(repoA, memoryStore())
     const summary = await createRecipe(repoA, indexA, sample('Pancakes'))
     const guid = summary.url.replace('yjs:', '')
 
     // Device B (higher clientID) receives the recipe + index (the join).
-    ;(globalThis as any).localStorage = mkLocalStorage(4000000000)
+    ;(globalThis as { localStorage?: unknown }).localStorage = mkLocalStorage(4000000000)
     const repoB = makeRepo()
     const indexB = await getOrCreateIndex(repoB, memoryStore())
     await syncDoc(repoA, repoB, guid)
@@ -323,9 +330,9 @@ describe('recipe store', () => {
     expect(joined?.title).toBe('Pancakes')
 
     // Partition: A renames; B saves the full form with the title untouched.
-    ;(globalThis as any).localStorage = mkLocalStorage(100000001)
+    ;(globalThis as { localStorage?: unknown }).localStorage = mkLocalStorage(100000001)
     await updateRecipe(repoA, indexA, summary.id, { title: 'Pancakes REMIXED' })
-    ;(globalThis as any).localStorage = mkLocalStorage(4000000000)
+    ;(globalThis as { localStorage?: unknown }).localStorage = mkLocalStorage(4000000000)
     await updateRecipe(repoB, indexB, summary.id, {
       title: 'Pancakes',
       ingredients: ['2 cups flour', '1 tsp salt', '1 tbsp sugar'],
@@ -346,6 +353,6 @@ describe('recipe store', () => {
     expect(finalA?.ingredients).toContain('1 tbsp sugar')
     expect(finalB?.ingredients).toContain('1 tbsp sugar')
 
-    delete (globalThis as any).localStorage
+    delete (globalThis as { localStorage?: unknown }).localStorage
   })
 })

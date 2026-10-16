@@ -78,7 +78,7 @@ function toStringArray(value: unknown): string[] {
   return []
 }
 
-function replaceArray(map: Y.Map<any>, key: string, items: string[]): void {
+function replaceArray(map: Y.Map<unknown>, key: string, items: string[]): void {
   const cur = map.get(key)
   if (cur instanceof Y.Array) {
     // If the content is identical, do nothing: delete+push would mint new
