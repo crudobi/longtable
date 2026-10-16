@@ -43,10 +43,10 @@ npm run seed
 
 ## Run it
 
-Long-running, in a named tmux session on devbox:
+Long-running, in a named tmux session on the build host:
 
 ```sh
-cd /home/devbox/code/longtable/services/atproto-testnet
+cd services/atproto-testnet
 npm install
 tmux new -s lt-atproto -d 'node start.mjs'   # or: npm start in the session
 ```
@@ -76,7 +76,7 @@ Stop it with `tmux kill-session -t lt-atproto`, or Ctrl-C / SIGTERM —
 ## Seeded accounts
 
 `npm run seed` creates two accounts on the local PDS and writes the
-result to **`/home/devbox/ops/longtable-atproto/accounts.json`**:
+result to **`<LT_ROOT>/ops/longtable-atproto/accounts.json`**:
 
 ```json
 {

@@ -137,7 +137,7 @@ DIDs in paths may be sent raw (`did:plc:...`) or URL-encoded.
 ```sh
 cd appview
 npm install
-tmux new -s lt-appview -d 'cd /home/devbox/code/longtable/appview && npm start'
+tmux new -s lt-appview -d 'cd appview && npm start'
 curl localhost:3210/health
 ```
 
@@ -156,7 +156,7 @@ npm run test:e2e  # e2e/appview.e2e.mjs against the live local testnet:
                   # forged ingestClaim in the author's name -> rejected,
                   # never searchable; author deletes -> disappears.
                   # Needs the testnet up + accounts at
-                  # /home/devbox/ops/longtable-atproto/accounts.json
+                  # <LT_ROOT>/ops/longtable-atproto/accounts.json
 ```
 
 ## Layout

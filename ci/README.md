@@ -1,11 +1,8 @@
-# Longtable CI (on-box, devbox)
+# Longtable CI (on-box)
 
-Automated tests + build on every commit to `main`, running **entirely on
-devbox**. No hosted CI: per the project's trust model, builds never
-leave this box (crashproof.press and its Forgejo/Woodpecker stack are
-untrusted downstream — a Woodpecker agent here would take build orders
-from that server, inverting the trust flow, and its docker backend is a
-poor fit for the KVM emulator + tmux tooling this pipeline drives).
+Automated tests + build on every commit to `main`. No hosted CI: the
+pipeline runs on the project's own infrastructure, on the same machine
+that hosts the emulator fleet it drives.
 
 ## How it triggers
 
@@ -20,8 +17,8 @@ poor fit for the KVM emulator + tmux tooling this pipeline drives).
 
 ## What a run does
 
-`ci/run-pipeline.sh` (installed copy:
-`/home/devbox/ops/longtable-ci/run-pipeline.sh`) builds the **committed
+`ci/run-pipeline.sh` (installed into the ops CI dir by
+`ci/install-ci.sh`) builds the **committed
 tree** in a pristine `git worktree` — a dirty developer checkout never
 leaks into a build — and runs, in order:
 
@@ -56,14 +53,14 @@ leaks into a build — and runs, in order:
     app-data reset on its devices first. (`proof-thirdparty` consumes
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
-13. `publish` — copies the APK to
-    `/home/devbox/builds/longtable/longtable-debug.apk`
+13. `publish` — copies the APK to the published location in the builds
+    dir (`longtable-debug.apk`)
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits
 land during a run, the runner loops and processes the new HEAD when it
 finishes. The e2e harness itself runs from the repo checkout (it is box
-infrastructure with hardcoded paths); the artifact under test is always
+infrastructure that derives its own paths); the artifact under test is always
 the worktree-built APK.
 
 Everything runs on every commit — no fast/full tiering. Duration is
@@ -79,7 +76,7 @@ so a CI run and a manual fleet run can never overlap.
 
 ## Status and logs
 
-All under `/home/devbox/ops/longtable-ci/`:
+All under the ops CI dir (`<LT_ROOT>/ops/longtable-ci/`):
 
 - `status.json` — the latest run: commit, result, per-stage results and
   durations, whether it published, the published APK md5, log path.

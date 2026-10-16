@@ -1,6 +1,6 @@
 # Longtable e2e + Android debugging cheat-sheet
 
-End-to-end validation runs on devbox against the `longtable-test` emulator
+End-to-end validation runs on the build host against the `longtable-test` emulator
 (Pixel 7, API 35, x86_64, KVM). The suite is Appium (UiAutomator2 driver) +
 webdriverio: native context for install/system dialogs, WEBVIEW context for the
 Capacitor UI (elements addressed by `data-testid` CSS selectors).
@@ -8,8 +8,8 @@ Capacitor UI (elements addressed by `data-testid` CSS selectors).
 ## Run the gate
 
 ```bash
-/home/devbox/code/longtable/e2e/run-e2e.sh [/path/to.apk]
-# default APK: /home/devbox/builds/longtable/longtable-debug.apk
+e2e/run-e2e.sh [/path/to.apk]
+# default APK: <LT_ROOT>/builds/longtable/longtable-debug.apk
 ```
 
 What it does: boots the emulator (idempotent), starts Appium if needed, then
@@ -20,7 +20,7 @@ any failure prints the step name and the assertion that failed.
 
 ## emu.sh — emulator helper
 
-`/home/devbox/tools/android-emu/emu.sh`:
+`<LT_ROOT>/tools/android-emu/emu.sh`:
 
 | command | what it does |
 |---|---|
@@ -33,7 +33,7 @@ any failure prints the step name and the assertion that failed.
 | `status` | `adb devices` + boot state |
 | `kill` | stop emulator + tmux session |
 
-Env notes: `ANDROID_AVD_HOME=/home/devbox/tools/android-sdk/avd`,
+Env notes: `ANDROID_AVD_HOME=$ANDROID_HOME/avd`,
 emulator runs `-no-window -no-audio -no-boot-anim -gpu swiftshader_indirect`.
 
 `emu.sh` takes an optional `--avd NAME` selector (fleet registry:
@@ -49,16 +49,16 @@ drives all three AVDs at once: `fleet.sh {provision|boot|stop|status}`.
 fleet from bare state to a full validation and back down again:
 
 ```bash
-/home/devbox/code/longtable/e2e/run-fleet.sh            # full suite
-/home/devbox/code/longtable/e2e/run-fleet.sh provision  # bring-up only
-/home/devbox/code/longtable/e2e/run-fleet.sh run proof-friends
-/home/devbox/code/longtable/e2e/run-fleet.sh teardown   # stop emulators
+e2e/run-fleet.sh            # full suite
+e2e/run-fleet.sh provision  # bring-up only
+e2e/run-fleet.sh run proof-friends
+e2e/run-fleet.sh teardown   # stop emulators
 ```
 
 What a full run does:
 
 1. Takes the CI pipeline flock
-   (`/home/devbox/ops/longtable-ci/pipeline.lock`) — the same
+   (`<LT_ROOT>/ops/longtable-ci/pipeline.lock`) — the same
    serialization the pipeline itself uses, so manual and CI runs never
    collide on the shared emulators/Appium.
 2. Provisions + boots all three AVDs via `fleet.sh`/`emu.sh`
@@ -66,7 +66,7 @@ What a full run does:
 3. Ensures the support services: Appium, the HTTPS fixture, signaling,
    coturn (the dev TURN), the ATProto testnet (restarted + re-seeded
    if down — its DIDs are ephemeral, and seeding refreshes
-   `/home/devbox/ops/longtable-atproto/accounts.json`), the hub
+   `<LT_ROOT>/ops/longtable-atproto/accounts.json`), the hub
    AppView, and the two TLS proxies.
 4. Installs the APK under test (`$APK`, default the published build;
    CI passes the pristine-worktree build) on all three devices, then
@@ -84,7 +84,7 @@ What a full run does:
    accounts and mimic record; `proof-hubfail` runs last because it
    rewrites the devices' hub configuration.
 6. Prints a per-proof summary (also written to
-   `/home/devbox/ops/longtable-ci/fleet-logs/<timestamp>/summary.txt`,
+   `<LT_ROOT>/ops/longtable-ci/fleet-logs/<timestamp>/summary.txt`,
    with a log per step alongside) and stops all three emulators.
 
 Retries: emulator proofs are subject to infrastructure transients
@@ -195,8 +195,8 @@ curl -s http://127.0.0.1:4723/status | head -c 200
 
 - Appium 3.8.0 (`/usr/local/bin/appium`), uiautomator2 driver 8.7.0
 - webdriverio pinned via `e2e/package-lock.json`
-- Emulator + `system-images;android-35;google_apis;x86_64` under `/home/devbox/tools/android-sdk`
-- Temurin JDK 21 at `/home/devbox/tools/jdk-21` (`JAVA_HOME` for sdkmanager/avdmanager)
+- Emulator + `system-images;android-35;google_apis;x86_64` under `$ANDROID_HOME`
+- Temurin JDK 21 (`JAVA_HOME` for sdkmanager/avdmanager)
 
 ## Storage-migration testing (from Phase 1 on)
 
@@ -205,7 +205,7 @@ The harness supports upgrade testing: install APK N (seed data via the suite),
 
 **Phase 0 -> Phase 1 (Automerge -> Yjs):** `e2e/proof-migration.mjs` is the
 repeatable proof. It installs the Phase 0 APK (built from commit `6223a9b`,
-kept at `/home/devbox/builds/longtable/longtable-phase0.apk`), seeds a
+kept at `<LT_ROOT>/builds/longtable/longtable-phase0.apk`), seeds a
 recipe with a photo through the UI, upgrades with `adb install -r`, and
 asserts the recipe survives exactly once with content intact — recovered by
 the one-time migration in `src/store/migrateFromAutomerge.ts`. Run it with
@@ -223,7 +223,7 @@ CA the emulator trusts.
 One-time setup (machine-level, NOT committed):
 
 ```bash
-CERTS=/home/devbox/tools/android-emu/fixture-certs
+CERTS=$LT_ROOT/tools/android-emu/fixture-certs
 mkdir -p $CERTS && cd $CERTS
 # 1. test CA + server cert (SAN IP:10.0.2.2 = emulator's host alias)
 openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.crt -days 825 -nodes -subj "/CN=Longtable E2E Test CA"

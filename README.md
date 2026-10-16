@@ -97,12 +97,12 @@ npm run build      # production build to dist/
 
 ## Android wrapper (Capacitor)
 
-All builds run on devbox — never off the build machine.
+All builds run on a dedicated build machine.
 
 ```sh
 # one-time env (per shell):
-export JAVA_HOME=/home/devbox/tools/jdk-21  # Temurin 21; box JDK 17 is too old for Capacitor 7.6+
-export ANDROID_HOME=/home/devbox/tools/android-sdk
+export JAVA_HOME=<path to a Temurin 21 JDK>   # JDK 21 required; JDK 17 is too old for Capacitor 7.6+
+export ANDROID_HOME=<path to the Android SDK>
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
 # rebuild the wrapper from the PWA:
