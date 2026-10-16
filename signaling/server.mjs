@@ -11,6 +11,11 @@
  *  - no payload logging — publish payloads are forwarded opaquely and never
  *    inspected (rooms with a password are end-to-end encrypted anyway)
  *  - aggregate counters only (connections, publishes), off unless SIGNAL_STATS=1
+ *  - abuse limits (the server is otherwise an open relay): at most 50
+ *    concurrent connections per source IP, 100 subscribed topics per
+ *    connection, and 200 messages per 10s per connection (excess
+ *    dropped, not disconnected — y-webrtc clients are nowhere near
+ *    these numbers; they only bite floods)
  *
  * Later this becomes the hub's signaling component; the protocol stays
  * y-webrtc-compatible so any spec-compliant client works.
@@ -29,6 +34,10 @@ const TLS_CERT = process.env.TLS_CERT || '/home/devbox/tools/android-emu/fixture
 const TLS_KEY = process.env.TLS_KEY || '/home/devbox/tools/android-emu/fixture-certs/server.key'
 const MAX_PAYLOAD = 1 << 20 // 1 MiB — signaling frames (SDP/ICE) are tiny
 const MAX_TOPIC_LEN = 256
+const MAX_CONNS_PER_IP = 50
+const MAX_TOPICS_PER_CONN = 100
+const RATE_LIMIT_MSGS = 200
+const RATE_LIMIT_WINDOW_MS = 10_000
 const PING_INTERVAL = 30000
 const STATS = process.env.SIGNAL_STATS === '1'
 
@@ -39,6 +48,10 @@ const topics = new Map()
 
 let statConns = 0
 let statPublishes = 0
+let statRateDrops = 0
+let statTopicDrops = 0
+/** source IP -> live connection count (for MAX_CONNS_PER_IP) */
+const connsByIp = new Map()
 
 /**
  * @param {import('ws').WebSocket} conn
@@ -65,13 +78,48 @@ const validTopic = t => typeof t === 'string' && t.length > 0 && t.length <= MAX
 /**
  * @param {import('ws').WebSocket} conn
  */
-const onConnection = conn => {
+const onConnection = (conn, req) => {
+  const ip = req?.socket?.remoteAddress ?? 'unknown'
+  const ipCount = connsByIp.get(ip) ?? 0
+  if (ipCount >= MAX_CONNS_PER_IP) {
+    console.log(`[signal] connection cap hit for ${ip} (${MAX_CONNS_PER_IP}); rejecting`)
+    try {
+      conn.close(1013, 'too many connections from this address')
+    } catch {
+      /* already gone */
+    }
+    return
+  }
+  connsByIp.set(ip, ipCount + 1)
+  conn.on('close', () => {
+    const n = (connsByIp.get(ip) ?? 1) - 1
+    if (n <= 0) {
+      connsByIp.delete(ip)
+    } else {
+      connsByIp.set(ip, n)
+    }
+  })
+
   /** @type {Set<string>} */
   const subscribed = new Set()
   let alive = true
   statConns++
 
+  // Fixed-window rate limit: messages past the cap are dropped (and
+  // counted), the connection stays up.
+  let rateWindowStart = Date.now()
+  let rateCount = 0
+
   conn.on('message', raw => {
+    const now = Date.now()
+    if (now - rateWindowStart >= RATE_LIMIT_WINDOW_MS) {
+      rateWindowStart = now
+      rateCount = 0
+    }
+    if (++rateCount > RATE_LIMIT_MSGS) {
+      statRateDrops++
+      return
+    }
     let msg
     try {
       msg = JSON.parse(raw.toString())
@@ -86,6 +134,10 @@ const onConnection = conn => {
         if (process.env.SIGNAL_DEBUG) console.log('[signal] subscribe', msg.topics);
         for (const t of msg.topics || []) {
           if (!validTopic(t)) {
+            continue
+          }
+          if (!subscribed.has(t) && subscribed.size >= MAX_TOPICS_PER_CONN) {
+            statTopicDrops++
             continue
           }
           let set = topics.get(t)
@@ -210,6 +262,6 @@ server.listen(PORT, () => {
 
 if (STATS) {
   setInterval(() => {
-    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes}`)
+    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes} rateDrops=${statRateDrops} topicDrops=${statTopicDrops}`)
   }, 5000).unref()
 }
