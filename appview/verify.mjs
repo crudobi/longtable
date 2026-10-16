@@ -111,25 +111,81 @@ export function extractSigningDidKey(didDoc) {
   return undefined
 }
 
-export function createVerifiedRepoProvider({ pdsUrl, plcUrl, fetchImpl = fetch } = {}) {
+/** Hard cap on a fetched repo CAR: 100 MiB. A repo larger than this is
+ * rejected before its bytes are fully buffered (declared Content-Length
+ * is checked first; the streamed read aborts the moment the cap is
+ * crossed). Without a cap, one huge repo could OOM the AppView. */
+export const MAX_CAR_BYTES = 100 * 1024 * 1024
+/** Per-fetch timeout for the PLC and PDS calls: a hung upstream must
+ * fail this repo's reconcile (counted as a rejection), never stall the
+ * shared reconcile queue behind it forever. */
+export const FETCH_TIMEOUT_MS = 30_000
+
+/** Read a fetch body into a Uint8Array, enforcing maxBytes DURING the
+ * read: oversize bodies are aborted, never fully buffered. */
+export async function readBodyWithCap(res, maxBytes, what) {
+  const declared = Number(res.headers?.get?.('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`${what} exceeds the ${maxBytes}-byte cap (declared ${declared} bytes)`)
+  }
+  const reader = res.body?.getReader?.()
+  if (!reader) {
+    const buf = new Uint8Array(await res.arrayBuffer())
+    if (buf.length > maxBytes) {
+      throw new Error(`${what} exceeds the ${maxBytes}-byte cap (${buf.length} bytes)`)
+    }
+    return buf
+  }
+  const chunks = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.length
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {})
+      throw new Error(`${what} exceeds the ${maxBytes}-byte cap`)
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const c of chunks) {
+    out.set(c, off)
+    off += c.length
+  }
+  return out
+}
+
+export function createVerifiedRepoProvider({
+  pdsUrl,
+  plcUrl,
+  fetchImpl = fetch,
+  maxCarBytes = MAX_CAR_BYTES,
+  fetchTimeoutMs = FETCH_TIMEOUT_MS,
+} = {}) {
   if (!pdsUrl) throw new Error('createVerifiedRepoProvider: pdsUrl is required')
   if (!plcUrl) throw new Error('createVerifiedRepoProvider: plcUrl is required')
 
   return async function getVerifiedRepoState(did) {
     // 1. DID document -> signing key
-    const docRes = await fetchImpl(`${plcUrl}/${did}`)
+    const docRes = await fetchImpl(`${plcUrl}/${did}`, {
+      signal: AbortSignal.timeout(fetchTimeoutMs),
+    })
     if (!docRes.ok) throw new Error(`PLC lookup for ${did} failed: HTTP ${docRes.status}`)
     const didDoc = await docRes.json()
     if (didDoc?.id !== did) throw new Error(`DID document id mismatch for ${did}`)
     const signingKey = extractSigningDidKey(didDoc)
     if (!signingKey) throw new Error(`No #atproto signing key in DID document for ${did}`)
 
-    // 2. Full repo CAR from the PDS
+    // 2. Full repo CAR from the PDS (capped read: a hostile or broken
+    // PDS cannot make us buffer an unbounded repo)
     const carRes = await fetchImpl(
       `${pdsUrl}/xrpc/com.atproto.sync.getRepo?did=${encodeURIComponent(did)}`,
+      { signal: AbortSignal.timeout(fetchTimeoutMs) },
     )
     if (!carRes.ok) throw new Error(`getRepo for ${did} failed: HTTP ${carRes.status}`)
-    const carBytes = new Uint8Array(await carRes.arrayBuffer())
+    const carBytes = await readBodyWithCap(carRes, maxCarBytes, `getRepo CAR for ${did}`)
     if (carBytes.length === 0) throw new Error(`getRepo for ${did} returned an empty CAR`)
 
     // 3. Cryptographic verification of the commit chain head against the key.

@@ -21,6 +21,10 @@ import { RECIPE_COLLECTION, PUBKEY_COLLECTION } from './db.mjs'
 
 export const WANTED_COLLECTIONS = [RECIPE_COLLECTION, PUBKEY_COLLECTION]
 
+/** Cap on a single firehose frame (16 MiB): commit frames are small;
+ * the ws default is unlimited, so one oversized frame could OOM us. */
+export const MAX_FIREHOSE_FRAME_BYTES = 16 * 1024 * 1024
+
 export function isWantedPath(path) {
   return (
     typeof path === 'string' &&
@@ -163,7 +167,7 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     if (ws || closed) return
     const url = firehoseUrl()
     log.info?.(`[appview] subscribing to firehose ${url}`)
-    ws = new WebSocket(url)
+    ws = new WebSocket(url, { maxPayload: MAX_FIREHOSE_FRAME_BYTES })
     ws.on('message', (data) => {
       try {
         handleMessage(data)
