@@ -7,6 +7,15 @@
  *   guest: joinShare(payload) -> empty Y.Doc with the SAME guid -> y-webrtc
  *          sync populates it from the host -> registered in the guest's index
  *
+ * Room authentication: every share created by this build carries a random
+ * 32-byte secret in its payload. Both sides pass it to y-webrtc as the
+ * room password, so signaling traffic for the room is encrypted with it
+ * and a peer without the secret cannot join or inject updates — knowing
+ * the recipe id (which is NOT a secret: publishing a recipe exposes it as
+ * the record's rkey) is no longer enough. Payloads from older builds have
+ * no secret and still join passwordless: they stay exactly as open as
+ * they always were (see parseSharePayload).
+ *
  * Shares persist in localStorage and are rejoined on every launch, so peers
  * reconnect after app restarts (this is also what heals a partition).
  */
@@ -68,6 +77,11 @@ export interface SharePayload {
   title: string
   /** base64-encoded Yjs state update (snapshot) for instant initial sync */
   snapshot: string
+  /**
+   * Base64 32-byte room secret, used as the y-webrtc password. Absent in
+   * payloads minted by builds before room authentication existed.
+   */
+  secret?: string
 }
 
 export interface ShareRecord {
@@ -75,6 +89,13 @@ export interface ShareRecord {
   room: string
   signaling: string
   role: 'host' | 'guest'
+  /** Room secret from the payload; absent for legacy (pre-auth) shares. */
+  secret?: string
+}
+
+/** A fresh random room secret (32 bytes, base64). */
+function newShareSecret(): string {
+  return u8ToBase64(crypto.getRandomValues(new Uint8Array(32)))
 }
 
 const providers = new Map<string, WebrtcProviderType>()
@@ -149,6 +170,7 @@ async function joinRoom(
   room: string,
   doc: Y.Doc,
   signaling: string,
+  secret?: string,
 ): Promise<WebrtcProviderType> {
   let p = providers.get(room)
   if (!p) {
@@ -157,6 +179,11 @@ async function joinRoom(
       // Rendezvous list: this share's signaling first, then every hub in
       // the registry — peers find each other on ANY live hub (Phase 4).
       signaling: getSignalingUrls(signaling),
+      // Room password: y-webrtc encrypts the room's signaling traffic
+      // with it; peers without the secret cannot join or inject updates.
+      // Omitted entirely for legacy shares (no secret in their payload),
+      // which remain passwordless exactly as before.
+      ...(secret ? { password: secret } : {}),
       peerOpts: {
         config: {
           iceServers: getIceServers(),
@@ -197,12 +224,17 @@ export async function shareRecipe(
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, recipeId)
   const room = roomForRecipe(recipeId)
-  await joinRoom(room, doc, signaling)
-  saveShare({ recipeId, room, signaling, role: 'host' })
+  // Reuse the share's existing secret so re-sharing is idempotent; a
+  // legacy record (pre-auth) gains a fresh secret here, which upgrades
+  // the share: earlier guests hold a passwordless payload and must be
+  // given the new code to keep syncing.
+  const secret = getShare(recipeId)?.secret ?? newShareSecret()
+  await joinRoom(room, doc, signaling, secret)
+  saveShare({ recipeId, room, signaling, role: 'host', secret })
   // Embed a snapshot so the guest gets content instantly, even if y-webrtc
   // hasn't synced yet. y-webrtc handles live updates after the join.
   const snapshot = u8ToBase64(Y.encodeStateAsUpdate(doc))
-  return { v: 1 as const, room, signaling, recipeId, title, snapshot }
+  return { v: 1 as const, room, signaling, recipeId, title, snapshot, secret }
 }
 
 /**
@@ -229,12 +261,24 @@ async function waitForContent(doc: Y.Doc, timeoutMs: number): Promise<void> {
 export async function joinShare(payload: SharePayload): Promise<void> {
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, payload.recipeId)
+  // Fresh-GUID binding: a payload names the recipe id its content merges
+  // into. If this device already has a NON-EMPTY doc under that id that
+  // is not already this share's doc (no share record), refuse — merging
+  // a stranger's snapshot/sync into an existing local recipe (e.g. one
+  // the user authored, whose id a crafted payload can know from its
+  // public record) is never what "join this share" should do.
+  if (!getShare(payload.recipeId) && doc.getMap(RECIPE_MAP).size > 0) {
+    throw new Error(
+      'That share code points at a recipe you already have, outside this share. ' +
+        'Nothing was changed. (If you meant to re-join, delete your local copy first, then join again.)',
+    )
+  }
   // Apply the embedded snapshot for instant content. y-webrtc then handles
   // live updates. Falls back to waiting for sync if no snapshot (old payloads).
   if (payload.snapshot) {
     Y.applyUpdate(doc, base64ToU8(payload.snapshot))
   }
-  await joinRoom(payload.room, doc, payload.signaling)
+  await joinRoom(payload.room, doc, payload.signaling, payload.secret)
   if (!payload.snapshot) {
     await waitForContent(doc, 20000)
   }
@@ -244,6 +288,7 @@ export async function joinShare(payload: SharePayload): Promise<void> {
     room: payload.room,
     signaling: payload.signaling,
     role: 'guest',
+    ...(payload.secret ? { secret: payload.secret } : {}),
   })
 }
 
@@ -256,12 +301,14 @@ export async function rejoinShares(): Promise<void> {
   for (const s of loadShares()) {
     try {
       const doc = await getOrCreateDoc(repo, s.recipeId)
-      await joinRoom(s.room, doc, s.signaling)
+      await joinRoom(s.room, doc, s.signaling, s.secret)
     } catch (e) {
       console.warn('rejoin share failed', s.recipeId, e)
     }
   }
 }
+
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
 
 /** Parse and validate a pasted/scanned share payload. Throws on invalid. */
 export function parseSharePayload(text: string): SharePayload {
@@ -271,17 +318,51 @@ export function parseSharePayload(text: string): SharePayload {
   } catch {
     throw new Error('That code did not parse as a share invitation.')
   }
+  const o = obj as Partial<SharePayload> | null
   if (
     typeof obj !== 'object' ||
     obj === null ||
-    (obj as { v?: unknown }).v !== 1 ||
-    typeof (obj as { room?: unknown }).room !== 'string' ||
-    !(obj as { room?: unknown }).room ||
-    typeof (obj as { signaling?: unknown }).signaling !== 'string' ||
-    !(obj as { signaling?: unknown }).signaling ||
-    typeof (obj as { recipeId?: unknown }).recipeId !== 'string' ||
-    !(obj as { recipeId?: unknown }).recipeId ||
-    typeof (obj as { title?: unknown }).title !== 'string'
+    o?.v !== 1 ||
+    typeof o.room !== 'string' ||
+    !o.room ||
+    typeof o.signaling !== 'string' ||
+    !o.signaling ||
+    typeof o.recipeId !== 'string' ||
+    !o.recipeId ||
+    typeof o.title !== 'string'
+  ) {
+    throw new Error('That code is not a valid Longtable share invitation.')
+  }
+  // The room is a pure function of the recipe id (roomForRecipe). A
+  // payload whose room disagrees is forged or corrupted — accepting it
+  // would join an attacker-chosen room under this recipe's id.
+  if (o.room !== roomForRecipe(o.recipeId as string)) {
+    throw new Error('That code is not a valid Longtable share invitation.')
+  }
+  // Snapshot, when present, must be well-formed base64 carrying a real
+  // Yjs update (applied to a scratch doc here — the target doc is only
+  // touched by joinShare after this validation passes).
+  if (o.snapshot !== undefined) {
+    if (
+      typeof o.snapshot !== 'string' ||
+      !o.snapshot ||
+      o.snapshot.length % 4 !== 0 ||
+      !BASE64_RE.test(o.snapshot)
+    ) {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    }
+    const scratch = new Y.Doc()
+    try {
+      Y.applyUpdate(scratch, base64ToU8(o.snapshot))
+    } catch {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    } finally {
+      scratch.destroy()
+    }
+  }
+  if (
+    o.secret !== undefined &&
+    (typeof o.secret !== 'string' || !o.secret)
   ) {
     throw new Error('That code is not a valid Longtable share invitation.')
   }
