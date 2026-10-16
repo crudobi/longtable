@@ -38,13 +38,19 @@ Edit `hub.conf.json`. The fields that matter:
 | `publicHost` | The hostname/IP clients use to reach this machine. Shown in the endpoint summary. |
 | `web.port` | Serves the Longtable web app (default 8080). |
 | `signaling.port` | y-webrtc signaling over wss (default 4444). |
-| `turn.password` | **Change this.** Clients need the matching username/password configured in their hub entry. |
+| `turn.password` | Optional. If unset (or left at a placeholder), the hub **generates** a strong password on first start, prints it in the start output, and stores it in `data/turn-password.txt`. Clients need the matching username/password configured in their hub entry. |
 | `turn.externalIp` | Your public IP, if the hub is behind NAT and clients connect from elsewhere. |
 | `appview.port` | Public-recipe search API (default 3210). |
 | `pds.enabled` | Run the bundled managed PDS (default `true`). See the honest note below. |
 | `tls.san` | SubjectAltName for the auto-generated self-signed cert, e.g. `"IP:203.0.113.7,DNS:hub.example.org"`. Set this to how clients reach the hub. |
 | `tls.cert` / `tls.key` / `tls.certDir` | Bring your own certificate instead of the self-signed one. `certDir` must contain `server.crt` and `server.key`. |
 | `tls.proxies` | HTTPS ports that expose the AppView and PDS to devices: `{ "appviewPort": 3211, "pdsPort": 2584 }`, or `null` to disable. |
+
+A note on the TURN relay: its credentials are shared with every client
+of your hub by design, so the generated coturn config refuses to relay
+toward loopback, private (RFC1918), CGNAT, link-local, or multicast
+addresses — the relay can carry traffic between your hub's users, but
+it cannot be used to reach your LAN or the hub host itself.
 
 If a default port is already taken on your machine, change it here —
 every component's port is configurable.

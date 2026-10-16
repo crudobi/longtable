@@ -18,6 +18,7 @@
  * Normally started via ./longtable-hub start.
  */
 import { spawn, execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
@@ -156,13 +157,63 @@ function startChild(id, cmd, argv, opts = {}) {
 }
 
 // ---------------------------------------------------------------- TURN ----
+// Peer ranges a hub TURN relay must never reach: "this network", RFC1918,
+// CGNAT, link-local, multicast, and the v6 equivalents. TURN credentials
+// are shared with every client of the hub BY DESIGN, so the relay itself
+// must refuse to proxy toward the operator's LAN or the hub host —
+// otherwise anyone with the (effectively public) credential can allocate
+// relays to internal addresses. coturn's denied-peer-ip takes address
+// RANGES (lo-hi), not CIDRs, hence the spelled-out bounds.
+const DENIED_PEER_RANGES = [
+  '0.0.0.0-0.255.255.255', // 0.0.0.0/8
+  '10.0.0.0-10.255.255.255', // 10.0.0.0/8
+  '100.64.0.0-100.127.255.255', // 100.64.0.0/10 (CGNAT)
+  '127.0.0.0-127.255.255.255', // 127.0.0.0/8 (loopback)
+  '169.254.0.0-169.254.255.255', // 169.254.0.0/16 (link-local)
+  '172.16.0.0-172.31.255.255', // 172.16.0.0/12
+  '192.168.0.0-192.168.255.255', // 192.168.0.0/16
+  '224.0.0.0-239.255.255.255', // 224.0.0.0/4 (multicast)
+  '::1', // v6 loopback
+  'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // fc00::/7 (ULA)
+  'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // fe80::/10 (link-local)
+]
+// Passwords that mean "not set": the pre-hardening shipped default and
+// the example config's placeholder. Either one surviving into a real
+// config would leave the relay effectively open, so both are treated as
+// unset and replaced with a generated password (below).
+const UNSET_TURN_PASSWORDS = new Set(['change-me', 'SET-A-STRONG-PASSWORD'])
+const turnPasswordFile = path.join(DATA_DIR, 'turn-password.txt')
+
+let turnPasswordSource = 'config'
+function resolveTurnPassword() {
+  const configured = turnCfg.password
+  if (configured && !UNSET_TURN_PASSWORDS.has(configured)) return configured
+  turnPasswordSource = 'generated'
+  // Reuse the previously generated password across restarts, so clients
+  // configured with it keep working (same pattern as the minted TLS cert).
+  try {
+    const saved = fs.readFileSync(turnPasswordFile, 'utf8').trim()
+    if (saved) return saved
+  } catch {
+    /* not generated yet */
+  }
+  const generated = randomBytes(24).toString('base64url')
+  fs.writeFileSync(turnPasswordFile, generated + '\n', { mode: 0o600 })
+  return generated
+}
+const turnPassword = turnEnabled ? resolveTurnPassword() : null
+
 function writeTurnConfig() {
   const lines = [
     `listening-port=${turnPort}`,
     `realm=${turnCfg.realm ?? 'longtable'}`,
-    `user=${turnCfg.username ?? 'longtable'}:${turnCfg.password ?? 'change-me'}`,
+    `user=${turnCfg.username ?? 'longtable'}:${turnPassword}`,
     'lt-cred-mech',
     'fingerprint',
+    // No 'no-loopback-peers' line: coturn 4.6.1's config parser rejects
+    // it ("Bad configuration format", verified against the real binary);
+    // loopback is covered by the 127.0.0.0/8 and ::1 denied ranges.
+    ...DENIED_PEER_RANGES.map((r) => `denied-peer-ip=${r}`),
     `log-file=${path.join(DATA_DIR, 'turn.log')}`,
     'simple-log',
   ]
@@ -273,6 +324,18 @@ for (const [id, check] of checks) {
     if (!ok) await new Promise((r) => setTimeout(r, 1000))
   }
   console.info(`[hub] ${id}: ${ok ? 'ready' : 'NOT READY (still starting or failed — see child output above)'}`)
+}
+
+if (turnEnabled) {
+  if (turnPasswordSource === 'generated') {
+    console.info(
+      `[hub] TURN password: GENERATED for this hub (turn.password is unset or ` +
+        `still the placeholder) — "${turnPassword}", persisted in ${turnPasswordFile}. ` +
+        `Clients need it in their hub entry; set turn.password in hub.conf.json to choose your own.`,
+    )
+  } else {
+    console.info('[hub] TURN password: as configured in hub.conf.json.')
+  }
 }
 
 console.info(
