@@ -13,10 +13,10 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 // updateViaCache: 'all' lets the browser satisfy the SW's own update check
 // from its HTTP cache, so a repeat visit needs zero network requests.
 //
-// NOTE: do NOT gate this on window 'load'. The Automerge WASM initializes via
-// top-level await in this module graph, which can take longer than the rest
-// of the document load — by the time the module body runs, readyState is
-// already 'complete' and a load listener would never fire (measured).
+// NOTE: do NOT gate this on window 'load' alone. This module graph can
+// finish evaluating after the document's load event — by the time the
+// module body runs, readyState may already be 'complete' and a load
+// listener registered then would never fire (measured).
 if ('serviceWorker' in navigator) {
   const register = () => {
     navigator.serviceWorker.register('/sw.js', { updateViaCache: 'all' }).catch((err) => {

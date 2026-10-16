@@ -35,8 +35,12 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Precache the entire app shell. (The Automerge WASM blob this
-        // limit was raised for is gone — Yjs is pure JS.)
+        // Precache the entire app shell. The 6 MiB per-file limit is
+        // load-bearing: the Phase 0 recovery migration chunk (the
+        // Automerge WASM, pulled in dynamically by
+        // src/store/migrateFromAutomerge.ts) still ships and exceeds
+        // Workbox's 2 MiB default. The limit can only come down when
+        // that migration retires.
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm,woff2}'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         navigateFallback: 'index.html',

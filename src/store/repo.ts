@@ -64,7 +64,8 @@ let store: YjsStore | undefined
 
 /**
  * App-wide store singleton. One Y.Doc per recipe, persisted to IndexedDB.
- * Phase 1: still purely local — P2P sync arrives separately.
+ * Sync providers (P2P share rooms, friend channels) attach to these docs
+ * from src/p2p and src/friends; the store itself stays a local container.
  */
 export function getRepo(): YjsStore {
   if (!store) {

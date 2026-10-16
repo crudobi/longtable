@@ -11,7 +11,7 @@
     "y-webrtc": "^10.3.0",
     "yjs": "13.6.33"
   },
-  "description": "Longtable Phase 0 \u2014 local-first recipe box. Local cookbook, no sync, no network.",
+  "description": "Longtable \u2014 a local-first recipe box: your recipes live on your device, sync peer-to-peer with friends you choose, and are published openly only when you say so.",
   "devDependencies": {
     "@capacitor/cli": "^7.6.9",
     "@types/libsodium-wrappers": "^0.7.14",
