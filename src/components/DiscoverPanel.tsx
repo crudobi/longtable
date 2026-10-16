@@ -35,10 +35,13 @@ export function PublicRecipeView({
   record,
   onBack,
   onSaveCopy,
+  saveError,
 }: {
   record: PublicRecipe
   onBack: () => void
   onSaveCopy: () => Promise<void> | void
+  /** A save failure reported by the panel (blob fetch / create). */
+  saveError?: string | null
 }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -103,6 +106,11 @@ export function PublicRecipeView({
         )}
       </section>
       {error && <p className="status error">{error}</p>}
+      {saveError && (
+        <p className="status error" data-testid="public-save-error">
+          {saveError}
+        </p>
+      )}
       <div className="modal-actions">
         <button
           className="primary"
@@ -131,6 +139,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
   const [searched, setSearched] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const search = async () => {
     setBusy(true)
@@ -159,6 +168,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
   const openResult = async (r: PublicSearchResult) => {
     setBusy(true)
     setError(null)
+    setSaveError(null)
     try {
       const url = appViewUrl.trim() || loadAppViewUrl()
       setSelected(await fetchPublicRecipe(url, r.did, r.rkey))
@@ -172,17 +182,24 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
   const saveCopyOfSelected = async () => {
     if (!selected) return
     const rec = selected
-    // Photos live as blobs on the author's PDS. On the local testnet that
-    // is the same PDS the settings point at; fall back to the canonical
-    // local testnet address when this device has never signed in.
-    const pdsUrl = loadSession()?.pdsUrl || getActiveHub().pdsUrl
-    const client = new AtprotoClient(pdsUrl)
-    const input = await publicRecordToInput(rec, async (cid, blob) => {
-      const buf = await client.getBlob(rec.did, cid)
-      return blobBytesToDataUrl(new Uint8Array(buf), blob)
-    })
-    await onSaveCopy(input)
-    onClose()
+    setSaveError(null)
+    try {
+      // Photos live as blobs on the author's PDS. On the local testnet that
+      // is the same PDS the settings point at; fall back to the canonical
+      // local testnet address when this device has never signed in.
+      const pdsUrl = loadSession()?.pdsUrl || getActiveHub().pdsUrl
+      const client = new AtprotoClient(pdsUrl)
+      const input = await publicRecordToInput(rec, async (cid, blob) => {
+        const buf = await client.getBlob(rec.did, cid)
+        return blobBytesToDataUrl(new Uint8Array(buf), blob)
+      })
+      await onSaveCopy(input)
+      onClose()
+    } catch (e) {
+      // A failed photo fetch or create used to reject silently and leave
+      // the panel sitting there; surface it like every other panel path.
+      setSaveError(friendlyError(e, 'the discovery service'))
+    }
   }
 
   return (
@@ -193,6 +210,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
             record={selected}
             onBack={() => setSelected(null)}
             onSaveCopy={saveCopyOfSelected}
+            saveError={saveError}
           />
         ) : (
           <>

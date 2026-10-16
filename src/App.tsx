@@ -215,10 +215,12 @@ export default function App() {
       // If this recipe is shared friends-only, republish the new version
       // (encrypted, same key) to its authorized friends.
       const idn = identityRef.current
+      const stale: string[] = []
       if (idn) {
-        await republishIfShared(id, idn).catch((e) =>
-          console.warn('republish failed', e),
-        )
+        await republishIfShared(id, idn).catch((e) => {
+          console.warn('republish failed', e)
+          stale.push('the copy shared with your friends')
+        })
       }
       // If this recipe is public with a live publication, republish the
       // fresh content (new blobs + a fresh device signature) to the PDS.
@@ -237,7 +239,16 @@ export default function App() {
           }
         } catch (e) {
           console.warn('public republish failed', e)
+          stale.push('the public copy')
         }
+      }
+      // The local save stands either way — but a failed republication is
+      // never silent: the user hears that a shared/public copy may still
+      // show the older version.
+      if (stale.length > 0) {
+        setError(
+          `Saved on this device — but ${stale.join(' and ')} couldn't be updated just now, so ${stale.length === 1 ? 'it' : 'they'} may still show the older version.`,
+        )
       }
     },
     [],
@@ -256,27 +267,40 @@ export default function App() {
    * The delete flow itself, without the confirmation prompt or UI
    * navigation: strip friends-only shares, remove the public record,
    * then delete locally. Used by the detail view AND the localhost API.
+   * The local delete always proceeds — deleting here is the user's act —
+   * but if a remote removal fails, the user is told plainly that the
+   * shared/public copy may still be live; it is never swallowed quietly.
    */
   const performDelete = useCallback(async (id: string) => {
+    const remoteProblems: string[] = []
     // Strip friends-only shares of this recipe from friends' channels.
     const idn = identityRef.current
     if (idn) {
-      await unshareRecipeEverywhere(id, idn).catch((e) =>
-        console.warn('unshare failed', e),
-      )
+      await unshareRecipeEverywhere(id, idn).catch((e) => {
+        console.warn('unshare failed', e)
+        remoteProblems.push('the copies shared with friends')
+      })
     }
     // If it was published publicly, remove the ATProto record first.
     if (getPublication(id)) {
       const session = loadSession()
       if (session) {
         await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
-          (e) => console.warn('unpublish failed', e),
+          (e) => {
+            console.warn('unpublish failed', e)
+            remoteProblems.push('the public copy')
+          },
         )
       }
     }
     const repo = getRepo()
     const index = await getOrCreateIndex(repo)
     await deleteRecipe(repo, index, id)
+    if (remoteProblems.length > 0) {
+      setError(
+        `Deleted from this device — but ${remoteProblems.join(' and ')} couldn't be taken down, because the other side didn't answer. ${remoteProblems.length === 1 ? 'It' : 'They'} may still be out there; your local copy is gone either way.`,
+      )
+    }
   }, [])
 
   const handleDelete = useCallback(
@@ -357,6 +381,20 @@ export default function App() {
 
   const handleSetVisibility = useCallback(
     async (id: string, recipe: Recipe, tier: VisibilityTier) => {
+      // Going public is the one wide-exposure move in the app, so — like
+      // delete and unfriend — it confirms first, with the consequence in
+      // plain words. Private and friends-only stay one tap, and leaving
+      // public (which only removes exposure) stays one tap too.
+      if (tier === 'public' && recipe.visibility !== 'public') {
+        const name = recipe.title || 'this recipe'
+        if (
+          !window.confirm(
+            `Make "${name}" public? Anyone with Longtable can find and read it, and it will be listed under your publishing account. You can make it private again later — but copies other people have saved stay theirs.`,
+          )
+        ) {
+          return
+        }
+      }
       try {
         setError(null)
         await applyVisibility(id, recipe, tier)
@@ -549,7 +587,7 @@ export default function App() {
         <RecipeForm
           initial={emptyInput}
           heading="New recipe"
-          onSave={(input) => void handleCreate(input)}
+          onSave={handleCreate}
           onCancel={() => setView({ name: 'list' })}
         />
       )}
@@ -564,7 +602,7 @@ export default function App() {
             cookMinutes: current.cookMinutes,
           }}
           heading="Edit recipe"
-          onSave={(input) => void handleUpdate(view.id, input)}
+          onSave={(input) => handleUpdate(view.id, input)}
           onCancel={() => void openDetail(view.id)}
         />
       )}

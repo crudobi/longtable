@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import { filesToDataUrls } from '../importers/photoImport'
 import { UrlImportDialog } from './UrlImportDialog'
+import { friendlyError } from '../friendlyError'
 import type { RecipeInput } from '../types'
 
 interface Props {
   initial: RecipeInput
   heading: string
-  onSave: (input: RecipeInput) => void
+  /** May be async; a rejection is shown in the form and nothing navigates. */
+  onSave: (input: RecipeInput) => Promise<void> | void
   onCancel: () => void
 }
 
@@ -26,6 +28,8 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
   const [stepDraft, setStepDraft] = useState('')
   const [photoBusy, setPhotoBusy] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const addIngredient = () => {
     const v = ingredientDraft.trim()
@@ -58,15 +62,27 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
     if (partial.photos && partial.photos.length > 0) setPhotos((xs) => [...xs, ...partial.photos!])
   }
 
-  const save = () => {
-    onSave({
-      title: title.trim(),
-      ingredients,
-      steps,
-      photos,
-      prepMinutes: parseMinutes(prep),
-      cookMinutes: parseMinutes(cook),
-    })
+  const save = async () => {
+    // Guarded + disabled while in flight: a double-tap must not create
+    // the recipe twice. A failure stays on the form, in plain words —
+    // it used to vanish as an unhandled rejection.
+    if (saving) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await onSave({
+        title: title.trim(),
+        ingredients,
+        steps,
+        photos,
+        prepMinutes: parseMinutes(prep),
+        cookMinutes: parseMinutes(cook),
+      })
+    } catch (e) {
+      setSaveError(friendlyError(e))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -76,10 +92,21 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
           ‹ Cancel
         </button>
         <h1 className="header-title">{heading}</h1>
-        <button className="primary" data-testid="save-recipe" onClick={save}>
-          Save
+        <button
+          className="primary"
+          data-testid="save-recipe"
+          disabled={saving}
+          onClick={() => void save()}
+        >
+          {saving ? 'Saving…' : 'Save'}
         </button>
       </header>
+
+      {saveError && (
+        <p className="status error" data-testid="form-save-error">
+          {saveError}
+        </p>
+      )}
 
       <button className="import-link" data-testid="import-url" onClick={() => setImportOpen(true)}>
         Import from a web page…
