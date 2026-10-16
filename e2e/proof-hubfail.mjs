@@ -5,7 +5,7 @@
  * Oath: "The network survives the death of any hub, including ours."
  *
  *   Setup: hub A and hub B are independent instances deployed from the
- *   packaged artifact (longtable-hub tarball) under /home/devbox/hubs/.
+ *   packaged artifact (longtable-hub tarball) under <LT_ROOT>/hubs/.
  *   Both emulators register BOTH hubs in the app (Hubs UI), hub A active.
  *   A ("Olga") pairs with B ("Fay") — the invite carries hub A's
  *   signaling — and shares "Hubfail Stew" friends-only.
@@ -27,9 +27,16 @@ import { execFileSync } from 'node:child_process'
 import net from 'node:net'
 
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
-const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb'
-const HUB_A_DIR = '/home/devbox/hubs/hub-a'
-const HUB_B_DIR = '/home/devbox/hubs/hub-b'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+// Host layout derives from this file's location (env LT_ROOT wins):
+// the repo is <LT_ROOT>/code/longtable.
+const LT_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const LT_ROOT = process.env.LT_ROOT ?? path.resolve(LT_REPO, '..', '..')
+const LT_ADB = process.env.ADB ?? path.join(LT_ROOT, 'tools/android-sdk/platform-tools/adb')
+const ADB = LT_ADB
+const HUB_A_DIR = process.env.HUB_A_DIR ?? path.join(LT_ROOT, 'hubs/hub-a')
+const HUB_B_DIR = process.env.HUB_B_DIR ?? path.join(LT_ROOT, 'hubs/hub-b')
 
 const HUB_A = {
   name: 'Hub A',

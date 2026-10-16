@@ -33,6 +33,7 @@ cd "$(dirname "$0")/.."
 REPO_DIR=$PWD
 ROOT=${LT_ROOT:-$(cd "$REPO_DIR/../.." && pwd)}
 ADB=$ROOT/tools/android-sdk/platform-tools/adb
+export LT_ROOT="$ROOT"
 # The host's LAN address (hub endpoints are also expected via it); CI
 # provides the real value via ci.env, the default is a documentation IP.
 export LT_HOST_LAN_IP="${LT_HOST_LAN_IP:-192.0.2.10}"
@@ -47,8 +48,10 @@ PCAP="$OUT_DIR/session.pcap"
 QEMU_PIDS=$( { pgrep -f 'qemu-system-x86_64-headless'; pgrep -f 'emulator/netsimd'; pgrep -f 'crashpad_handler'; } | tr '\n' ' ' )
 HUB_PIDS=$(python3 - <<'PYEOF'
 import json
+import os
 pids = []
-for d in ('/home/devbox/ops/longtable-hub-a', '/home/devbox/ops/longtable-hub-b'):
+_root = os.environ.get('LT_ROOT', '')
+for d in (f'{_root}/ops/longtable-hub-a', f'{_root}/ops/longtable-hub-b'):
     try:
         s = json.load(open(f'{d}/hub-status.json'))
         pids.append(str(s['pid']))

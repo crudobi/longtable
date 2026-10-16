@@ -24,8 +24,11 @@ const PDS_URL = process.env.PDS_URL ?? 'http://localhost:2583'
 const PLC_URL = process.env.PLC_URL ?? 'http://localhost:2582'
 const PORT = Number(process.env.APPVIEW_E2E_PORT ?? 3211)
 const BASE = `http://localhost:${PORT}`
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..')
 const ACCOUNTS_FILE =
-  process.env.ACCOUNTS_FILE ?? '/home/devbox/ops/longtable-atproto/accounts.json'
+  process.env.ACCOUNTS_FILE ?? path.join(LT_ROOT, 'ops/longtable-atproto/accounts.json')
 const COLLECTION = 'kitchen.longtable.recipe'
 const TIMEOUT_MS = 90_000
 

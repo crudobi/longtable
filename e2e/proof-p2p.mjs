@@ -17,10 +17,17 @@
 import { remote } from 'webdriverio';
 import { execFileSync } from 'node:child_process';
 
-const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb';
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+// Host layout derives from this file's location (env LT_ROOT wins):
+// the repo is <LT_ROOT>/code/longtable.
+const LT_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const LT_ROOT = process.env.LT_ROOT ?? path.resolve(LT_REPO, '..', '..')
+const LT_ADB = process.env.ADB ?? path.join(LT_ROOT, 'tools/android-sdk/platform-tools/adb')
+const ADB = LT_ADB;
 const PKG = 'kitchen.longtable.app';
 const SIGNAL_TMUX = 'lt-signaling';
-const SIGNAL_CMD = 'node /home/devbox/code/longtable/signaling/server.mjs';
+const SIGNAL_CMD = 'node ' + path.join(LT_REPO, 'signaling/server.mjs');
 
 const adb = (serial, ...args) =>
   execFileSync(ADB, ['-s', serial, ...args], { stdio: 'pipe' }).toString();

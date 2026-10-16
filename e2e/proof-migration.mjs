@@ -15,11 +15,18 @@ import { remote } from 'webdriverio';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
-const P0_APK = process.env.P0_APK || '/home/devbox/builds/longtable/longtable-phase0.apk';
-const NEW_APK = process.env.APK || '/home/devbox/builds/longtable/longtable-debug.apk';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Host layout derives from this file's location (env LT_ROOT wins):
+// the repo is <LT_ROOT>/code/longtable.
+const LT_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const LT_ROOT = process.env.LT_ROOT ?? path.resolve(LT_REPO, '..', '..');
+const LT_ADB = process.env.ADB ?? path.join(LT_ROOT, 'tools/android-sdk/platform-tools/adb');
+const P0_APK = process.env.P0_APK || path.join(LT_ROOT, 'builds/longtable/longtable-phase0.apk');
+const NEW_APK = process.env.APK || path.join(LT_ROOT, 'builds/longtable/longtable-debug.apk');
 const PKG = 'kitchen.longtable.app';
 const SERIAL = process.env.SERIAL || 'emulator-5554';
-const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb';
+const ADB = LT_ADB;
 const TITLE = 'Migration Soup';
 
 const adb = (...args) => execFileSync(ADB, ['-s', SERIAL, ...args], { encoding: 'utf8' });

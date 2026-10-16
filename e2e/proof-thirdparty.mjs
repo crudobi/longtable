@@ -25,17 +25,24 @@ import { remote } from 'webdriverio'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 
-const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb'
-const APK = process.env.APK || '/home/devbox/builds/longtable/longtable-debug.apk'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+// Host layout derives from this file's location (env LT_ROOT wins):
+// the repo is <LT_ROOT>/code/longtable.
+const LT_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const LT_ROOT = process.env.LT_ROOT ?? path.resolve(LT_REPO, '..', '..')
+const LT_ADB = process.env.ADB ?? path.join(LT_ROOT, 'tools/android-sdk/platform-tools/adb')
+const ADB = LT_ADB
+const APK = process.env.APK || path.join(LT_ROOT, 'builds/longtable/longtable-debug.apk')
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
 const ACCOUNTS = JSON.parse(
-  fs.readFileSync('/home/devbox/ops/longtable-atproto/accounts.json', 'utf8'),
+  fs.readFileSync(process.env.ACCOUNTS_FILE ?? path.join(LT_ROOT, 'ops/longtable-atproto/accounts.json'), 'utf8'),
 )
 const AUTHOR = ACCOUNTS.author
 const ATTACKER = ACCOUNTS.attacker
 const APPVIEW = 'http://localhost:3210'
 const PDS_EMU = 'https://10.0.2.2:2584'
-const CLIENT = '/home/devbox/code/longtable/examples/third-party-client/read-recipe.mjs'
+const CLIENT = path.join(LT_REPO, 'examples/third-party-client/read-recipe.mjs')
 const TITLE = 'Third-Party Gazpacho'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))

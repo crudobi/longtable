@@ -21,7 +21,14 @@ import { execFileSync } from 'node:child_process'
 
 const APPIUM = 'http://127.0.0.1:4723'
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
-const ADB = '/home/devbox/tools/android-sdk/platform-tools/adb'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+// Host layout derives from this file's location (env LT_ROOT wins):
+// the repo is <LT_ROOT>/code/longtable.
+const LT_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const LT_ROOT = process.env.LT_ROOT ?? path.resolve(LT_REPO, '..', '..')
+const LT_ADB = process.env.ADB ?? path.join(LT_ROOT, 'tools/android-sdk/platform-tools/adb')
+const ADB = LT_ADB
 
 const results = []
 function step(name, ok, detail = '') {

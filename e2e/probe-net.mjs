@@ -8,6 +8,24 @@
 // Used by e2e/run-fleet.sh as the net-verify step of fleet provisioning;
 // requires Appium + fixture HTTPS + signaling + TURN already up.
 import { remote } from 'webdriverio'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// The dev TURN credential is never a source constant: run-fleet exports
+// LT_DEV_TURN_PASSWORD; standalone runs fall back to the ops password
+// file (the rotation store).
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+let TURN_CREDENTIAL = process.env.LT_DEV_TURN_PASSWORD ?? ''
+if (!TURN_CREDENTIAL) {
+  try {
+    TURN_CREDENTIAL = fs
+      .readFileSync(path.join(LT_ROOT, 'ops/longtable-ci/dev-turn-password'), 'utf8')
+      .trim()
+  } catch { /* probe will fail its TURN check loudly if unprovisioned */ }
+}
 
 const APPIUM = 'http://127.0.0.1:4723'
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
@@ -48,7 +66,7 @@ try {
       .then((r) => { window.__probe.https = 'status ' + r.status; })
       .catch((e) => { window.__probe.https = 'error:' + e.message; });
     try {
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:10.0.2.2:3478', username: 'longtable', credential: 'dev-turn-password' }, { urls: 'stun:10.0.2.2:3478' }] });
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'turn:10.0.2.2:3478', username: 'longtable', credential: '${TURN_CREDENTIAL}' }, { urls: 'stun:10.0.2.2:3478' }] });
       pc.createDataChannel('probe');
       pc.onicecandidate = (ev) => { if (ev.candidate) window.__probe.cands.push(ev.candidate.type + '/' + ev.candidate.protocol); };
       pc.onicegatheringstatechange = () => { window.__probe.ice = pc.iceGatheringState; };
