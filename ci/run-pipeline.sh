@@ -10,6 +10,13 @@
 # developer checkout never leaks into a build. Publishes the APK only
 # when EVERY stage passes. Serialized with flock: the emulator is a
 # shared resource and must never see two pipelines at once.
+#
+# Two APK builds (H1): the web-build/apk stages build with
+# VITE_LT_DEBUG_HOOKS=1 — the emulator proofs drive the app through
+# window.__ltFriends/__ltPublic. After every proof passes, the
+# release-build stage rebuilds the web bundle WITHOUT the flag, asserts
+# the hook strings are absent from the bundle, re-syncs and rebuilds
+# the APK — and THAT artifact is what publish ships.
 
 set -uo pipefail
 
@@ -73,7 +80,24 @@ do_checkout() {
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_unit()      { (cd "$WT" && npm test); }
-do_build()     { (cd "$WT" && npm run build); }
+# Proof build: debug hooks ON (VITE_LT_DEBUG_HOOKS=1). The assertion
+# pins the wiring: if the hooks ever vanish from the proof bundle, the
+# proofs would fail obscurely — fail here, loudly, instead.
+do_build()     {
+  (cd "$WT" && VITE_LT_DEBUG_HOOKS=1 npm run build) &&
+  grep -rq '__ltFriends' "$WT/dist/assets" &&
+  grep -rq '__ltPublic' "$WT/dist/assets"
+}
+# Release build: same tree, hooks OFF, rebuilt after all proofs pass;
+# its APK is the one do_publish ships. Fails closed if either hook
+# string survives in the bundle.
+do_release_build() {
+  (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS npm run build) &&
+  ! grep -rq '__ltFriends' "$WT/dist/assets" &&
+  ! grep -rq '__ltPublic' "$WT/dist/assets" &&
+  (cd "$WT" && npx cap sync android) &&
+  (cd "$WT/android" && ./gradlew assembleDebug --console=plain)
+}
 # The AppView is a standalone subpackage (own package.json + lockfile);
 # its unit tests cover ingest filtering, verify-then-index and FTS5
 # search. Runs in the pristine worktree like every other stage.
@@ -173,6 +197,7 @@ run_one() {
     stage proof-importer  do_proof proof-importer &&
     stage proof-localapi  do_proof proof-localapi &&
     stage proof-hubfail   do_proof proof-hubfail &&
+    stage release-build   do_release_build &&
     stage publish         do_publish
     true
   } >>"$log" 2>&1
