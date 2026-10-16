@@ -30,7 +30,12 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-ADB=/home/devbox/tools/android-sdk/platform-tools/adb
+REPO_DIR=$PWD
+ROOT=${LT_ROOT:-$(cd "$REPO_DIR/../.." && pwd)}
+ADB=$ROOT/tools/android-sdk/platform-tools/adb
+# The host's LAN address (hub endpoints are also expected via it); CI
+# provides the real value via ci.env, the default is a documentation IP.
+export LT_HOST_LAN_IP="${LT_HOST_LAN_IP:-192.0.2.10}"
 OUT_DIR=/tmp/lt-telemetry-audit
 mkdir -p "$OUT_DIR"
 BASE_LOG="$OUT_DIR/sockets-baseline.log"
@@ -113,6 +118,7 @@ ls -lh "$PCAP" 2>/dev/null || echo "(no pcap — tcpdump unavailable; ss poll is
 
 # --- analyze --------------------------------------------------------------
 python3 - "$BASE_LOG" "$POLL_LOG" "$QEMU_PIDS" "$HUB_PIDS" <<'PYEOF'
+import os
 import re
 import sys
 
@@ -157,10 +163,10 @@ EXPECTED_APP = {
     '127.0.0.1:3221', '127.0.0.1:3222',   # AppView TLS A/B
     '127.0.0.1:2594', '127.0.0.1:2597',   # PDS TLS A/B
     # Same endpoints via the LAN address (direct-IP hub configs).
-    '192.0.2.10:4445', '192.0.2.10:4446',
-    '192.0.2.10:3479', '192.0.2.10:3480',
-    '192.0.2.10:3221', '192.0.2.10:3222',
-    '192.0.2.10:2594', '192.0.2.10:2597',
+    *{
+        f"{os.environ.get('LT_HOST_LAN_IP', '192.0.2.10')}:{port}"
+        for port in (4445, 4446, 3479, 3480, 3221, 3222, 2594, 2597)
+    },
 }
 
 def classify(ep):

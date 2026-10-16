@@ -1,5 +1,5 @@
 #!/bin/bash
-# run-e2e.sh — Longtable Android e2e gate (runs on devbox).
+# run-e2e.sh — Longtable Android e2e gate (runs on the build host).
 # Usage: run-e2e.sh [apk-path]
 #   1. boots the longtable-test emulator (idempotent)
 #   2. starts the Appium server if needed (tmux session longtable-appium)
@@ -8,10 +8,16 @@
 # Exit 0 = all steps passed; non-zero = at least one step failed (see per-step report).
 set -u
 
-EMU=/home/devbox/tools/android-emu/emu.sh
-E2E_DIR=/home/devbox/code/longtable/e2e
-APK="${1:-/home/devbox/builds/longtable/longtable-debug.apk}"
-FIXTURE_CERTS=/home/devbox/tools/android-emu/fixture-certs
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SELF_DIR/.." && pwd)
+ROOT=${LT_ROOT:-$(cd "$REPO/../.." && pwd)}
+EMU=${LT_EMU:-$ROOT/tools/android-emu/emu.sh}
+E2E_DIR=$REPO/e2e
+APK="${1:-${LT_APK:-$ROOT/builds/longtable/longtable-debug.apk}}"
+FIXTURE_CERTS=${LT_FIXTURE_CERTS:-$ROOT/tools/android-emu/fixture-certs}
+export ANDROID_HOME=$ROOT/tools/android-sdk
+export ANDROID_SDK_ROOT=$ANDROID_HOME
+export JAVA_HOME=$ROOT/tools/jdk-21
 FIXTURE_PORT=18443
 
 [ -f "$APK" ] || { echo "ERROR: APK not found: $APK" >&2; exit 2; }
@@ -25,7 +31,7 @@ if ! curl -sf --max-time 3 http://127.0.0.1:4723/status > /dev/null 2>&1; then
   # Appium 3.x gates the chromedriver download (needed for WEBVIEW contexts)
   # behind the 'uiautomator2:chromedriver_autodownload' insecure feature;
   # without it, webview automation fails with "No Chromedriver found".
-  tmux new -s longtable-appium -d 'env ANDROID_HOME=/home/devbox/tools/android-sdk ANDROID_SDK_ROOT=/home/devbox/tools/android-sdk JAVA_HOME=/home/devbox/tools/jdk-21 PATH=/usr/local/bin:/usr/bin:/bin appium server --address 127.0.0.1 --port 4723 --allow-insecure uiautomator2:chromedriver_autodownload'
+  tmux new -s longtable-appium -d "env ANDROID_HOME=$ANDROID_HOME ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT JAVA_HOME=$JAVA_HOME PATH=/usr/local/bin:/usr/bin:/bin appium server --address 127.0.0.1 --port 4723 --allow-insecure uiautomator2:chromedriver_autodownload"
   ok=0
   for i in $(seq 1 30); do
     sleep 2

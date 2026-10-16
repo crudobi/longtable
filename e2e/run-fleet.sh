@@ -27,18 +27,23 @@
 #    hub configuration.)
 #
 # Env:
-#   APK                APK under test (default:
-#                      /home/devbox/builds/longtable/longtable-debug.apk).
+#   APK                APK under test (default: the published debug APK
+#                      in the builds dir).
 #                      CI passes the pristine-worktree build here.
 #   LT_FLEET_NO_LOCK=1 the caller already holds the pipeline flock
-#                      (CI stages). Standalone runs take
-#                      /home/devbox/ops/longtable-ci/pipeline.lock —
+#                      (CI stages). Standalone runs take the pipeline
+#                      lock in the ops CI dir —
 #                      the same lock the CI pipeline uses — so a manual
 #                      run and a pipeline run can never collide on the
 #                      shared emulators/Appium.
 #   LT_FLEET_KEEP_UP=1 full-suite mode: skip the teardown at the end.
 #   FLEET_LOG_DIR      where per-step logs + summary.txt go
-#                      (default /home/devbox/ops/longtable-ci/fleet-logs/<ts>)
+#                      (default <ops>/longtable-ci/fleet-logs/<ts>)
+#   LT_HOST_LAN_IP     this host's LAN address, used as the test-rig
+#                      TURN relay/external address (CI sets it from the
+#                      ops ci.env; default is a documentation-range IP).
+#   LT_DEV_TURN_PASSWORD  test-rig TURN password; else read from the ops
+#                      password file (see DEV_TURN_PASSWORD below).
 #
 # Teardown policy: ONLY the emulators are stopped. Appium, signaling,
 # TURN, the testnet, the AppView, the TLS proxies, the HTTPS fixture and
@@ -65,18 +70,41 @@
 
 set -uo pipefail
 
-REPO=/home/devbox/code/longtable
+# Locations derive from this script's own path (env overrides win):
+# the repo is <LT_ROOT>/code/longtable; ops/, builds/, tools/ are its
+# siblings under LT_ROOT.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=${LT_REPO:-$(cd "$SELF_DIR/.." && pwd)}
+ROOT=${LT_ROOT:-$(cd "$REPO/../.." && pwd)}
+OPS_DIR=$ROOT/ops
 E2E_DIR=$REPO/e2e
-EMU_DIR=/home/devbox/tools/android-emu
+EMU_DIR=$ROOT/tools/android-emu
 FLEET=$EMU_DIR/fleet.sh
 FIXTURE_CERTS=$EMU_DIR/fixture-certs
 TESTNET_DIR=$REPO/services/atproto-testnet
 APPVIEW_DIR=$REPO/appview
-ACCOUNTS_FILE=/home/devbox/ops/longtable-atproto/accounts.json
-LOCK_FILE=/home/devbox/ops/longtable-ci/pipeline.lock
+ACCOUNTS_FILE=${ACCOUNTS_FILE:-$OPS_DIR/longtable-atproto/accounts.json}
+LOCK_FILE=$OPS_DIR/longtable-ci/pipeline.lock
 PKG=kitchen.longtable.app
-APK="${APK:-/home/devbox/builds/longtable/longtable-debug.apk}"
-ADB=/home/devbox/tools/android-sdk/platform-tools/adb
+APK="${APK:-$ROOT/builds/longtable/longtable-debug.apk}"
+ADB=$ROOT/tools/android-sdk/platform-tools/adb
+APPVIEW_DB=$OPS_DIR/longtable-appview/appview.db
+HOST_LAN_IP="${LT_HOST_LAN_IP:-192.0.2.10}"
+
+# Test-rig TURN state lives in the ops CI dir: the generated config
+# embeds the dev TURN password, so it is never kept in the repo or /tmp.
+# The password itself comes from LT_DEV_TURN_PASSWORD or the ops
+# password file (single store, written out-of-band by rotation).
+TURN_CONF=$OPS_DIR/longtable-ci/turnserver.conf
+TURN_PID=$OPS_DIR/longtable-ci/turnserver.pid
+TURN_LOG=$OPS_DIR/longtable-ci/turnserver.log
+TURN_PASSWORD_FILE=$OPS_DIR/longtable-ci/dev-turn-password
+DEV_TURN_PASSWORD="${LT_DEV_TURN_PASSWORD:-}"
+if [ -z "$DEV_TURN_PASSWORD" ] && [ -f "$TURN_PASSWORD_FILE" ]; then
+  DEV_TURN_PASSWORD=$(cat "$TURN_PASSWORD_FILE")
+fi
+export LT_DEV_TURN_PASSWORD="$DEV_TURN_PASSWORD"
+export LT_HOST_LAN_IP="$HOST_LAN_IP"
 
 # Absolute path to this script, for self-invocation of the internal
 # __services/__install-apk/__probe-all subcommands. $0 alone is not
@@ -87,14 +115,14 @@ ADB=/home/devbox/tools/android-sdk/platform-tools/adb
 SELF=$(readlink -f "$0")
 
 export PATH=/usr/local/bin:/usr/bin:/bin
-export HOME="${HOME:-/home/crudobi}"
-export JAVA_HOME=/home/devbox/tools/jdk-21
-export ANDROID_HOME=/home/devbox/tools/android-sdk
-export ANDROID_SDK_ROOT=/home/devbox/tools/android-sdk
+export HOME="${HOME:-/home/$(id -un)}"
+export JAVA_HOME=$ROOT/tools/jdk-21
+export ANDROID_HOME=$ROOT/tools/android-sdk
+export ANDROID_SDK_ROOT=$ANDROID_HOME
 export APK
 
 TS=$(date +%Y%m%d-%H%M%S)
-LOGDIR="${FLEET_LOG_DIR:-/home/devbox/ops/longtable-ci/fleet-logs/$TS}"
+LOGDIR="${FLEET_LOG_DIR:-$OPS_DIR/longtable-ci/fleet-logs/$TS}"
 mkdir -p "$LOGDIR"
 
 say() { echo "[fleet-run] $*"; }
@@ -183,7 +211,7 @@ ensure_appium() {
   fi
   say "appium: starting (tmux longtable-appium)"
   tmux kill-session -t longtable-appium 2>/dev/null || true
-  tmux new -s longtable-appium -d 'env ANDROID_HOME=/home/devbox/tools/android-sdk ANDROID_SDK_ROOT=/home/devbox/tools/android-sdk JAVA_HOME=/home/devbox/tools/jdk-21 PATH=/usr/local/bin:/usr/bin:/bin appium server --address 127.0.0.1 --port 4723 --allow-insecure uiautomator2:chromedriver_autodownload'
+  tmux new -s longtable-appium -d "env ANDROID_HOME=$ANDROID_HOME ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT JAVA_HOME=$JAVA_HOME PATH=/usr/local/bin:/usr/bin:/bin appium server --address 127.0.0.1 --port 4723 --allow-insecure uiautomator2:chromedriver_autodownload"
   wait_http http://127.0.0.1:4723/status 30 || { say "ERROR: appium did not start" >&2; return 1; }
 }
 
@@ -202,7 +230,7 @@ ensure_fixture() {
 ensure_signaling() {
   if port_listening 4444; then say "signaling: already up"; return 0; fi
   say "signaling: starting (tmux lt-signaling)"
-  tmux_fresh lt-signaling 'node /home/devbox/code/longtable/signaling/server.mjs'
+  tmux_fresh lt-signaling "node $REPO/signaling/server.mjs"
   local i
   for i in $(seq 1 15); do port_listening 4444 && return 0; sleep 2; done
   say "ERROR: signaling did not start" >&2; return 1
@@ -211,26 +239,30 @@ ensure_signaling() {
 ensure_turn() {
   if udp_listening 3478; then say "turn: already up"; return 0; fi
   say "turn: starting (tmux lt-turn)"
-  if [ ! -f /tmp/turnserver.conf ]; then
-    # The local test-rig TURN config (test credential for the LAN rig
-    # only; packaged hubs generate their own). Recreate it if /tmp was
-    # cleared by a reboot.
-    cat > /tmp/turnserver.conf <<'EOF'
-listening-port=3478
-listening-ip=0.0.0.0
-relay-ip=192.0.2.10
-external-ip=192.0.2.10
-realm=longtable
-user=longtable:dev-turn-password
-lt-cred-mech
-no-stdout-log
-log-file=/tmp/turnserver.log
-EOF
+  # Regenerate the config on every start so a password rotation takes
+  # effect simply by restarting coturn. (Packaged hubs generate their
+  # own config and credential; this one is only the local test rig.)
+  if [ -z "$DEV_TURN_PASSWORD" ]; then
+    say "ERROR: dev TURN password not provisioned — set LT_DEV_TURN_PASSWORD or create $TURN_PASSWORD_FILE" >&2
+    return 1
   fi
-  # --pidfile under /tmp matches the original long-running invocation;
-  # without it coturn defaults to /var/run/turnserver.pid, hits a
-  # permission error, and is slow to bind.
-  tmux_fresh lt-turn 'turnserver -c /tmp/turnserver.conf --pidfile=/tmp/turnserver.pid'
+  mkdir -p "$(dirname "$TURN_CONF")"
+  {
+    printf 'listening-port=3478\n'
+    printf 'listening-ip=0.0.0.0\n'
+    printf 'relay-ip=%s\n' "$HOST_LAN_IP"
+    printf 'external-ip=%s\n' "$HOST_LAN_IP"
+    printf 'realm=longtable\n'
+    printf 'user=longtable:%s\n' "$DEV_TURN_PASSWORD"
+    printf 'lt-cred-mech\n'
+    printf 'no-stdout-log\n'
+    printf 'log-file=%s\n' "$TURN_LOG"
+  } > "$TURN_CONF.tmp"
+  chmod 600 "$TURN_CONF.tmp"
+  mv "$TURN_CONF.tmp" "$TURN_CONF"
+  # Explicit --pidfile in the ops dir: coturn's default (/var/run) hits a
+  # permission error for this user and is slow to bind.
+  tmux_fresh lt-turn "turnserver -c $TURN_CONF --pidfile=$TURN_PID"
   local i
   for i in $(seq 1 30); do udp_listening 3478 && return 0; sleep 2; done
   say "ERROR: turnserver did not start" >&2; return 1
@@ -277,7 +309,7 @@ ensure_appview() {
   fi
   if ! curl -sf --max-time 3 http://localhost:3210/health > /dev/null 2>&1; then
     say "appview: starting (tmux lt-appview)"
-    tmux new -s lt-appview -d "cd $APPVIEW_DIR && env APPVIEW_PORT=3210 APPVIEW_DB=/home/devbox/ops/longtable-appview/appview.db PDS_URL=http://localhost:2583 PLC_URL=http://localhost:2582 node index.mjs"
+    tmux new -s lt-appview -d "cd $APPVIEW_DIR && env APPVIEW_PORT=3210 APPVIEW_DB=$APPVIEW_DB PDS_URL=http://localhost:2583 PLC_URL=http://localhost:2582 node index.mjs"
     wait_http http://localhost:3210/health 30 || { say "ERROR: appview did not start" >&2; return 1; }
   fi
   if curl -skf --max-time 3 https://127.0.0.1:3211/health > /dev/null 2>&1; then

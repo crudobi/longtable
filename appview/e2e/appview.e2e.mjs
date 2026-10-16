@@ -4,7 +4,7 @@
  *   npm run test:e2e
  *
  * Requires the testnet to be up (PDS on :2583, PLC on :2582) and seeded
- * accounts at /home/devbox/ops/longtable-atproto/accounts.json
+ * accounts at <LT_ROOT>/ops/longtable-atproto/accounts.json
  * ({author:{handle,password,did}, attacker:{handle,password,did}}).
  *
  * Flow: start the AppView in-process on :3211 with a temp DB -> author

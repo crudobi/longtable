@@ -5,8 +5,8 @@
 //   login -> putRecord -> getRecord -> listRecords -> deleteRecord
 // Prints PASS/FAIL per step and exits non-zero if any step fails.
 //
-// Credentials/DID are read from the seed output
-// (/home/devbox/ops/longtable-atproto/accounts.json), falling back to the
+// Credentials/DID are read from the seed output (accounts.json in the
+// ops dir, $LT_ROOT/ops/longtable-atproto/), falling back to the
 // well-known seed values. Run `npm run seed` first (and re-run it after
 // every testnet restart — DIDs are ephemeral).
 //
@@ -14,12 +14,19 @@
 
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..')
 
 const require = createRequire(import.meta.url)
 const { BskyAgent } = require('@atproto/api')
 
 const PDS_URL = 'http://localhost:2583'
-const ACCOUNTS_FILE = '/home/devbox/ops/longtable-atproto/accounts.json'
+const ACCOUNTS_FILE =
+  process.env.ACCOUNTS_FILE ?? path.join(LT_ROOT, 'ops/longtable-atproto/accounts.json')
 const COLLECTION = 'kitchen.longtable.recipe'
 const RKEY = 'smoke-1'
 

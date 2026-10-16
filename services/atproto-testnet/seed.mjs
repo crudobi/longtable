@@ -20,14 +20,20 @@
 
 import { createRequire } from 'node:module'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import path, { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..')
 import { randomBytes } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const { BskyAgent } = require('@atproto/api')
 
 const PDS_URL = process.env.PDS_URL ?? 'http://localhost:2583'
-const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE ?? '/home/devbox/ops/longtable-atproto/accounts.json'
+const ACCOUNTS_FILE =
+  process.env.ACCOUNTS_FILE ?? path.join(LT_ROOT, 'ops/longtable-atproto/accounts.json')
 const GENERATED = !process.env.LT_SEED_PASSWORD
 const PASSWORD = process.env.LT_SEED_PASSWORD ?? randomBytes(18).toString('base64url')
 

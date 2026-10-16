@@ -3,8 +3,8 @@
 #
 # Triggered by longtable-ci.service (longtable-ci.path watches
 # .git/refs/heads/main; longtable-ci.timer is a 10-minute fallback).
-# Installed to /home/devbox/ops/longtable-ci/run-pipeline.sh by
-# ci/install-ci.sh; the copy in the repo is the source of truth.
+# Installed into the ops CI state dir by ci/install-ci.sh; the copy in
+# the repo is the source of truth.
 #
 # Builds the committed tree in a pristine git worktree so a dirty
 # developer checkout never leaks into a build. Publishes the APK only
@@ -20,19 +20,37 @@
 
 set -uo pipefail
 
-REPO=/home/devbox/code/longtable
-STATE=/home/devbox/ops/longtable-ci
+# --- locations ---------------------------------------------------------------
+# LT_ROOT is the host dir that parents code/, ops/, builds/ and tools/.
+# Override with LT_ROOT; otherwise derive it from this script's location:
+# the script runs either from the repo checkout (ci/, two levels under
+# code/) or installed into the ops state dir (ops/longtable-ci/).
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -n "${LT_ROOT:-}" ]; then
+  ROOT=$LT_ROOT
+elif [ -f "$SELF_DIR/../package.json" ]; then
+  ROOT=$(cd "$SELF_DIR/../../.." && pwd)
+else
+  ROOT=$(cd "$SELF_DIR/../.." && pwd)
+fi
+REPO=${LT_REPO:-$ROOT/code/longtable}
+STATE=${LT_CI_STATE:-$ROOT/ops/longtable-ci}
 LOGS=$STATE/logs
 WT=$STATE/work/wt
-PUBLISH_APK=/home/devbox/builds/longtable/longtable-debug.apk
+PUBLISH_APK=${LT_PUBLISH_APK:-$ROOT/builds/longtable/longtable-debug.apk}
 LOCK_FILE=$STATE/pipeline.lock
 APK_REL=android/app/build/outputs/apk/debug/app-debug.apk
 
 export PATH=/usr/local/bin:/usr/bin:/bin
-export HOME=/home/crudobi
-export JAVA_HOME=/home/devbox/tools/jdk-21
-export ANDROID_HOME=/home/devbox/tools/android-sdk
-export ANDROID_SDK_ROOT=/home/devbox/tools/android-sdk
+export HOME="${HOME:-/home/$(id -un)}"
+export JAVA_HOME=${LT_JAVA_HOME:-$ROOT/tools/jdk-21}
+export ANDROID_HOME=${LT_ANDROID_HOME:-$ROOT/tools/android-sdk}
+export ANDROID_SDK_ROOT=$ANDROID_HOME
+
+# Optional operator environment (e.g. LT_HOST_LAN_IP — this host's LAN
+# address, used as the fleet TURN relay address). Lives in the ops state
+# dir, never in the repo; the systemd unit also loads it (EnvironmentFile).
+if [ -f "$STATE/ci.env" ]; then set -a; . "$STATE/ci.env"; set +a; fi
 
 mkdir -p "$LOGS" "$STATE/work"
 
@@ -105,8 +123,8 @@ do_appview()   { (cd "$WT/appview" && npm ci --no-audit --no-fund && npm test); 
 do_capsync()   { (cd "$WT" && npx cap sync android); }
 do_apk()       { (cd "$WT/android" && ./gradlew assembleDebug --console=plain); }
 # The e2e harness is box infrastructure and runs from the repo checkout
-# (run-e2e.sh hardcodes its paths); the artifact under test is the
-# worktree-built APK.
+# (it derives its paths from its own location); the artifact under test
+# is the worktree-built APK.
 do_e2e()       { "$REPO/e2e/run-e2e.sh" "$WT/$APK_REL"; }
 do_migration() { (cd "$REPO/e2e" && APK="$WT/$APK_REL" node proof-migration.mjs); }
 # The fleet suite (e2e/run-fleet.sh) is driven stage-by-stage so

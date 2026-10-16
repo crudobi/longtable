@@ -10,20 +10,28 @@
  * Usage: node tls-proxy.mjs <listenPort> <targetBaseUrl> [certDir]
  *   node tls-proxy.mjs 2584 http://localhost:2583   (PDS)
  *   node tls-proxy.mjs 3211 http://localhost:3210   (AppView)
- * certDir defaults to /home/devbox/tools/android-emu/fixture-certs
+ * certDir defaults to <LT_ROOT>/tools/android-emu/fixture-certs
  * (server.crt/server.key, machine-level test CA — never committed).
  */
 import https from 'node:https'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..')
 
 const [listenPort, targetBase, certDirArg] = process.argv.slice(2)
 if (!listenPort || !targetBase) {
   console.error('usage: tls-proxy.mjs <listenPort> <targetBaseUrl> [certDir]')
   process.exit(2)
 }
-const certDir = certDirArg || '/home/devbox/tools/android-emu/fixture-certs'
+const certDir =
+  certDirArg ||
+  process.env.FIXTURE_CERTS ||
+  path.join(LT_ROOT, 'tools/android-emu/fixture-certs')
 const target = new URL(targetBase)
 
 const server = https.createServer(

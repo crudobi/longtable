@@ -2,7 +2,7 @@
 
 Serves e2e/fixtures/ (recipe.html) over TLS with CORS headers, so the
 app's WebView can fetch it without mixed-content or CORS failures.
-Certs are machine-level (NOT committed): /home/devbox/tools/android-emu/fixture-certs/
+Certs are machine-level (NOT committed): <LT_ROOT>/tools/android-emu/fixture-certs/
   ca.crt / ca.key        - test CA; ca.crt is installed in the emulator's
                            /system/etc/security/cacerts (one-time setup)
   server.crt / server.key - serves 10.0.2.2 (SAN IP:10.0.2.2)
@@ -14,7 +14,15 @@ import ssl
 import sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-CERT_DIR = sys.argv[1] if len(sys.argv) > 1 else "/home/devbox/tools/android-emu/fixture-certs"
+if len(sys.argv) > 1:
+    CERT_DIR = sys.argv[1]
+elif os.environ.get("FIXTURE_CERTS"):
+    CERT_DIR = os.environ["FIXTURE_CERTS"]
+else:
+    _root = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
+    )
+    CERT_DIR = os.path.join(_root, "tools", "android-emu", "fixture-certs")
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8443
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__))))

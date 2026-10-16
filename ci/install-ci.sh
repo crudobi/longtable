@@ -6,14 +6,19 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-STATE=/home/devbox/ops/longtable-ci
+ROOT=$(cd "$HERE/../../.." && pwd)
+STATE=${LT_CI_STATE:-$ROOT/ops/longtable-ci}
 
 mkdir -p "$STATE/logs" "$STATE/work"
 install -m 0755 "$HERE/run-pipeline.sh" "$STATE/run-pipeline.sh"
 
-sudo install -m 0644 "$HERE/longtable-ci.service" /etc/systemd/system/longtable-ci.service
-sudo install -m 0644 "$HERE/longtable-ci.path" /etc/systemd/system/longtable-ci.path
-sudo install -m 0644 "$HERE/longtable-ci.timer" /etc/systemd/system/longtable-ci.timer
+# The units are templates: @LT_ROOT@ is substituted at install time, so
+# the repo carries no host-specific absolute paths.
+for unit in longtable-ci.service longtable-ci.path longtable-ci.timer; do
+  sed "s|@LT_ROOT@|$ROOT|g" "$HERE/$unit" > "$STATE/.$unit.tmp"
+  sudo install -m 0644 "$STATE/.$unit.tmp" "/etc/systemd/system/$unit"
+  rm -f "$STATE/.$unit.tmp"
+done
 sudo systemctl daemon-reload
 sudo systemctl enable --now longtable-ci.path longtable-ci.timer
 

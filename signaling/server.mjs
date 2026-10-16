@@ -25,13 +25,20 @@ import { WebSocketServer } from 'ws'
 import http from 'node:http'
 import https from 'node:https'
 import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const PORT = Number(process.env.PORT || 4444)
 // TLS cert/key for wss://. The app's WebView is https://localhost, and browsers
 // block insecure ws:// from secure contexts — so the signaling server must speak
 // wss://. Defaults to the e2e fixture cert (SAN IP:10.0.2.2); override via env.
-const TLS_CERT = process.env.TLS_CERT || '/home/devbox/tools/android-emu/fixture-certs/server.crt'
-const TLS_KEY = process.env.TLS_KEY || '/home/devbox/tools/android-emu/fixture-certs/server.key'
+const LT_ROOT =
+  process.env.LT_ROOT ??
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+const FIXTURE_CERTS =
+  process.env.FIXTURE_CERTS ?? path.join(LT_ROOT, 'tools/android-emu/fixture-certs')
+const TLS_CERT = process.env.TLS_CERT || path.join(FIXTURE_CERTS, 'server.crt')
+const TLS_KEY = process.env.TLS_KEY || path.join(FIXTURE_CERTS, 'server.key')
 const MAX_PAYLOAD = 1 << 20 // 1 MiB — signaling frames (SDP/ICE) are tiny
 const MAX_TOPIC_LEN = 256
 const MAX_CONNS_PER_IP = 50

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # pack-hub.sh — build the single-artifact Longtable hub tarball.
 #
-# Produces /home/devbox/builds/longtable/longtable-hub-<version>.tar.gz
+# Produces longtable-hub-<version>.tar.gz in the builds output dir
+# (LT_BUILDS_DIR, default <LT_ROOT>/builds/longtable).
 # containing everything a stranger needs: the hub supervisor, the web
 # app build, signaling, AppView, the managed-PDS testnet stack, and all
 # node_modules — no npm install, no repo checkout at deploy time.
@@ -14,7 +15,7 @@ cd "$REPO"
 
 VERSION="$(node -p "require('./package.json').version")"
 NAME="longtable-hub-$VERSION"
-OUT_DIR="/home/devbox/builds/longtable"
+OUT_DIR="${LT_BUILDS_DIR:-$(cd "$REPO/../.." && pwd)/builds/longtable}"
 mkdir -p "$OUT_DIR"
 
 echo "[pack] building the web app (npm run build)…"
