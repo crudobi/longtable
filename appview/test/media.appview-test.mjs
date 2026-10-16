@@ -3,15 +3,17 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createAppView } from '../server.mjs'
-import { isCacheableMediaId } from '../media.mjs'
+import { createMediaCache, isCacheableMediaId, rawCidForBytes } from '../media.mjs'
 
 // Phase 4: the hub AppView caches public media (recipe photos) from the
 // PDS, content-addressed by (did, cid). First fetch goes to the PDS;
 // repeats are served from disk without touching the PDS again.
 
 const DID = 'did:plc:mediatest123'
-const CID = 'bafkreimediatestcid0001'
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+// A REAL CID over those bytes: the cache verifies fetched bytes against
+// the CID before storing, so fixtures must use genuine content addresses.
+const CID = rawCidForBytes(PNG)
 
 let app
 let base
@@ -87,5 +89,71 @@ describe('appview media cache', () => {
     expect(body.media).toBeTruthy()
     expect(body.media.hits).toBeGreaterThanOrEqual(1)
     expect(body.media.fetches).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('media cache integrity + bounds (direct)', () => {
+  const DID2 = 'did:plc:directtest'
+  const quietLog = { log() {}, info() {}, warn() {}, error() {} }
+  const okPng = (bytes) =>
+    new Response(bytes, { status: 200, headers: { 'content-type': 'image/png' } })
+
+  function tmpCache(opts, handler) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-media-direct-'))
+    const fetchImpl = async (url) => handler(new URL(url))
+    const cache = createMediaCache({
+      dir,
+      pdsUrl: 'http://pds.test',
+      fetchImpl,
+      log: quietLog,
+      ...opts,
+    })
+    return { dir, cache }
+  }
+
+  it('rejects bytes that do not match the requested CID and stores nothing', async () => {
+    const cid = rawCidForBytes(Buffer.from('the real photo bytes'))
+    const { dir, cache } = tmpCache({}, async () =>
+      okPng(Buffer.from('attacker substituted bytes')),
+    )
+    const got = await cache.get(DID2, cid)
+    expect(got).toBeNull()
+    expect(cache.stats.errors).toBe(1)
+    const sub = path.join(dir, encodeURIComponent(DID2))
+    expect(fs.existsSync(path.join(sub, cid))).toBe(false)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('aborts an oversize download during the read and stores nothing', async () => {
+    const big = Buffer.alloc(64 * 1024, 7)
+    const cid = rawCidForBytes(big)
+    const { dir, cache } = tmpCache({ maxBlobBytes: 1024 }, async () => okPng(big))
+    const got = await cache.get(DID2, cid)
+    expect(got).toBeNull()
+    const sub = path.join(dir, encodeURIComponent(DID2))
+    expect(fs.existsSync(path.join(sub, cid))).toBe(false)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('evicts oldest entries to keep the total under the cache bound', async () => {
+    const blobs = [Buffer.alloc(100, 1), Buffer.alloc(100, 2), Buffer.alloc(100, 3)]
+    const cids = blobs.map((b) => rawCidForBytes(b))
+    const { dir, cache } = tmpCache({ maxCacheBytes: 300 }, async (u) => {
+      const i = cids.indexOf(u.searchParams.get('cid'))
+      return i >= 0 ? okPng(blobs[i]) : new Response('nf', { status: 404 })
+    })
+    await cache.get(DID2, cids[0])
+    await new Promise((r) => setTimeout(r, 5)) // distinct mtimes for LRU order
+    await cache.get(DID2, cids[1])
+    await new Promise((r) => setTimeout(r, 5))
+    await cache.get(DID2, cids[2])
+    const sub = path.join(dir, encodeURIComponent(DID2))
+    const stored = fs.readdirSync(sub).filter((f) => !f.endsWith('.json'))
+    expect(stored).not.toContain(cids[0]) // oldest evicted
+    expect(stored).toContain(cids[2]) // newest kept
+    let total = 0
+    for (const f of fs.readdirSync(sub)) total += fs.statSync(path.join(sub, f)).size
+    expect(total).toBeLessThanOrEqual(300)
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 })
