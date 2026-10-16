@@ -16,6 +16,7 @@ import {
   ensurePluginsLoaded,
   getImporter,
   listImporters,
+  registerImporter,
   runImporter,
 } from '../importers/registry'
 
@@ -242,5 +243,58 @@ describe('registry', () => {
     await expect(runImporter('nope', { kind: 'text', text: '{}' })).rejects.toThrow(
       /not available/,
     )
+  })
+})
+
+describe('registry: plugin error contract (M-L)', () => {
+  registerImporter({
+    apiVersion: IMPORTER_API_VERSION,
+    id: 'test-plain-thrower',
+    name: 'Plain thrower',
+    accepts: ['text'],
+    import: () => {
+      throw new Error("This file ended early — row 12 has no title, so nothing could be read.")
+    },
+  })
+  registerImporter({
+    apiVersion: IMPORTER_API_VERSION,
+    id: 'test-stack-thrower',
+    name: 'Stack thrower',
+    accepts: ['text'],
+    import: () => {
+      throw new Error(
+        'Error: boom\n    at parseIt (parser.js:10:5)\n    at runImporter (registry.ts:115:3)',
+      )
+    },
+  })
+  registerImporter({
+    apiVersion: IMPORTER_API_VERSION,
+    id: 'test-long-thrower',
+    name: 'Long thrower',
+    accepts: ['text'],
+    import: () => {
+      throw new Error(`Broken export: ${'x'.repeat(400)}`)
+    },
+  })
+
+  it("surfaces a plugin's own plain-language error message", async () => {
+    await expect(runImporter('test-plain-thrower', { kind: 'text', text: 'x' })).rejects.toThrow(
+      'This file ended early — row 12 has no title, so nothing could be read.',
+    )
+  })
+
+  it('replaces a stack-trace-shaped plugin message with the generic failure', async () => {
+    await expect(runImporter('test-stack-thrower', { kind: 'text', text: 'x' })).rejects.toThrow(
+      "Stack thrower failed — the source couldn't be read. Nothing was imported.",
+    )
+  })
+
+  it('caps an over-long plugin message at 300 characters', async () => {
+    const err = await runImporter('test-long-thrower', { kind: 'text', text: 'x' }).catch(
+      (e: unknown) => e,
+    )
+    expect(err).toBeInstanceOf(ImporterError)
+    expect((err as Error).message.length).toBe(300)
+    expect((err as Error).message.startsWith('Broken export: ')).toBe(true)
   })
 })

@@ -94,6 +94,43 @@ export function listPluginIssues(): PluginIssue[] {
 // Running an import
 // ---------------------------------------------------------------------------
 
+/** Longest plugin-thrown message the UI will show. */
+const PLUGIN_MESSAGE_MAX = 300
+
+/**
+ * Does this text look like raw machine output rather than a sentence
+ * written for a user? Mirrors friendlyError's looksRaw heuristic —
+ * duplicated here on purpose: friendlyError imports this package's
+ * contract, so importing it back from here would close a cycle.
+ */
+function looksRawMessage(message: string): boolean {
+  return (
+    /^\s*[{[]/.test(message) ||
+    /\s+at\s+\S+/.test(message) || // stack frames ("… at fn (file:1:2)")
+    /HTTP \d{3}\b/.test(message) ||
+    /^(TypeError|ReferenceError|SyntaxError|RangeError)\b/.test(message)
+  )
+}
+
+/**
+ * Make a plugin-thrown message safe to show: collapse it to one line,
+ * strip control characters, cap it at PLUGIN_MESSAGE_MAX characters.
+ * Returns null when nothing showable remains — empty text, or text that
+ * looks like raw machine output (a stack trace, a JSON blob, …) — so the
+ * caller falls back to its generic failure sentence instead.
+ */
+export function sanitizePluginMessage(raw: string): string | null {
+  const cleaned = raw
+    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned || looksRawMessage(cleaned)) return null
+  return cleaned.length > PLUGIN_MESSAGE_MAX
+    ? `${cleaned.slice(0, PLUGIN_MESSAGE_MAX - 1).trimEnd()}…`
+    : cleaned
+}
+
 /**
  * Run an importer and validate its output. Resolves with the recipes as
  * app-ready `RecipeInput[]`; rejects with an `ImporterError` whose message
@@ -113,10 +150,17 @@ export async function runImporter(
   try {
     raw = await importer.import(input)
   } catch (e) {
-    // ImporterErrors (and UrlImportErrors, which carry plain messages
-    // already) pass through; anything else becomes a plain failure.
+    // ImporterErrors (thrown by the contract validator and built-ins) are
+    // written for users and pass through as-is. A plugin's own Error is
+    // also shown — that is the documented contract (docs/importers.md) —
+    // after sanitization (see sanitizePluginMessage). Anything that
+    // isn't an Error becomes the plain generic failure.
     if (e instanceof ImporterError) throw e
     if (e instanceof Error && e.name === 'UrlImportError') throw new ImporterError(e.message)
+    if (e instanceof Error) {
+      const msg = sanitizePluginMessage(e.message)
+      if (msg) throw new ImporterError(msg)
+    }
     throw new ImporterError(
       `${importer.name} failed — the source couldn't be read. Nothing was imported.`,
     )

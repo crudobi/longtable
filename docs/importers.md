@@ -55,7 +55,13 @@ Rules of the road:
 - **Fail with a sentence.** On any problem, `throw new Error('…')` with
   a plain-language message a cook can act on ("This doesn't look like a
   Mealie recipe — it has no recipeIngredient list"). The app shows the
-  message verbatim and imports **nothing** from that run.
+  message and imports **nothing** from that run. "Shows" has one safety
+  edit: the message is collapsed to a single line, control characters
+  are stripped, and it is capped at 300 characters — and if what you
+  throw looks like raw machine output (a stack trace, a JSON blob, an
+  "HTTP 500" string) the app replaces it with a generic failure
+  sentence instead. Write a sentence for a cook and it will arrive
+  exactly as written.
 - **Don't pre-validate defensively — but do shape faithfully.** After
   your importer returns, the app validates every recipe (below). Map
   your format's fields to the canonical names; don't stuff data into

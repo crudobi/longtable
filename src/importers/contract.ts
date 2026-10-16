@@ -65,7 +65,10 @@ export interface RecipeImporter {
   /**
    * Do the import. May return one recipe or many (a file can hold a whole
    * collection). Throw an `Error` with a plain-language message on any
-   * problem — the app shows it verbatim and imports nothing.
+   * problem — the app shows it (sanitized: one line, control characters
+   * stripped, capped at 300 characters; anything that looks like raw
+   * machine output, e.g. a stack trace, is replaced with a generic
+   * failure sentence) and imports nothing.
    */
   import: (input: ImporterInput) => Promise<ImportedRecipe[]> | ImportedRecipe[]
 }
