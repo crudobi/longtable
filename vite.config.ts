@@ -10,9 +10,15 @@ import { VitePWA } from 'vite-plugin-pwa'
  * that script-src 'self' would block, breaking the dev loop outright.
  * The shipped artifact — what WebViews and browsers actually run — is
  * the build, so the policy lives there. Directive rationale:
- *  - script-src 'self': no inline or third-party script execution.
- *    With the (currently sink-free) escaping rendering this is the
- *    defense-in-depth layer: a future stored-XSS bug still can't run.
+ *  - script-src 'self' + 'wasm-unsafe-eval': no inline or third-party
+ *    script execution, and no JS eval — but WebAssembly compilation
+ *    is allowed, because libsodium (identity/friends crypto) and the
+ *    Automerge migration chunk are WASM. Without the wasm allowance
+ *    identity creation fails and half the app silently never starts
+ *    (caught by the e2e gate on the first CSP run — exactly what the
+ *    gate is for). With the (currently sink-free) escaping rendering
+ *    this is the defense-in-depth layer: a future stored-XSS bug
+ *    still can't run script.
  *  - connect-src: hubs, PDS and AppView endpoints are user-configured
  *    arbitrary origins, so TLS schemes are open (https:/wss:); plain
  *    http/ws is allowed ONLY for loopback, which is where the dev
@@ -26,7 +32,7 @@ import { VitePWA } from 'vite-plugin-pwa'
  */
 const CSP = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
   "connect-src 'self' https: wss: http://localhost:* ws://localhost:*",
   "img-src 'self' data: blob: https:",
   "style-src 'self' 'unsafe-inline'",
