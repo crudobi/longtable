@@ -68,6 +68,27 @@ gradle.taskGraph.whenReady { graph ->
     }
 }
 
+// A4: signed release config. Reads the upload keystore credentials
+// from a key.properties file OUTSIDE the repo (ops state dir), located
+// via LT_KEYSTORE_PROPERTIES, falling back to the conventional
+// repo-relative path ../../../ops/longtable-ci/key.properties (from
+// android/: repo -> code -> <LT_ROOT> -> ops/). The file holds
+// storeFile/storePassword/keyAlias/keyPassword; it is never committed
+// (0600, ops dir only) and its values never appear on a command line.
+// When the file is absent (e.g. a developer checkout), no release
+// signing config is applied and bundleRelease produces an unsigned
+// bundle — the CI signed-release stage fails closed on apksigner
+// verify in that case, so an unsigned artifact can never publish.
+// The A3 tag/clean-tree gate is untouched: it still refuses release
+// builds on untagged or dirty HEADs.
+def keystorePropsFile = file(System.getenv('LT_KEYSTORE_PROPERTIES') ?: '../../../ops/longtable-ci/key.properties')
+def keystoreProps = new Properties()
+def haveSigningKey = false
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+    haveSigningKey = keystoreProps['storeFile'] && keystoreProps['storePassword'] && keystoreProps['keyAlias'] && keystoreProps['keyPassword']
+}
+
 android {
     namespace "kitchen.longtable.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -84,10 +105,23 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (haveSigningKey) {
+            release {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (haveSigningKey) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

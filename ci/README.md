@@ -53,8 +53,26 @@ leaks into a build — and runs, in order:
     app-data reset on its devices first. (`proof-thirdparty` consumes
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
-13. `publish` — copies the APK to the published location in the builds
-    dir (`longtable-debug.apk`)
+13. `release-build` — rebuilds the web bundle hooks-off (no debug
+    hooks, no dev TURN password), asserts the hook strings and the
+    rotated dev TURN password are absent, re-syncs and rebuilds the
+    debug APK. That artifact is what `publish` ships.
+14. `signed-release` — builds `bundleRelease` + `assembleRelease`
+    signed with the ops-dir upload keystore (`key.properties` beside
+    the keystore, never in the repo), then verifies: `apksigner
+    verify`, `bundletool dump manifest` (package + git-derived
+    versionCode/versionName), and `aapt2 dump badging` of the release
+    APK. Runs ONLY when HEAD carries an exact git tag and SKIPS
+    cleanly (recorded as `signed_release: "skipped"`) on untagged
+    commits — the A3 fail-closed rule (release builds refuse untagged
+    or dirty HEADs) is never relaxed. Tag a commit (e.g. `v0.1.0`)
+    and push commit + tag together to cut a signed release.
+15. `publish` — copies the debug APK to the published location in the
+    builds dir (`longtable-debug.apk`); when the signed-release stage
+    published, also copies `longtable-release.aab` +
+    `longtable-release.apk` (+ `longtable-release-mapping.txt` when
+    produced — currently not, `minifyEnabled false`) with `.sha256`
+    sidecars. Copies are atomic (`.tmp` + rename).
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits
@@ -79,7 +97,9 @@ so a CI run and a manual fleet run can never overlap.
 All under the ops CI dir (`<LT_ROOT>/ops/longtable-ci/`):
 
 - `status.json` — the latest run: commit, result, per-stage results and
-  durations, whether it published, the published APK md5, log path.
+  durations, whether it published, the published APK md5, the signed
+  AAB / release APK md5s and `signed_release` state (`none` /
+  `skipped` / `published`), log path.
 - `history.jsonl` — one JSON line per run, append-only.
 - `logs/<timestamp>-<short-hash>.log` — full output of one run.
 - `work/wt` — the build worktree. Removed after a green run; **kept

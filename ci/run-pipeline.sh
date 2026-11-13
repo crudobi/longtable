@@ -17,6 +17,17 @@
 # release-build stage rebuilds the web bundle WITHOUT the flag, asserts
 # the hook strings are absent from the bundle, re-syncs and rebuilds
 # the APK — and THAT artifact is what publish ships.
+#
+# Signed release (A4): after release-build, the signed-release stage
+# builds bundleRelease + assembleRelease signed with the ops-dir
+# upload keystore — but ONLY when HEAD carries an exact git tag. A3
+# made release builds fail closed on untagged HEADs and CI builds
+# every commit, so the stage gates on a tag and skips cleanly
+# otherwise; the A3 check itself is never relaxed. Tag a commit
+# (e.g. v0.1.0) to cut a signed release. Verified artifacts (apksigner
+# + bundletool manifest + aapt2 badging) publish as
+# longtable-release.aab/.apk (+ mapping.txt when produced) with
+# .sha256 sidecars.
 
 set -uo pipefail
 
@@ -38,14 +49,27 @@ STATE=${LT_CI_STATE:-$ROOT/ops/longtable-ci}
 LOGS=$STATE/logs
 WT=$STATE/work/wt
 PUBLISH_APK=${LT_PUBLISH_APK:-$ROOT/builds/longtable/longtable-debug.apk}
+PUBLISH_AAB=${LT_PUBLISH_AAB:-$ROOT/builds/longtable/longtable-release.aab}
+PUBLISH_RELEASE_APK=${LT_PUBLISH_RELEASE_APK:-$ROOT/builds/longtable/longtable-release.apk}
+PUBLISH_MAPPING=${LT_PUBLISH_MAPPING:-$ROOT/builds/longtable/longtable-release-mapping.txt}
 LOCK_FILE=$STATE/pipeline.lock
 APK_REL=android/app/build/outputs/apk/debug/app-debug.apk
+RELEASE_AAB_REL=android/app/build/outputs/bundle/release/app-release.aab
+RELEASE_APK_REL=android/app/build/outputs/apk/release/app-release.apk
+MAPPING_REL=android/app/build/outputs/mapping/release/mapping.txt
+KEYSTORE_PROPS=${LT_KEYSTORE_PROPERTIES:-$STATE/key.properties}
 
 export PATH=/usr/local/bin:/usr/bin:/bin
 export HOME="${HOME:-/home/$(id -un)}"
 export JAVA_HOME=${LT_JAVA_HOME:-$ROOT/tools/jdk-21}
 export ANDROID_HOME=${LT_ANDROID_HOME:-$ROOT/tools/android-sdk}
 export ANDROID_SDK_ROOT=$ANDROID_HOME
+
+# A4 verification tools (build-tools 35.0.0; bundletool jar lives in
+# tools/, fetched from the upstream Google release).
+APKSIGNER=${LT_APKSIGNER:-$ANDROID_HOME/build-tools/35.0.0/apksigner}
+AAPT2=${LT_AAPT2:-$ANDROID_HOME/build-tools/35.0.0/aapt2}
+BUNDLETOOL_JAR=${LT_BUNDLETOOL_JAR:-$ROOT/tools/bundletool/bundletool-all-1.18.1.jar}
 
 # Optional operator environment (e.g. LT_HOST_LAN_IP — this host's LAN
 # address, used as the fleet TURN relay address). Lives in the ops state
@@ -68,6 +92,9 @@ STAGE_RESULTS=""   # "name:ok:seconds,name:fail:seconds,..."
 FAILED_STAGE=""
 FLEET_UP=""        # set once fleet provisioning is attempted
 APK_MD5=""
+AAB_MD5=""
+RELEASE_APK_MD5=""
+SIGNED_RELEASE="none"   # none | skipped (untagged HEAD) | published
 
 stage() {
   local name=$1; shift
@@ -159,11 +186,80 @@ do_fleet_teardown() {
   LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" teardown
 }
 
+# A4: signed release. Runs AFTER release-build (hooks-off web bundle
+# + cap sync already done) and after every proof, so a signed artifact
+# only exists for a fully-green tree. A3 interaction — fail-closed,
+# NOT weakened: bundleRelease/assembleRelease themselves refuse an
+# untagged HEAD or a dirty tree, and this stage never invokes them on
+# an untagged commit: it gates on an exact tag first and skips cleanly
+# (logged; recorded as "skipped" in status.json) when HEAD is
+# untagged. A release is cut by tagging the commit and pushing commit
+# + tag together; the pristine worktree then sees the tag and the
+# stage runs. Any failure here fails the run and nothing publishes.
+# Verification is all-or-nothing: apksigner verify (v1+v2+v3),
+# bundletool manifest dump (package + git-derived versionCode and
+# versionName), and aapt2 badging of the release APK against the same
+# expected values.
+do_signed_release() {
+  local tag expect_code expect_name manifest
+  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  if [ -z "$tag" ]; then
+    say "signed-release: HEAD has no exact tag; skipping (tag the commit to cut a signed release)"
+    SIGNED_RELEASE=skipped
+    return 0
+  fi
+  say "signed-release: HEAD tagged $tag; building signed release"
+  [ -f "$KEYSTORE_PROPS" ] || { say "signed-release: key.properties missing at $KEYSTORE_PROPS"; return 1; }
+  [ -f "$BUNDLETOOL_JAR" ] || { say "signed-release: bundletool jar missing at $BUNDLETOOL_JAR"; return 1; }
+  [ -x "$APKSIGNER" ] || { say "signed-release: apksigner missing at $APKSIGNER"; return 1; }
+  [ -x "$AAPT2" ] || { say "signed-release: aapt2 missing at $AAPT2"; return 1; }
+  (cd "$WT/android" && LT_KEYSTORE_PROPERTIES="$KEYSTORE_PROPS" ./gradlew bundleRelease assembleRelease --console=plain) || return 1
+  [ -f "$WT/$RELEASE_AAB_REL" ] || { say "signed-release: AAB missing at $RELEASE_AAB_REL"; return 1; }
+  [ -f "$WT/$RELEASE_APK_REL" ] || { say "signed-release: release APK missing at $RELEASE_APK_REL"; return 1; }
+  "$APKSIGNER" verify --verbose "$WT/$RELEASE_APK_REL" || return 1
+  manifest=$(mktemp)
+  "$JAVA_HOME/bin/java" -jar "$BUNDLETOOL_JAR" dump manifest --bundle "$WT/$RELEASE_AAB_REL" >"$manifest" || { rm -f "$manifest"; return 1; }
+  expect_code=$(git -C "$WT" rev-list --count HEAD)
+  expect_name=${tag#v}
+  grep -q "package=\"kitchen.longtable.app\"" "$manifest" || { say "signed-release: AAB manifest package mismatch"; rm -f "$manifest"; return 1; }
+  grep -q "android:versionCode=\"$expect_code\"" "$manifest" || { say "signed-release: AAB manifest versionCode mismatch (want $expect_code)"; rm -f "$manifest"; return 1; }
+  grep -q "android:versionName=\"$expect_name\"" "$manifest" || { say "signed-release: AAB manifest versionName mismatch (want $expect_name)"; rm -f "$manifest"; return 1; }
+  rm -f "$manifest"
+  "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" | grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" || { say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name)"; return 1; }
+  say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
+  SIGNED_RELEASE=published
+}
+
+publish_one() { # src dst
+  cp "$1" "$2.tmp"
+  mv "$2.tmp" "$2"
+}
+
+write_sha256() { # file
+  (cd "$(dirname "$1")" && sha256sum "$(basename "$1")" > "$1.sha256.tmp" && mv "$1.sha256.tmp" "$1.sha256")
+}
+
 do_publish() {
-  cp "$WT/$APK_REL" "$PUBLISH_APK.tmp"
-  mv "$PUBLISH_APK.tmp" "$PUBLISH_APK"
+  publish_one "$WT/$APK_REL" "$PUBLISH_APK"
   APK_MD5=$(md5sum "$PUBLISH_APK" | cut -d' ' -f1)
   say "published $PUBLISH_APK md5=$APK_MD5"
+  if [ "$SIGNED_RELEASE" = published ]; then
+    publish_one "$WT/$RELEASE_AAB_REL" "$PUBLISH_AAB"
+    publish_one "$WT/$RELEASE_APK_REL" "$PUBLISH_RELEASE_APK"
+    AAB_MD5=$(md5sum "$PUBLISH_AAB" | cut -d' ' -f1)
+    RELEASE_APK_MD5=$(md5sum "$PUBLISH_RELEASE_APK" | cut -d' ' -f1)
+    write_sha256 "$PUBLISH_AAB"
+    write_sha256 "$PUBLISH_RELEASE_APK"
+    say "published $PUBLISH_AAB md5=$AAB_MD5"
+    say "published $PUBLISH_RELEASE_APK md5=$RELEASE_APK_MD5"
+    if [ -f "$WT/$MAPPING_REL" ]; then
+      publish_one "$WT/$MAPPING_REL" "$PUBLISH_MAPPING"
+      write_sha256 "$PUBLISH_MAPPING"
+      say "published $PUBLISH_MAPPING"
+    else
+      say "publish: no mapping.txt produced (minifyEnabled false); skipping mapping publish"
+    fi
+  fi
 }
 
 write_status() {
@@ -171,6 +267,8 @@ write_status() {
   CI_RESULT="$1" CI_FAILED_STAGE="$FAILED_STAGE" \
   CI_STARTED_AT="$2" CI_FINISHED_AT="$3" CI_DURATION_S="$4" \
   CI_APK_MD5="$APK_MD5" CI_LOG="$5" \
+  CI_AAB_MD5="$AAB_MD5" CI_RELEASE_APK_MD5="$RELEASE_APK_MD5" \
+  CI_SIGNED_RELEASE="$SIGNED_RELEASE" \
   python3 - "$STATE/status.json" "$STATE/history.jsonl" <<'PYEOF'
 import json, os, sys
 status_path, history_path = sys.argv[1], sys.argv[2]
@@ -189,6 +287,9 @@ rec = {
     "duration_s": int(os.environ.get("CI_DURATION_S", "0")),
     "published": os.environ.get("CI_RESULT", "") == "success",
     "apk_md5": os.environ.get("CI_APK_MD5", "") or None,
+    "aab_md5": os.environ.get("CI_AAB_MD5", "") or None,
+    "release_apk_md5": os.environ.get("CI_RELEASE_APK_MD5", "") or None,
+    "signed_release": os.environ.get("CI_SIGNED_RELEASE", "none"),
     "log": os.environ.get("CI_LOG", ""),
     "stages": stages,
 }
@@ -207,7 +308,7 @@ run_one() {
   run_id="$(date +%Y%m%d-%H%M%S)-$short"
   log="$LOGS/$run_id.log"
   started=$(date -Iseconds)
-  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; FLEET_UP=""
+  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; FLEET_UP=""
   local t0=$SECONDS
   say "run $run_id commit $TARGET_HASH"
   {
@@ -232,6 +333,7 @@ run_one() {
     stage proof-localapi  do_proof proof-localapi &&
     stage proof-hubfail   do_proof proof-hubfail &&
     stage release-build   do_release_build &&
+    stage signed-release  do_signed_release &&
     stage publish         do_publish
     true
   } >>"$log" 2>&1
