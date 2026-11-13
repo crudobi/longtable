@@ -119,6 +119,14 @@ once to create `capacitor.config.ts`; `npx cap add android` generated
 `android/`. The first `./gradlew` run downloads its distribution (Gradle
 8.11.1) and the SDK Platform 35 package — run it in tmux on a flaky link.
 
+## Release signing
+
+Release builds are signed with the project's upload key. The keystore is
+held by the maintainer and is never committed to this repo.
+
+- Upload-key certificate SHA-256 fingerprint:
+  `AD:C9:E0:62:94:C2:88:7B:A6:51:7F:9A:B7:5C:BA:C8:FB:81:42:D6:99:43:66:C0:A1:BA:54:A0:10:31:D4:E9`
+
 ## Verify the no-telemetry property
 
 With the local services up (hub, signaling, testnet), run
