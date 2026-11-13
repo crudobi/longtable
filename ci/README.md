@@ -73,6 +73,15 @@ leaks into a build — and runs, in order:
     `longtable-release.apk` (+ `longtable-release-mapping.txt` when
     produced — currently not, `minifyEnabled false`) with `.sha256`
     sidecars. Copies are atomic (`.tmp` + rename).
+16. `github-release` — creates a GitHub Release for the tag (A5)
+    with the signed `longtable-release.aab` +
+    `longtable-release.apk` and their `.sha256` sidecars,
+    changelog from `git log` since the previous tag. Runs ONLY
+    when the signed-release stage published this run and SKIPS
+    cleanly (recorded as `github_release: "skipped"`) on
+    untagged commits — same gate as signed-release. Fails
+    closed if a release for the tag already exists; never
+    overwrites or deletes one.
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits
@@ -99,6 +108,7 @@ All under the ops CI dir (`<LT_ROOT>/ops/longtable-ci/`):
 - `status.json` — the latest run: commit, result, per-stage results and
   durations, whether it published, the published APK md5, the signed
   AAB / release APK md5s and `signed_release` state (`none` /
+  `skipped` / `published`), plus `github_release` state (`none` /
   `skipped` / `published`), log path.
 - `history.jsonl` — one JSON line per run, append-only.
 - `logs/<timestamp>-<short-hash>.log` — full output of one run.

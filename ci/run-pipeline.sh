@@ -95,6 +95,7 @@ APK_MD5=""
 AAB_MD5=""
 RELEASE_APK_MD5=""
 SIGNED_RELEASE="none"   # none | skipped (untagged HEAD) | published
+GITHUB_RELEASE="none"     # none | skipped (untagged HEAD) | published
 
 stage() {
   local name=$1; shift
@@ -200,6 +201,18 @@ do_fleet_teardown() {
 # bundletool manifest dump (package + git-derived versionCode and
 # versionName), and aapt2 badging of the release APK against the same
 # expected values.
+
+# GitHub Release (A5): after publish, the github-release stage creates
+# a GitHub Release for the tag with the signed AAB + release APK and
+# their .sha256 sidecars, changelog from git log since the previous
+# tag. It rides the same gate as signed-release (only when a signed
+# release was published this run) and fails closed if a release for
+# the tag already exists -- never overwrites. /usr/local/sbin/release
+# and the Gonas release-gated-publish recipe were NOT reused: they
+# publish source trees for web projects (gh-publish scan/publish +
+# homepage 200 + tally) and Longtable is not in the recipe's allowed
+# list; this publisher ships binary release assets instead.
+
 do_signed_release() {
   local tag expect_code expect_name manifest
   tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
@@ -228,6 +241,69 @@ do_signed_release() {
   "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" | grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" || { say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name)"; return 1; }
   say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
   SIGNED_RELEASE=published
+}
+
+gh_repo_for() { # worktree -> owner/repo derived from origin URL
+  local url repo
+  url=$(git -C "$1" config --get remote.origin.url 2>/dev/null || true)
+  repo=${url#*github.com[:/]}
+  repo=${repo%.git}
+  case "$repo" in */*) echo "$repo" ;; *) echo "" ;; esac
+}
+
+# A5: GitHub Release publisher. Runs AFTER publish, so the assets it
+# uploads are the already-published, verified signed artifacts (AAB +
+# release APK + .sha256 sidecars) -- never worktree files directly.
+# Tag-gated on the same condition as signed-release: it only runs when
+# SIGNED_RELEASE=published (which implies HEAD carries an exact tag);
+# otherwise it skips cleanly and records "skipped". Changelog is the
+# git log since the previous tag (full history when this is the first
+# tag). Fail-closed: if a release for the tag already exists, the
+# stage FAILS -- never force-delete or overwrite an existing release;
+# re-publishing a tag is a human call.
+do_github_release() {
+  local tag repo notes prev
+  if [ "$SIGNED_RELEASE" != published ]; then
+    say "github-release: no signed release this run (signed_release=$SIGNED_RELEASE); skipping"
+    GITHUB_RELEASE=skipped
+    return 0
+  fi
+  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  [ -n "$tag" ] || { say "github-release: signed_release=published but HEAD has no exact tag; refusing"; return 1; }
+  [ -f "$PUBLISH_AAB" ] || { say "github-release: published AAB missing at $PUBLISH_AAB"; return 1; }
+  [ -f "$PUBLISH_RELEASE_APK" ] || { say "github-release: published release APK missing at $PUBLISH_RELEASE_APK"; return 1; }
+  [ -f "$PUBLISH_AAB.sha256" ] || { say "github-release: AAB checksum sidecar missing at $PUBLISH_AAB.sha256"; return 1; }
+  [ -f "$PUBLISH_RELEASE_APK.sha256" ] || { say "github-release: release APK checksum sidecar missing at $PUBLISH_RELEASE_APK.sha256"; return 1; }
+  command -v gh >/dev/null 2>&1 || { say "github-release: gh CLI not found"; return 1; }
+  repo=$(gh_repo_for "$WT")
+  [ -n "$repo" ] || { say "github-release: could not derive owner/repo from origin"; return 1; }
+  if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+    say "github-release: release $tag already exists on $repo; refusing to overwrite (delete it by hand if a re-publish is intended)"
+    return 1
+  fi
+  notes=$(mktemp)
+  {
+    echo "Longtable $tag"
+    echo ""
+    echo "versionCode $(git -C "$WT" rev-list --count HEAD), versionName ${tag#v}."
+    echo "Signed release APK + AAB, with SHA-256 sidecars."
+    echo ""
+    echo "Checksums:"
+    cat "$PUBLISH_AAB.sha256" "$PUBLISH_RELEASE_APK.sha256"
+    echo ""
+    echo "Changes:"
+    prev=$(git -C "$WT" describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+    if [ -n "$prev" ]; then
+      git -C "$WT" log "$prev..HEAD" --format='- %s (%h)'
+    else
+      git -C "$WT" log --format='- %s (%h)'
+    fi
+  } >"$notes" || { rm -f "$notes"; return 1; }
+  gh release create "$tag" --repo "$repo" --title "Longtable $tag" --notes-file "$notes" \
+    "$PUBLISH_RELEASE_APK" "$PUBLISH_AAB" "$PUBLISH_RELEASE_APK.sha256" "$PUBLISH_AAB.sha256" || { rm -f "$notes"; return 1; }
+  rm -f "$notes"
+  say "github-release: published https://github.com/$repo/releases/tag/$tag"
+  GITHUB_RELEASE=published
 }
 
 publish_one() { # src dst
@@ -269,6 +345,7 @@ write_status() {
   CI_APK_MD5="$APK_MD5" CI_LOG="$5" \
   CI_AAB_MD5="$AAB_MD5" CI_RELEASE_APK_MD5="$RELEASE_APK_MD5" \
   CI_SIGNED_RELEASE="$SIGNED_RELEASE" \
+  CI_GITHUB_RELEASE="$GITHUB_RELEASE" \
   python3 - "$STATE/status.json" "$STATE/history.jsonl" <<'PYEOF'
 import json, os, sys
 status_path, history_path = sys.argv[1], sys.argv[2]
@@ -290,6 +367,7 @@ rec = {
     "aab_md5": os.environ.get("CI_AAB_MD5", "") or None,
     "release_apk_md5": os.environ.get("CI_RELEASE_APK_MD5", "") or None,
     "signed_release": os.environ.get("CI_SIGNED_RELEASE", "none"),
+    "github_release": os.environ.get("CI_GITHUB_RELEASE", "none"),
     "log": os.environ.get("CI_LOG", ""),
     "stages": stages,
 }
@@ -308,7 +386,7 @@ run_one() {
   run_id="$(date +%Y%m%d-%H%M%S)-$short"
   log="$LOGS/$run_id.log"
   started=$(date -Iseconds)
-  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; FLEET_UP=""
+  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; GITHUB_RELEASE="none"; FLEET_UP=""
   local t0=$SECONDS
   say "run $run_id commit $TARGET_HASH"
   {
@@ -334,7 +412,8 @@ run_one() {
     stage proof-hubfail   do_proof proof-hubfail &&
     stage release-build   do_release_build &&
     stage signed-release  do_signed_release &&
-    stage publish         do_publish
+    stage publish         do_publish &&
+    stage github-release  do_github_release
     true
   } >>"$log" 2>&1
   if [ -n "$FLEET_UP" ]; then
