@@ -6,7 +6,9 @@
  * build against the public protocol. This proof:
  *
  *   1. In the REAL app: sign in to the testnet PDS, create a recipe with a
- *      unique name ("Third-Party Gazpacho"), flip it public via the UI.
+ *      unique name ("Third-Party Gazpacho <ms>", unique per run so a
+ *      leftover public record from a crashed run can never be mistaken
+ *      for this run's), flip it public via the UI.
  *   2. Host-side: run examples/third-party-client/read-recipe.mjs — a
  *      client written from docs/public-protocol.md using ONLY official
  *      @atproto libraries + libsodium (zero app code) — in its documented
@@ -43,7 +45,11 @@ const ATTACKER = ACCOUNTS.attacker
 const APPVIEW = 'http://localhost:3210'
 const PDS_EMU = 'https://10.0.2.2:2584'
 const CLIENT = path.join(LT_REPO, 'examples/third-party-client/read-recipe.mjs')
-const TITLE = 'Third-Party Gazpacho'
+// Unique per run: a prior run that dies after publishing leaves a
+// public record behind, and title-based first-match lookups would
+// then pick the stale record (CI b237ac2). The FTS search ANDs all
+// tokens, so the full unique title matches only this run's record.
+const TITLE = 'Third-Party Gazpacho ' + Date.now()
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const results = []
@@ -169,7 +175,7 @@ async function main() {
     const rkey = found.rkey
 
     // The third-party client, in its documented search mode.
-    const good = runClient(['Gazpacho'])
+    const good = runClient([TITLE])
     const goodPass = good.code === 0 && good.out.includes('RESULT: ALL PASS')
     step('third-party client: search → fetch → verify ALL PASS', goodPass,
       goodPass ? 'repo sig + binding + device sig verified' : `exit ${good.code}`)
