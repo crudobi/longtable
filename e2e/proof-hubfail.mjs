@@ -108,9 +108,18 @@ async function makeSession(udid) {
   await driver.execute('mobile: startActivity', {
     component: `kitchen.longtable.app/${ACTIVITY}`,
   })
-  await sleep(1500)
-  const contexts = await driver.getContexts()
-  const webview = contexts.find((c) => c.startsWith('WEBVIEW'))
+  // After a reboot the WebView can take well over 1.5s to appear on a
+  // loaded box; a single getContexts() here killed the retry outright
+  // (CI fd72cad attempt 2: 8s, NATIVE_APP only). Poll up to 30s, the
+  // same budget the new-recipe wait below already uses.
+  let webview = null
+  let contexts = []
+  const deadline = Date.now() + 30000
+  while (!webview && Date.now() < deadline) {
+    contexts = await driver.getContexts()
+    webview = contexts.find((c) => c.startsWith('WEBVIEW'))
+    if (!webview) await sleep(1000)
+  }
   if (!webview) throw new Error(`no webview context on ${udid}: ${contexts.join(',')}`)
   await driver.switchContext(webview)
   const el = await driver.$('[data-testid="new-recipe"]')
