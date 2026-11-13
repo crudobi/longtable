@@ -357,6 +357,14 @@ ensure_services() {
     say "installing e2e dependencies (first run)"
     (cd "$E2E_DIR" && npm ci --no-audit --no-fund) || return 1
   fi
+  # The independent public-record verifier is a standalone subpackage too
+  # (scripts/verify-public, official @atproto libs + libsodium-wrappers).
+  # Same cold-start gap: without its node_modules, proof-public crashes
+  # with ERR_MODULE_NOT_FOUND after the app-side checks already passed.
+  if [ ! -d "$REPO/scripts/verify-public/node_modules/libsodium-wrappers" ]; then
+    say "installing verify-public dependencies (first run)"
+    (cd "$REPO/scripts/verify-public" && npm ci --no-audit --no-fund) || return 1
+  fi
 }
 
 # --- phases ------------------------------------------------------------------
