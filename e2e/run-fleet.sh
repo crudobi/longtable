@@ -229,6 +229,16 @@ ensure_fixture() {
 
 ensure_signaling() {
   if port_listening 4444; then say "signaling: already up"; return 0; fi
+  # The signaling server is a standalone subpackage (@longtable/signaling,
+  # depends on `ws`). A cold box — or a checkout whose node_modules was
+  # wiped — has no signaling/node_modules, and node then dies instantly
+  # with ERR_MODULE_NOT_FOUND, which used to surface only as the opaque
+  # "signaling did not start". Install the deps when missing so a cold
+  # start works; skip when already installed.
+  if [ ! -d "$REPO/signaling/node_modules/ws" ]; then
+    say "signaling: installing deps (npm ci in signaling/)"
+    (cd "$REPO/signaling" && npm ci --no-audit --no-fund) || { say "ERROR: signaling npm ci failed" >&2; return 1; }
+  fi
   say "signaling: starting (tmux lt-signaling)"
   tmux_fresh lt-signaling "node $REPO/signaling/server.mjs"
   local i
