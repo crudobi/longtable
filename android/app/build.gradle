@@ -2,6 +2,72 @@ apply plugin: 'com.android.application'
 // Kotlin: only for LocalApiPlugin (the localhost API's native socket).
 apply plugin: 'org.jetbrains.kotlin.android'
 
+// A3: git-derived versioning.
+//   versionCode    = `git rev-list --count HEAD` (monotonic integer).
+//   versionName    = exact tag on HEAD (`git describe --tags
+//                    --exact-match`, leading 'v' stripped), or a
+//                    clearly-marked dev form `0.1.0-dev+<short-sha>`
+//                    on untagged commits.
+//   Release builds fail closed: assembleRelease / bundleRelease /
+//   assemble require an exact tag on HEAD and a clean tree (tracked
+//   modifications only; untracked/cap-sync output is ignored).
+//   Debug builds always work, so CI can build every commit.
+// Git is run with cwd = the android/ root dir; it finds the repo
+// upward, which works both from a normal checkout and from the CI
+// pipeline's pristine worktree (Gradle runs with cwd $WT/android).
+def gitOutput = { String... args ->
+    def cmd = ['git']
+    cmd.addAll(args)
+    def out = new ByteArrayOutputStream()
+    def err = new ByteArrayOutputStream()
+    def proc = cmd.execute(null, rootDir)
+    proc.consumeProcessOutput(out, err)
+    proc.waitFor()
+    if (proc.exitValue() != 0) {
+        return null
+    }
+    return out.toString().trim()
+}
+
+def gitVersionCode = {
+    def count = gitOutput('rev-list', '--count', 'HEAD')
+    if (count == null || !(count ==~ /\d+/)) {
+        throw new GradleException('A3: could not derive versionCode (git rev-list --count HEAD failed)')
+    }
+    return count.toInteger()
+}()
+
+def gitVersionName = {
+    def tag = gitOutput('describe', '--tags', '--exact-match', 'HEAD')
+    if (tag != null) {
+        return tag.startsWith('v') ? tag.substring(1) : tag
+    }
+    def sha = gitOutput('rev-parse', '--short', 'HEAD')
+    if (sha == null) {
+        throw new GradleException('A3: could not derive versionName (git rev-parse --short HEAD failed)')
+    }
+    return '0.1.0-dev+' + sha
+}()
+
+gradle.taskGraph.whenReady { graph ->
+    def buildsRelease = graph.allTasks.any { t ->
+        t.name == 'assembleRelease' || t.name == 'bundleRelease' || t.name == 'assemble'
+    }
+    if (buildsRelease) {
+        def tag = gitOutput('describe', '--tags', '--exact-match', 'HEAD')
+        if (tag == null) {
+            throw new GradleException('A3: release build requires HEAD to carry an exact git tag; HEAD is untagged')
+        }
+        def dirty = gitOutput('status', '--porcelain', '--untracked-files=no')
+        if (dirty == null) {
+            throw new GradleException('A3: release build could not verify a clean tree (git status failed)')
+        }
+        if (!dirty.isEmpty()) {
+            throw new GradleException('A3: release build requires a clean tree (tracked modifications present); commit or stash first')
+        }
+    }
+}
+
 android {
     namespace "kitchen.longtable.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -9,8 +75,8 @@ android {
         applicationId "kitchen.longtable.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode gitVersionCode
+        versionName gitVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
