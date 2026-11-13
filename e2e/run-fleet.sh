@@ -284,6 +284,14 @@ ensure_testnet() {
     say "testnet: already up"
   else
     say "testnet: starting (tmux lt-atproto)"
+    # The testnet is a standalone subpackage (depends on @atproto/dev-env).
+    # Same cold-start gap as signaling: a checkout without node_modules
+    # makes node die with Cannot find module, surfacing only as the opaque
+    # "testnet PDS did not come up". Install the deps when missing.
+    if [ ! -d "$TESTNET_DIR/node_modules/@atproto/dev-env" ]; then
+      say "testnet: installing deps (npm ci in services/atproto-testnet)"
+      (cd "$TESTNET_DIR" && npm ci --no-audit --no-fund) || { say "ERROR: testnet npm ci failed" >&2; return 1; }
+    fi
     tmux kill-session -t lt-atproto 2>/dev/null || true
     tmux new -s lt-atproto -d "cd $TESTNET_DIR && node start.mjs"
     if ! wait_http http://localhost:2583/xrpc/com.atproto.server.describeServer 60; then
@@ -319,6 +327,12 @@ ensure_appview() {
   fi
   if ! curl -sf --max-time 3 http://localhost:3210/health > /dev/null 2>&1; then
     say "appview: starting (tmux lt-appview)"
+    # The AppView is a standalone subpackage (own package.json + lockfile).
+    # Same cold-start gap as signaling/testnet: install deps when missing.
+    if [ ! -d "$APPVIEW_DIR/node_modules/ws" ]; then
+      say "appview: installing deps (npm ci in appview/)"
+      (cd "$APPVIEW_DIR" && npm ci --no-audit --no-fund) || { say "ERROR: appview npm ci failed" >&2; return 1; }
+    fi
     tmux new -s lt-appview -d "cd $APPVIEW_DIR && env APPVIEW_PORT=3210 APPVIEW_DB=$APPVIEW_DB PDS_URL=http://localhost:2583 PLC_URL=http://localhost:2582 node index.mjs"
     wait_http http://localhost:3210/health 30 || { say "ERROR: appview did not start" >&2; return 1; }
   fi
