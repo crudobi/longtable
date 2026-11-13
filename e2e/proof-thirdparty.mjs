@@ -99,6 +99,12 @@ async function main() {
       'appium:noReset': true,
       'appium:autoLaunch': false,
       'appium:chromedriverAutodownload': true,
+      // The host-side client phase (two sequential read-recipe runs,
+      // each with a 90s timeout) leaves the driver idle; Appium's
+      // 60s default newCommandTimeout kills the session mid-proof on
+      // a slow box (CI 496447f: session ended before the cleanup leg).
+      // 300s covers the worst-case client phase with margin.
+      'appium:newCommandTimeout': 300,
     },
   })
   try {
