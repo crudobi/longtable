@@ -365,6 +365,14 @@ ensure_services() {
     say "installing verify-public dependencies (first run)"
     (cd "$REPO/scripts/verify-public" && npm ci --no-audit --no-fund) || return 1
   fi
+  # The example third-party client is a standalone subpackage too
+  # (examples/third-party-client, official @atproto libs + libsodium).
+  # Same cold-start gap: without its node_modules, proof-thirdparty
+  # crashes with ERR_MODULE_NOT_FOUND after the app-side checks pass.
+  if [ ! -d "$REPO/examples/third-party-client/node_modules/libsodium-wrappers" ]; then
+    say "installing third-party-client dependencies (first run)"
+    (cd "$REPO/examples/third-party-client" && npm ci --no-audit --no-fund) || return 1
+  fi
 }
 
 # --- phases ------------------------------------------------------------------
