@@ -41,7 +41,7 @@ done
 if [ -z "$STATE" ]; then
   # Default: the ops CI dir beside the repo's host root
   # (repo is <root>/code/longtable).
-  STATE=$(cd "$REPO/../../.." 2>/dev/null && pwd)/ops/longtable-ci
+  STATE=$(cd "$REPO/../.." 2>/dev/null && pwd)/ops/longtable-ci
 fi
 [ -d "$STATE" ] || { echo "history-scan: state dir missing: $STATE" >&2; exit 2; }
 [ -x "$REPO/ci/privacy-scan.sh" ] || { echo "history-scan: privacy-scan.sh missing/not executable in $REPO/ci" >&2; exit 2; }
