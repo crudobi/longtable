@@ -204,7 +204,7 @@ do_fleet_teardown() {
 # list; this publisher ships binary release assets instead.
 
 do_signed_release() {
-  local tag expect_code expect_name manifest
+  local tag expect_code expect_name manifest badging_file
   tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
   if [ -z "$tag" ]; then
     ci_say "signed-release: HEAD has no exact tag; skipping (tag the commit to cut a signed release)"
@@ -228,7 +228,18 @@ do_signed_release() {
   grep -q "android:versionCode=\"$expect_code\"" "$manifest" || { ci_say "signed-release: AAB manifest versionCode mismatch (want $expect_code)"; rm -f "$manifest"; return 1; }
   grep -q "android:versionName=\"$expect_name\"" "$manifest" || { ci_say "signed-release: AAB manifest versionName mismatch (want $expect_name)"; rm -f "$manifest"; return 1; }
   rm -f "$manifest"
-  "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" | grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" || { ci_say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name)"; return 1; }
+  # NOTE (2026-11-14, v0.2.0): do NOT pipe aapt2 into grep -q here.
+  # Under `set -o pipefail`, grep -q exits after the first line and
+  # aapt2 dies with SIGPIPE (exit 141) on its next write, which
+  # pipefail reports as a check failure even when the badging
+  # matches (reproduced 38/40 running the exact pipeline command
+  # by hand). Capture to a temp file first (as the bundletool
+  # manifest check above does), then grep the file. Same pass/fail
+  # semantics; the mismatch message now prints the actual line.
+  badging_file=$(mktemp)
+  "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" >"$badging_file" || { rm -f "$badging_file"; return 1; }
+  grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" "$badging_file" || { ci_say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name; got: $(head -1 "$badging_file"))"; rm -f "$badging_file"; return 1; }
+  rm -f "$badging_file"
   ci_say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
   SIGNED_RELEASE=published
 }
