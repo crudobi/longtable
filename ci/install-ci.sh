@@ -3,6 +3,9 @@
 # Run as crudobi (uses sudo for the systemd units). Re-run after editing
 # anything in ci/: the service executes the installed copy of
 # run-pipeline.sh, not the working-tree file.
+# Unit installation rides the shared CI lib (ci_install_units):
+# templates carry @CI_ROOT@, rendered at install time, so the repo
+# carries no host-specific absolute paths.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -12,15 +15,10 @@ STATE=${LT_CI_STATE:-$ROOT/ops/longtable-ci}
 mkdir -p "$STATE/logs" "$STATE/work"
 install -m 0755 "$HERE/run-pipeline.sh" "$STATE/run-pipeline.sh"
 
-# The units are templates: @LT_ROOT@ is substituted at install time, so
-# the repo carries no host-specific absolute paths.
-for unit in longtable-ci.service longtable-ci.path longtable-ci.timer; do
-  sed "s|@LT_ROOT@|$ROOT|g" "$HERE/$unit" > "$STATE/.$unit.tmp"
-  sudo install -m 0644 "$STATE/.$unit.tmp" "/etc/systemd/system/$unit"
-  rm -f "$STATE/.$unit.tmp"
-done
-sudo systemctl daemon-reload
-sudo systemctl enable --now longtable-ci.path longtable-ci.timer
+CI_LIB=$ROOT/ops/shared/ci/ci-lib.sh
+[ -f "$CI_LIB" ] || { echo "install-ci.sh: shared CI lib missing at $CI_LIB" >&2; exit 1; }
+. "$CI_LIB"
+ci_install_units "$HERE" "$STATE" "$ROOT" longtable-ci.service longtable-ci.path longtable-ci.timer
 
 echo "Longtable CI installed."
 echo "  trigger : commit to main (path unit) + 10-min fallback timer"

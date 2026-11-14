@@ -4,6 +4,11 @@ Automated tests + build on every commit to `main`. No hosted CI: the
 pipeline runs on the project's own infrastructure, on the same machine
 that hosts the emulator fleet it drives.
 
+The skeleton — flock serialization, the stage runner, status/history
+logging, systemd unit install, always-teardown, main loop — is the
+shared CI lib at `ops/shared/ci/ci-lib.sh` (see its README);
+`ci/run-pipeline.sh` holds the Longtable stages only.
+
 ## How it triggers
 
 - `longtable-ci.path` (systemd path unit) watches
@@ -103,7 +108,7 @@ so a CI run and a manual fleet run can never overlap.
 
 ## Status and logs
 
-All under the ops CI dir (`<LT_ROOT>/ops/longtable-ci/`):
+All under the ops CI dir (`<host root>/ops/longtable-ci/`):
 
 - `status.json` — the latest run: commit, result, per-stage results and
   durations, whether it published, the published APK md5, the signed

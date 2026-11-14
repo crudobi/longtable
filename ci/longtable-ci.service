@@ -5,6 +5,6 @@ After=network.target
 [Service]
 Type=oneshot
 User=crudobi
-EnvironmentFile=-@LT_ROOT@/ops/longtable-ci/ci.env
-ExecStart=@LT_ROOT@/ops/longtable-ci/run-pipeline.sh
+EnvironmentFile=-@CI_ROOT@/ops/longtable-ci/ci.env
+ExecStart=@CI_ROOT@/ops/longtable-ci/run-pipeline.sh
 TimeoutStartSec=21600

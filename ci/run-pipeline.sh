@@ -4,7 +4,10 @@
 # Triggered by longtable-ci.service (longtable-ci.path watches
 # .git/refs/heads/main; longtable-ci.timer is a 10-minute fallback).
 # Installed into the ops CI state dir by ci/install-ci.sh; the copy in
-# the repo is the source of truth.
+# the repo is the source of truth. The pipeline skeleton (flock,
+# stage runner, status/history logging, always-teardown, main loop)
+# comes from the shared CI lib ops/shared/ci/ci-lib.sh; this script
+# holds the Longtable stages only.
 #
 # Builds the committed tree in a pristine git worktree so a dirty
 # developer checkout never leaks into a build. Publishes the APK only
@@ -44,8 +47,18 @@ elif [ -f "$SELF_DIR/../package.json" ]; then
 else
   ROOT=$(cd "$SELF_DIR/../.." && pwd)
 fi
-REPO=${LT_REPO:-$ROOT/code/longtable}
-STATE=${LT_CI_STATE:-$ROOT/ops/longtable-ci}
+# Shared pipeline skeleton (ops/shared/ci/ci-lib.sh): flock, stage
+# runner, status/history logging, always-teardown, main loop. The
+# bootstrap above stays here — the lib cannot locate itself — and
+# LT_* operator overrides keep working via the CI_* mapping below.
+CI_LIB=$ROOT/ops/shared/ci/ci-lib.sh
+[ -f "$CI_LIB" ] || { echo "[ci] shared CI lib missing at $CI_LIB" >&2; exit 1; }
+. "$CI_LIB"
+CI_ROOT=$ROOT
+CI_REPO=${CI_REPO:-${LT_REPO:-$ROOT/code/longtable}}
+CI_STATE_DIR=${CI_STATE_DIR:-${LT_CI_STATE:-$ROOT/ops/longtable-ci}}
+REPO=$CI_REPO
+STATE=$CI_STATE_DIR
 LOGS=$STATE/logs
 WT=$STATE/work/wt
 PUBLISH_APK=${LT_PUBLISH_APK:-$ROOT/builds/longtable/longtable-debug.apk}
@@ -78,41 +91,18 @@ if [ -f "$STATE/ci.env" ]; then set -a; . "$STATE/ci.env"; set +a; fi
 
 mkdir -p "$LOGS" "$STATE/work"
 
-say() { echo "[ci] $*"; }
+# --- serialization (shared lib) ---------------------------------------------
+ci_acquire_lock "$LOCK_FILE"
 
-# --- serialization ---------------------------------------------------------
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  say "another pipeline run holds the lock; exiting (it re-checks HEAD)"
-  exit 0
-fi
-
-# --- stage bookkeeping ------------------------------------------------------
-STAGE_RESULTS=""   # "name:ok:seconds,name:fail:seconds,..."
-FAILED_STAGE=""
+# --- run bookkeeping --------------------------------------------------------
+# Stage results live in the shared lib (CI_STAGE_RESULTS /
+# CI_FAILED_STAGE, reset per run by ci_reset_run_state).
 FLEET_UP=""        # set once fleet provisioning is attempted
 APK_MD5=""
 AAB_MD5=""
 RELEASE_APK_MD5=""
 SIGNED_RELEASE="none"   # none | skipped (untagged HEAD) | published
 GITHUB_RELEASE="none"     # none | skipped (untagged HEAD) | published
-
-stage() {
-  local name=$1; shift
-  local t0=$SECONDS rc
-  say "=== stage: $name"
-  if "$@"; then
-    STAGE_RESULTS="$STAGE_RESULTS$name:ok:$((SECONDS-t0)),"
-    say "--- stage $name OK ($((SECONDS-t0))s)"
-    return 0
-  else
-    rc=$?
-    STAGE_RESULTS="$STAGE_RESULTS$name:fail:$((SECONDS-t0)),"
-    FAILED_STAGE=$name
-    say "--- stage $name FAILED rc=$rc ($((SECONDS-t0))s)"
-    return 1
-  fi
-}
 
 # --- stage implementations --------------------------------------------------
 TARGET_HASH=""
@@ -217,29 +207,29 @@ do_signed_release() {
   local tag expect_code expect_name manifest
   tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
   if [ -z "$tag" ]; then
-    say "signed-release: HEAD has no exact tag; skipping (tag the commit to cut a signed release)"
+    ci_say "signed-release: HEAD has no exact tag; skipping (tag the commit to cut a signed release)"
     SIGNED_RELEASE=skipped
     return 0
   fi
-  say "signed-release: HEAD tagged $tag; building signed release"
-  [ -f "$KEYSTORE_PROPS" ] || { say "signed-release: key.properties missing at $KEYSTORE_PROPS"; return 1; }
-  [ -f "$BUNDLETOOL_JAR" ] || { say "signed-release: bundletool jar missing at $BUNDLETOOL_JAR"; return 1; }
-  [ -x "$APKSIGNER" ] || { say "signed-release: apksigner missing at $APKSIGNER"; return 1; }
-  [ -x "$AAPT2" ] || { say "signed-release: aapt2 missing at $AAPT2"; return 1; }
+  ci_say "signed-release: HEAD tagged $tag; building signed release"
+  [ -f "$KEYSTORE_PROPS" ] || { ci_say "signed-release: key.properties missing at $KEYSTORE_PROPS"; return 1; }
+  [ -f "$BUNDLETOOL_JAR" ] || { ci_say "signed-release: bundletool jar missing at $BUNDLETOOL_JAR"; return 1; }
+  [ -x "$APKSIGNER" ] || { ci_say "signed-release: apksigner missing at $APKSIGNER"; return 1; }
+  [ -x "$AAPT2" ] || { ci_say "signed-release: aapt2 missing at $AAPT2"; return 1; }
   (cd "$WT/android" && LT_KEYSTORE_PROPERTIES="$KEYSTORE_PROPS" ./gradlew bundleRelease assembleRelease --console=plain) || return 1
-  [ -f "$WT/$RELEASE_AAB_REL" ] || { say "signed-release: AAB missing at $RELEASE_AAB_REL"; return 1; }
-  [ -f "$WT/$RELEASE_APK_REL" ] || { say "signed-release: release APK missing at $RELEASE_APK_REL"; return 1; }
+  [ -f "$WT/$RELEASE_AAB_REL" ] || { ci_say "signed-release: AAB missing at $RELEASE_AAB_REL"; return 1; }
+  [ -f "$WT/$RELEASE_APK_REL" ] || { ci_say "signed-release: release APK missing at $RELEASE_APK_REL"; return 1; }
   "$APKSIGNER" verify --verbose "$WT/$RELEASE_APK_REL" || return 1
   manifest=$(mktemp)
   "$JAVA_HOME/bin/java" -jar "$BUNDLETOOL_JAR" dump manifest --bundle "$WT/$RELEASE_AAB_REL" >"$manifest" || { rm -f "$manifest"; return 1; }
   expect_code=$(git -C "$WT" rev-list --count HEAD)
   expect_name=${tag#v}
-  grep -q "package=\"kitchen.longtable.app\"" "$manifest" || { say "signed-release: AAB manifest package mismatch"; rm -f "$manifest"; return 1; }
-  grep -q "android:versionCode=\"$expect_code\"" "$manifest" || { say "signed-release: AAB manifest versionCode mismatch (want $expect_code)"; rm -f "$manifest"; return 1; }
-  grep -q "android:versionName=\"$expect_name\"" "$manifest" || { say "signed-release: AAB manifest versionName mismatch (want $expect_name)"; rm -f "$manifest"; return 1; }
+  grep -q "package=\"kitchen.longtable.app\"" "$manifest" || { ci_say "signed-release: AAB manifest package mismatch"; rm -f "$manifest"; return 1; }
+  grep -q "android:versionCode=\"$expect_code\"" "$manifest" || { ci_say "signed-release: AAB manifest versionCode mismatch (want $expect_code)"; rm -f "$manifest"; return 1; }
+  grep -q "android:versionName=\"$expect_name\"" "$manifest" || { ci_say "signed-release: AAB manifest versionName mismatch (want $expect_name)"; rm -f "$manifest"; return 1; }
   rm -f "$manifest"
-  "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" | grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" || { say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name)"; return 1; }
-  say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
+  "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" | grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" || { ci_say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name)"; return 1; }
+  ci_say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
   SIGNED_RELEASE=published
 }
 
@@ -264,21 +254,21 @@ gh_repo_for() { # worktree -> owner/repo derived from origin URL
 do_github_release() {
   local tag repo notes prev
   if [ "$SIGNED_RELEASE" != published ]; then
-    say "github-release: no signed release this run (signed_release=$SIGNED_RELEASE); skipping"
+    ci_say "github-release: no signed release this run (signed_release=$SIGNED_RELEASE); skipping"
     GITHUB_RELEASE=skipped
     return 0
   fi
   tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
-  [ -n "$tag" ] || { say "github-release: signed_release=published but HEAD has no exact tag; refusing"; return 1; }
-  [ -f "$PUBLISH_AAB" ] || { say "github-release: published AAB missing at $PUBLISH_AAB"; return 1; }
-  [ -f "$PUBLISH_RELEASE_APK" ] || { say "github-release: published release APK missing at $PUBLISH_RELEASE_APK"; return 1; }
-  [ -f "$PUBLISH_AAB.sha256" ] || { say "github-release: AAB checksum sidecar missing at $PUBLISH_AAB.sha256"; return 1; }
-  [ -f "$PUBLISH_RELEASE_APK.sha256" ] || { say "github-release: release APK checksum sidecar missing at $PUBLISH_RELEASE_APK.sha256"; return 1; }
-  command -v gh >/dev/null 2>&1 || { say "github-release: gh CLI not found"; return 1; }
+  [ -n "$tag" ] || { ci_say "github-release: signed_release=published but HEAD has no exact tag; refusing"; return 1; }
+  [ -f "$PUBLISH_AAB" ] || { ci_say "github-release: published AAB missing at $PUBLISH_AAB"; return 1; }
+  [ -f "$PUBLISH_RELEASE_APK" ] || { ci_say "github-release: published release APK missing at $PUBLISH_RELEASE_APK"; return 1; }
+  [ -f "$PUBLISH_AAB.sha256" ] || { ci_say "github-release: AAB checksum sidecar missing at $PUBLISH_AAB.sha256"; return 1; }
+  [ -f "$PUBLISH_RELEASE_APK.sha256" ] || { ci_say "github-release: release APK checksum sidecar missing at $PUBLISH_RELEASE_APK.sha256"; return 1; }
+  command -v gh >/dev/null 2>&1 || { ci_say "github-release: gh CLI not found"; return 1; }
   repo=$(gh_repo_for "$WT")
-  [ -n "$repo" ] || { say "github-release: could not derive owner/repo from origin"; return 1; }
+  [ -n "$repo" ] || { ci_say "github-release: could not derive owner/repo from origin"; return 1; }
   if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-    say "github-release: release $tag already exists on $repo; refusing to overwrite (delete it by hand if a re-publish is intended)"
+    ci_say "github-release: release $tag already exists on $repo; refusing to overwrite (delete it by hand if a re-publish is intended)"
     return 1
   fi
   notes=$(mktemp)
@@ -302,152 +292,83 @@ do_github_release() {
   gh release create "$tag" --repo "$repo" --title "Longtable $tag" --notes-file "$notes" \
     "$PUBLISH_RELEASE_APK" "$PUBLISH_AAB" "$PUBLISH_RELEASE_APK.sha256" "$PUBLISH_AAB.sha256" || { rm -f "$notes"; return 1; }
   rm -f "$notes"
-  say "github-release: published https://github.com/$repo/releases/tag/$tag"
+  ci_say "github-release: published https://github.com/$repo/releases/tag/$tag"
   GITHUB_RELEASE=published
 }
 
-publish_one() { # src dst
-  cp "$1" "$2.tmp"
-  mv "$2.tmp" "$2"
-}
-
-write_sha256() { # file
-  (cd "$(dirname "$1")" && sha256sum "$(basename "$1")" > "$1.sha256.tmp" && mv "$1.sha256.tmp" "$1.sha256")
-}
-
 do_publish() {
-  publish_one "$WT/$APK_REL" "$PUBLISH_APK"
+  ci_publish_one "$WT/$APK_REL" "$PUBLISH_APK"
   APK_MD5=$(md5sum "$PUBLISH_APK" | cut -d' ' -f1)
-  say "published $PUBLISH_APK md5=$APK_MD5"
+  ci_say "published $PUBLISH_APK md5=$APK_MD5"
   if [ "$SIGNED_RELEASE" = published ]; then
-    publish_one "$WT/$RELEASE_AAB_REL" "$PUBLISH_AAB"
-    publish_one "$WT/$RELEASE_APK_REL" "$PUBLISH_RELEASE_APK"
+    ci_publish_one "$WT/$RELEASE_AAB_REL" "$PUBLISH_AAB"
+    ci_publish_one "$WT/$RELEASE_APK_REL" "$PUBLISH_RELEASE_APK"
     AAB_MD5=$(md5sum "$PUBLISH_AAB" | cut -d' ' -f1)
     RELEASE_APK_MD5=$(md5sum "$PUBLISH_RELEASE_APK" | cut -d' ' -f1)
-    write_sha256 "$PUBLISH_AAB"
-    write_sha256 "$PUBLISH_RELEASE_APK"
-    say "published $PUBLISH_AAB md5=$AAB_MD5"
-    say "published $PUBLISH_RELEASE_APK md5=$RELEASE_APK_MD5"
+    ci_write_sha256 "$PUBLISH_AAB"
+    ci_write_sha256 "$PUBLISH_RELEASE_APK"
+    ci_say "published $PUBLISH_AAB md5=$AAB_MD5"
+    ci_say "published $PUBLISH_RELEASE_APK md5=$RELEASE_APK_MD5"
     if [ -f "$WT/$MAPPING_REL" ]; then
-      publish_one "$WT/$MAPPING_REL" "$PUBLISH_MAPPING"
-      write_sha256 "$PUBLISH_MAPPING"
-      say "published $PUBLISH_MAPPING"
+      ci_publish_one "$WT/$MAPPING_REL" "$PUBLISH_MAPPING"
+      ci_write_sha256 "$PUBLISH_MAPPING"
+      ci_say "published $PUBLISH_MAPPING"
     else
-      say "publish: no mapping.txt produced (minifyEnabled false); skipping mapping publish"
+      ci_say "publish: no mapping.txt produced (minifyEnabled false); skipping mapping publish"
     fi
   fi
 }
 
-write_status() {
-  CI_STAGES="$STAGE_RESULTS" CI_COMMIT="$TARGET_HASH" \
-  CI_RESULT="$1" CI_FAILED_STAGE="$FAILED_STAGE" \
-  CI_STARTED_AT="$2" CI_FINISHED_AT="$3" CI_DURATION_S="$4" \
-  CI_APK_MD5="$APK_MD5" CI_LOG="$5" \
-  CI_AAB_MD5="$AAB_MD5" CI_RELEASE_APK_MD5="$RELEASE_APK_MD5" \
-  CI_SIGNED_RELEASE="$SIGNED_RELEASE" \
-  CI_GITHUB_RELEASE="$GITHUB_RELEASE" \
-  python3 - "$STATE/status.json" "$STATE/history.jsonl" <<'PYEOF'
-import json, os, sys
-status_path, history_path = sys.argv[1], sys.argv[2]
-stages = []
-raw = os.environ.get("CI_STAGES", "").strip(",")
-if raw:
-    for entry in raw.split(","):
-        name, ok, secs = entry.rsplit(":", 2)
-        stages.append({"name": name, "ok": ok == "ok", "seconds": int(secs)})
-rec = {
-    "commit": os.environ.get("CI_COMMIT", ""),
-    "result": os.environ.get("CI_RESULT", ""),
-    "failed_stage": os.environ.get("CI_FAILED_STAGE", "") or None,
-    "started_at": os.environ.get("CI_STARTED_AT", ""),
-    "finished_at": os.environ.get("CI_FINISHED_AT", ""),
-    "duration_s": int(os.environ.get("CI_DURATION_S", "0")),
-    "published": os.environ.get("CI_RESULT", "") == "success",
-    "apk_md5": os.environ.get("CI_APK_MD5", "") or None,
-    "aab_md5": os.environ.get("CI_AAB_MD5", "") or None,
-    "release_apk_md5": os.environ.get("CI_RELEASE_APK_MD5", "") or None,
-    "signed_release": os.environ.get("CI_SIGNED_RELEASE", "none"),
-    "github_release": os.environ.get("CI_GITHUB_RELEASE", "none"),
-    "log": os.environ.get("CI_LOG", ""),
-    "stages": stages,
-}
-with open(status_path, "w") as f:
-    json.dump(rec, f, indent=2)
-    f.write("\n")
-with open(history_path, "a") as f:
-    f.write(json.dumps(rec) + "\n")
-PYEOF
-}
-
 run_one() {
-  TARGET_HASH=$1
+  TARGET_HASH=$1; CI_COMMIT=$TARGET_HASH
   local short run_id log started finished result
   short=$(git -C "$REPO" rev-parse --short "$TARGET_HASH")
   run_id="$(date +%Y%m%d-%H%M%S)-$short"
   log="$LOGS/$run_id.log"
   started=$(date -Iseconds)
-  STAGE_RESULTS=""; FAILED_STAGE=""; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; GITHUB_RELEASE="none"; FLEET_UP=""
+  ci_reset_run_state; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; GITHUB_RELEASE="none"; FLEET_UP=""; CI_EXTRA_JSON=""
   local t0=$SECONDS
-  say "run $run_id commit $TARGET_HASH"
+  ci_say "run $run_id commit $TARGET_HASH"
   {
-    say "run $run_id commit $TARGET_HASH (full log: $log)"
-    stage checkout        do_checkout  &&
-    stage npm-ci          do_npm_ci    &&
-    stage typecheck       do_typecheck &&
-    stage lint            do_lint      &&
-    stage unit-tests      do_unit      &&
-    stage appview-tests   do_appview   &&
-    stage web-build       do_build     &&
-    stage cap-sync        do_capsync   &&
-    stage apk             do_apk       &&
-    stage fleet-provision do_fleet_provision &&
-    stage e2e-gate        do_e2e       &&
-    stage migration-proof do_migration &&
-    stage proof-p2p       do_proof proof-p2p &&
-    stage proof-friends   do_proof proof-friends &&
-    stage proof-public    do_proof proof-public &&
-    stage proof-thirdparty do_proof proof-thirdparty &&
-    stage proof-importer  do_proof proof-importer &&
-    stage proof-localapi  do_proof proof-localapi &&
-    stage proof-hubfail   do_proof proof-hubfail &&
-    stage release-build   do_release_build &&
-    stage signed-release  do_signed_release &&
-    stage publish         do_publish &&
-    stage github-release  do_github_release
+    ci_say "run $run_id commit $TARGET_HASH (full log: $log)"
+    ci_stage checkout        do_checkout  &&
+    ci_stage npm-ci          do_npm_ci    &&
+    ci_stage typecheck       do_typecheck &&
+    ci_stage lint            do_lint      &&
+    ci_stage unit-tests      do_unit      &&
+    ci_stage appview-tests   do_appview   &&
+    ci_stage web-build       do_build     &&
+    ci_stage cap-sync        do_capsync   &&
+    ci_stage apk             do_apk       &&
+    ci_stage fleet-provision do_fleet_provision &&
+    ci_stage e2e-gate        do_e2e       &&
+    ci_stage migration-proof do_migration &&
+    ci_stage proof-p2p       do_proof proof-p2p &&
+    ci_stage proof-friends   do_proof proof-friends &&
+    ci_stage proof-public    do_proof proof-public &&
+    ci_stage proof-thirdparty do_proof proof-thirdparty &&
+    ci_stage proof-importer  do_proof proof-importer &&
+    ci_stage proof-localapi  do_proof proof-localapi &&
+    ci_stage proof-hubfail   do_proof proof-hubfail &&
+    ci_stage release-build   do_release_build &&
+    ci_stage signed-release  do_signed_release &&
+    ci_stage publish         do_publish &&
+    ci_stage github-release  do_github_release
     true
   } >>"$log" 2>&1
   if [ -n "$FLEET_UP" ]; then
-    {
-      say "=== stage: fleet-teardown (post-chain; runs pass or fail)"
-      tt0=$SECONDS
-      if do_fleet_teardown; then
-        STAGE_RESULTS="${STAGE_RESULTS}fleet-teardown:ok:$((SECONDS-tt0)),"
-        say "--- stage fleet-teardown OK ($((SECONDS-tt0))s)"
-      else
-        STAGE_RESULTS="${STAGE_RESULTS}fleet-teardown:fail:$((SECONDS-tt0)),"
-        say "--- stage fleet-teardown FAILED ($((SECONDS-tt0))s) — emulators may still be running; investigate"
-      fi
-    } >>"$log" 2>&1
+    { ci_run_teardown fleet-teardown do_fleet_teardown; } >>"$log" 2>&1
   fi
   finished=$(date -Iseconds)
-  if [ -n "$FAILED_STAGE" ]; then result=failed; else result=success; fi
-  write_status "$result" "$started" "$finished" "$((SECONDS-t0))" "$log"
-  say "run $run_id result=$result failed_stage=${FAILED_STAGE:-none} duration=$((SECONDS-t0))s log=$log"
+  if [ -n "$CI_FAILED_STAGE" ]; then result=failed; else result=success; fi
+  CI_EXTRA_JSON=$(printf '{"apk_md5": %s, "aab_md5": %s, "release_apk_md5": %s, "signed_release": %s, "github_release": %s}' "$(ci_json_str "$APK_MD5")" "$(ci_json_str "$AAB_MD5")" "$(ci_json_str "$RELEASE_APK_MD5")" "$(ci_json_str "$SIGNED_RELEASE")" "$(ci_json_str "$GITHUB_RELEASE")")
+  ci_write_status "$result" "$started" "$finished" "$((SECONDS-t0))" "$log"
+  ci_say "run $run_id result=$result failed_stage=${CI_FAILED_STAGE:-none} duration=$((SECONDS-t0))s log=$log"
   if [ "$result" = success ]; then
     git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
   else
-    say "failed worktree kept for inspection at $WT (wiped by next run)"
+    ci_say "failed worktree kept for inspection at $WT (wiped by next run)"
   fi
 }
-
-# --- main loop: process HEAD, then catch up if it moved during the run -----
-while :; do
-  TARGET=$(git -C "$REPO" rev-parse main)
-  DONE=$(cat "$STATE/last-processed" 2>/dev/null || echo "")
-  if [ "$TARGET" = "$DONE" ]; then
-    say "main @ $TARGET already processed; nothing to do"
-    break
-  fi
-  run_one "$TARGET"
-  echo "$TARGET" > "$STATE/last-processed"
-done
+# --- main loop (shared lib): process HEAD, catch up if it moved ------------
+ci_main_loop run_one
