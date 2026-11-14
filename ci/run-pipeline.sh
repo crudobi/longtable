@@ -129,15 +129,16 @@ do_build()     {
 }
 # Release build: same tree, hooks OFF and no dev TURN password
 # injected, rebuilt after all proofs pass; its APK is the one
-# do_publish ships. Fails closed if a hook string or any dev TURN
-# credential (the burned one, or the rotated one) survives in the
-# bundle.
+# do_publish ships. Fails closed if a hook string, any dev TURN
+# credential (the burned one, or the rotated one), or any forbidden
+# literal (ops-side pattern file) survives in the bundle.
 do_release_build() {
   (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS -u VITE_LT_DEV_TURN_PASSWORD npm run build) &&
   ! grep -rq '__ltFriends' "$WT/dist/assets" &&
   ! grep -rq '__ltPublic' "$WT/dist/assets" &&
   ! grep -rqF 'dev-turn-password' "$WT/dist/assets" &&
   release_turn_clean &&
+  forbidden_literals_clean_dir "$WT/dist/assets" &&
   (cd "$WT" && npx cap sync android) &&
   (cd "$WT/android" && ./gradlew assembleDebug --console=plain)
 }
@@ -148,6 +149,37 @@ release_turn_clean() {
   if [ -s "$STATE/dev-turn-password" ]; then
     ! grep -rqF -f "$STATE/dev-turn-password" "$WT/dist/assets"
   fi
+}
+# Forbidden literals (dev-box hostname, burned TURN credential) must
+# never ship in the bundle or the release archives. The patterns live
+# in the ops-side file $STATE/forbidden-literals (0600, one literal
+# per line, no blank lines -- an empty pattern matches everything)
+# and are read with grep -f, so the values never appear in the repo,
+# on a command line, or in a log. A missing or empty file fails
+# closed: the check cannot run, so nothing ships. See ci/README.md.
+forbidden_literals_clean_dir() { # dir
+  if [ ! -s "$STATE/forbidden-literals" ]; then
+    ci_say "forbidden-literals: pattern file missing or empty at $STATE/forbidden-literals; refusing to ship an unverified bundle"
+    return 1
+  fi
+  [ -d "$1" ] || { ci_say "forbidden-literals: directory missing: $1"; return 1; }
+  ! grep -riqF -f "$STATE/forbidden-literals" "$1"
+}
+# The release APK/AAB carry the same web bundle cap sync copied from
+# dist/assets; verify the shipped archives themselves, not just dist.
+# Extracted to a temp dir and grepped as files (never piped into
+# grep -q -- see the aapt2 SIGPIPE note in do_signed_release).
+release_artifacts_clean() {
+  local tmp
+  tmp=$(mktemp -d)
+  unzip -qo "$WT/$RELEASE_APK_REL" -d "$tmp/apk" || { rm -rf "$tmp"; return 1; }
+  unzip -qo "$WT/$RELEASE_AAB_REL" -d "$tmp/aab" || { rm -rf "$tmp"; return 1; }
+  if forbidden_literals_clean_dir "$tmp/apk" && forbidden_literals_clean_dir "$tmp/aab"; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
 }
 # The AppView is a standalone subpackage (own package.json + lockfile);
 # its unit tests cover ingest filtering, verify-then-index and FTS5
@@ -190,7 +222,8 @@ do_fleet_teardown() {
 # Verification is all-or-nothing: apksigner verify (v1+v2+v3),
 # bundletool manifest dump (package + git-derived versionCode and
 # versionName), and aapt2 badging of the release APK against the same
-# expected values.
+# expected values, plus a forbidden-literals scan of the extracted
+# AAB/APK.
 
 # GitHub Release (A5): after publish, the github-release stage creates
 # a GitHub Release for the tag with the signed AAB + release APK and
@@ -240,6 +273,7 @@ do_signed_release() {
   "$AAPT2" dump badging "$WT/$RELEASE_APK_REL" >"$badging_file" || { rm -f "$badging_file"; return 1; }
   grep -q "^package: name='kitchen.longtable.app' versionCode='$expect_code' versionName='$expect_name'" "$badging_file" || { ci_say "signed-release: release APK badging mismatch (want code=$expect_code name=$expect_name; got: $(head -1 "$badging_file"))"; rm -f "$badging_file"; return 1; }
   rm -f "$badging_file"
+  release_artifacts_clean || return 1
   ci_say "signed-release: verified tag=$tag versionCode=$expect_code versionName=$expect_name"
   SIGNED_RELEASE=published
 }

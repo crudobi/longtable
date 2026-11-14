@@ -11,12 +11,14 @@ import type { KeyValueStore } from '../identity/identity'
 import {
   DEFAULT_HUB,
   HUBS_KEY,
-  LEGACY_DEFAULT_HUB_ID,
+  LEGACY_HUB_HASHES,
   addHub,
   getActiveHub,
   getIceServers,
   getSignalingUrls,
+  legacyMatchHash,
   listHubs,
+  migrateLegacyDefaultHub,
   removeHub,
   setActiveHub,
   updateHub,
@@ -84,47 +86,70 @@ describe('hub registry', () => {
     expect(next.name).toBe('Renamed')
   })
 
+  it('legacyMatchHash matches the FNV-1a-64 test vectors', () => {
+    expect(legacyMatchHash('')).toBe('cbf29ce484222325')
+    expect(legacyMatchHash('a')).toBe('af63dc4c8601ec8c')
+    expect(legacyMatchHash('local-dev')).not.toBe(LEGACY_HUB_HASHES.id)
+  })
+
   it('migrates a persisted legacy default-hub entry in place', () => {
+    // The migration matches on digests, so the test exercises the same
+    // code path with synthetic values and their digests -- the real
+    // legacy literals appear nowhere in this file.
+    const oldId = 'old-test-hub'
+    const oldName = 'Old Test Hub'
+    const oldCred = 'old-test-credential'
+    const hashes = {
+      id: legacyMatchHash(oldId),
+      name: legacyMatchHash(oldName),
+      credential: legacyMatchHash(oldCred),
+    }
     const legacy: HubConfig = {
       ...DEFAULT_HUB,
-      id: LEGACY_DEFAULT_HUB_ID,
-      name: 'Wafl' + 'urgiooh (dev)',
-      turnCredential: 'lt-turn-' + 'secret-2026',
+      id: oldId,
+      name: oldName,
+      turnCredential: oldCred,
     }
-    const kv = memKv({
-      [HUBS_KEY]: JSON.stringify({ hubs: [legacy], activeId: LEGACY_DEFAULT_HUB_ID }),
-    })
-    // Loading triggers and persists the migration.
-    expect(getActiveHub(kv).id).toBe(DEFAULT_HUB.id)
-    const b = addHub({ ...HUB_B }, kv)
-    const hubs = listHubs(kv)
-    // Renamed, not duplicated; the added hub is untouched.
-    expect(hubs.map((h) => h.id)).toEqual([DEFAULT_HUB.id, b.id])
-    const migrated = hubs.find((h) => h.id === DEFAULT_HUB.id)!
-    expect(migrated.name).toBe('Local dev hub')
+    const reg: HubRegistry = { hubs: [legacy], activeId: oldId }
+    expect(migrateLegacyDefaultHub(reg, hashes)).toBe(true)
+    expect(reg.hubs).toHaveLength(1)
+    const migrated = reg.hubs[0]
+    expect(migrated.id).toBe(DEFAULT_HUB.id)
+    expect(migrated.name).toBe(DEFAULT_HUB.name)
     // The burned credential is gone (test builds inject no replacement).
     expect(migrated.turnCredential).toBeUndefined()
+    expect(reg.activeId).toBe(DEFAULT_HUB.id)
     // Everything else about the entry is preserved.
     expect(migrated.signalingUrl).toBe(legacy.signalingUrl)
     expect(migrated.appviewUrl).toBe(legacy.appviewUrl)
     expect(migrated.turnUrl).toBe(legacy.turnUrl)
-    // Persisted back: the stored registry carries the new id only.
-    const stored = JSON.parse(kv.map.get(HUBS_KEY)!) as HubRegistry
-    expect(stored.hubs.map((h) => h.id)).toEqual([DEFAULT_HUB.id, b.id])
-    expect(stored.activeId).toBe(DEFAULT_HUB.id)
   })
 
   it('legacy migration keeps a user-renamed hub name', () => {
-    const legacy: HubConfig = {
-      ...DEFAULT_HUB,
-      id: LEGACY_DEFAULT_HUB_ID,
-      name: 'My kitchen hub',
+    const oldId = 'old-test-hub'
+    const hashes = {
+      id: legacyMatchHash(oldId),
+      name: legacyMatchHash('Old Test Hub'),
+      credential: legacyMatchHash('old-test-credential'),
     }
-    const kv = memKv({
-      [HUBS_KEY]: JSON.stringify({ hubs: [legacy], activeId: LEGACY_DEFAULT_HUB_ID }),
-    })
-    expect(getActiveHub(kv).id).toBe(DEFAULT_HUB.id)
-    expect(getActiveHub(kv).name).toBe('My kitchen hub')
+    const reg: HubRegistry = {
+      hubs: [{ ...DEFAULT_HUB, id: oldId, name: 'My kitchen hub' }],
+      activeId: oldId,
+    }
+    expect(migrateLegacyDefaultHub(reg, hashes)).toBe(true)
+    expect(reg.hubs[0].id).toBe(DEFAULT_HUB.id)
+    expect(reg.hubs[0].name).toBe('My kitchen hub')
+    expect(reg.activeId).toBe(DEFAULT_HUB.id)
+  })
+
+  it('legacy migration leaves non-legacy entries untouched', () => {
+    const reg: HubRegistry = {
+      hubs: [{ ...DEFAULT_HUB, id: 'hub-something-else', name: 'Other' }],
+      activeId: 'hub-something-else',
+    }
+    expect(migrateLegacyDefaultHub(reg)).toBe(false)
+    expect(reg.hubs[0].id).toBe('hub-something-else')
+    expect(reg.activeId).toBe('hub-something-else')
   })
 
   it('falls back to the default hub on corrupt storage', () => {

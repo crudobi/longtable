@@ -60,14 +60,16 @@ leaks into a build — and runs, in order:
     because it rewrites the devices' hub configuration.)
 13. `release-build` — rebuilds the web bundle hooks-off (no debug
     hooks, no dev TURN password), asserts the hook strings and the
-    rotated dev TURN password are absent, re-syncs and rebuilds the
+    rotated dev TURN password, and the forbidden literals (ops-side
+    pattern file) are absent from the bundle, re-syncs and rebuilds the
     debug APK. That artifact is what `publish` ships.
 14. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
     verify`, `bundletool dump manifest` (package + git-derived
     versionCode/versionName), and `aapt2 dump badging` of the release
-    APK. Runs ONLY when HEAD carries an exact git tag and SKIPS
+    APK, plus a forbidden-literals scan of the extracted AAB/APK.
+    Runs ONLY when HEAD carries an exact git tag and SKIPS
     cleanly (recorded as `signed_release: "skipped"`) on untagged
     commits — the A3 fail-closed rule (release builds refuse untagged
     or dirty HEADs) is never relaxed. Tag a commit (e.g. `v0.1.0`)
@@ -87,6 +89,29 @@ leaks into a build — and runs, in order:
     untagged commits — same gate as signed-release. Fails
     closed if a release for the tag already exists; never
     overwrites or deletes one.
+
+## Ops-side files the pipeline reads
+
+Two files in the ops CI dir (`<host root>/ops/longtable-ci/`) hold
+values that must never appear in the repo; the pipeline reads them
+with `grep -f`, so they never appear on a command line or in a log:
+
+- `dev-turn-password` -- the rotated dev TURN password. The
+  `release-build` stage asserts it is absent from the web bundle.
+- `forbidden-literals` -- one literal per line, no blank lines (an
+  empty pattern matches everything): the dev-box hostname and the
+  burned TURN credential. The `release-build` stage asserts neither
+  appears in the web bundle; `signed-release` asserts the same for
+  the extracted release AAB/APK. A missing or empty file fails the
+  run closed -- nothing ships unverified.
+
+Both files are mode `0600`, created once by the operator, and are NOT
+managed by `ci/install-ci.sh` (install only copies `run-pipeline.sh`
+and the units). If `forbidden-literals` is ever lost, re-derive it
+from the fragment-assembled `LEGACY_*` constants in git history
+(they survive in the public history by design of the Oct-15 scrub):
+the hostname is the legacy hub id minus its `-dev` suffix, the
+credential is the legacy TURN credential value.
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits

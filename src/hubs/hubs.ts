@@ -52,17 +52,51 @@ const DEV_TURN_PASSWORD: string | undefined =
   import.meta.env.VITE_LT_DEV_TURN_PASSWORD || undefined
 
 /**
- * The pre-scrub seeded hub's persisted identity. Existing installs
- * carry this id/name (and the burned dev TURN credential) in their
- * localStorage registry; loadRegistry renames the entry in place (see
- * migrateLegacyDefaultHub). The literals are assembled from fragments
- * on purpose: those strings were scrubbed from this repository and
- * must not reappear in it, while the migration still has to recognize
- * them on real devices.
+ * Recognizing the pre-scrub seeded hub WITHOUT shipping its values.
+ *
+ * Existing installs carry the old default-hub id/name (and the burned
+ * dev TURN credential) in their localStorage registry; loadRegistry
+ * renames the entry in place (see migrateLegacyDefaultHub). Those old
+ * values must never appear in this repository or in a shipped bundle
+ * again -- not even as string fragments, which concatenate at build
+ * time. The migration therefore matches on FNV-1a-64 digests of the
+ * old values instead of the values themselves.
+ *
+ * Why a non-cryptographic hash: the old values are already public
+ * (pre-scrub git history, old shipped bundles) and the credential is
+ * burned/rotated, so the digest is NOT a secrecy boundary -- it only
+ * lets the migration recognize the values without writing them down.
+ * FNV-1a-64 is deterministic across JS engines (BigInt arithmetic is
+ * exact), synchronous (this migration runs inside the synchronous
+ * loadRegistry, reachable from React render initializers before
+ * libsodium's WASM init -- so the codebase's BLAKE2b helper, which
+ * needs `await cryptoReady()`, cannot be used here), and needs no new
+ * dependency. The digests below were computed once from the old values
+ * at scrub time; the unit tests pin the hash against the FNV-1a-64
+ * test vectors.
  */
-export const LEGACY_DEFAULT_HUB_ID = 'wafl' + 'urgiooh-dev'
-const LEGACY_DEFAULT_HUB_NAME = 'Wafl' + 'urgiooh (dev)'
-const LEGACY_TURN_CREDENTIAL = 'lt-turn-' + 'secret-2026'
+export function legacyMatchHash(value: string): string {
+  let hash = BigInt('0xcbf29ce484222325')
+  const bytes = new TextEncoder().encode(value)
+  for (const b of bytes) {
+    hash ^= BigInt(b)
+    hash = (hash * BigInt('0x100000001b3')) & BigInt('0xffffffffffffffff')
+  }
+  return hash.toString(16).padStart(16, '0')
+}
+
+/** FNV-1a-64 digests of the pre-scrub legacy hub id, name, and TURN credential. */
+export interface LegacyHubHashes {
+  id: string
+  name: string
+  credential: string
+}
+
+export const LEGACY_HUB_HASHES: LegacyHubHashes = {
+  id: 'aa3d84ecc2a466dc',
+  name: '7dadf2009a1fa830',
+  credential: '7572d0be55d53e4f',
+}
 
 /** The built-in hub: Phase 1–3 dev endpoints (emulator view of the dev rig). */
 export const DEFAULT_HUB: HubConfig = {
@@ -85,17 +119,29 @@ export const DEFAULT_HUB: HubConfig = {
  * activeId followed. All other fields are preserved; no entry is added
  * or removed, so an existing hub list migrates without loss or
  * duplication. Returns true when anything changed.
+ *
+ * Matching is by digest (see legacyMatchHash): the stored id, name,
+ * and credential are hashed and compared against LEGACY_HUB_HASHES,
+ * so the old values never appear in this file or the shipped bundle.
+ * `hashes` is injectable so unit tests can exercise the same code path
+ * with synthetic values; production always uses LEGACY_HUB_HASHES.
  */
-function migrateLegacyDefaultHub(reg: HubRegistry): boolean {
-  const legacy = reg.hubs.find((h) => h.id === LEGACY_DEFAULT_HUB_ID)
+export function migrateLegacyDefaultHub(
+  reg: HubRegistry,
+  hashes: LegacyHubHashes = LEGACY_HUB_HASHES,
+): boolean {
+  const legacy = reg.hubs.find((h) => legacyMatchHash(h.id) === hashes.id)
   if (!legacy) return false
   legacy.id = DEFAULT_HUB_ID
-  if (legacy.name === LEGACY_DEFAULT_HUB_NAME) legacy.name = DEFAULT_HUB.name
-  if (legacy.turnCredential === LEGACY_TURN_CREDENTIAL) {
+  if (legacyMatchHash(legacy.name) === hashes.name) legacy.name = DEFAULT_HUB.name
+  if (
+    legacy.turnCredential !== undefined &&
+    legacyMatchHash(legacy.turnCredential) === hashes.credential
+  ) {
     if (DEV_TURN_PASSWORD) legacy.turnCredential = DEV_TURN_PASSWORD
     else delete legacy.turnCredential
   }
-  if (reg.activeId === LEGACY_DEFAULT_HUB_ID) reg.activeId = DEFAULT_HUB_ID
+  if (legacyMatchHash(reg.activeId) === hashes.id) reg.activeId = DEFAULT_HUB_ID
   return true
 }
 
