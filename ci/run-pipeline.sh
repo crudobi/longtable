@@ -143,7 +143,7 @@ do_build()     {
 # injected, rebuilt after all proofs pass; its APK is the one
 # do_publish ships. Fails closed if a hook string or any dev TURN
 # credential (the burned one, or the rotated one) survives in the
-# bundle, or any forbidden literal (ops-side pattern file) survives
+# bundle, or any literal from the shared ops-side privacy-secrets file survives
 # anywhere in dist/ -- not just dist/assets.
 do_release_build() {
   (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS -u VITE_LT_DEV_TURN_PASSWORD npm run build) &&
@@ -163,20 +163,22 @@ release_turn_clean() {
     ! grep -rqF -f "$STATE/dev-turn-password" "$WT/dist/assets"
   fi
 }
-# Forbidden literals (dev-box hostname, burned TURN credential) must
-# never ship in the bundle or the release archives. The patterns live
-# in the ops-side file $STATE/forbidden-literals (0600, one literal
-# per line, no blank lines -- an empty pattern matches everything)
-# and are read with grep -f, so the values never appear in the repo,
-# on a command line, or in a log. A missing or empty file fails
-# closed: the check cannot run, so nothing ships. See ci/README.md.
+# Forbidden literals must never ship in the bundle or the release
+# archives. The patterns are the single ops-side file
+# $STATE/privacy-secrets (0600, one literal per line, no blank
+# lines -- an empty pattern matches everything), shared with the
+# secret-scan stage: dev-box hostname, burned TURN credential,
+# testnet password, and three internal paths. They are read with
+# grep -f, so the values never appear in the repo, on a command
+# line, or in a log. A missing or empty file fails closed: the check
+# cannot run, so nothing ships. See ci/README.md.
 forbidden_literals_clean_dir() { # dir
-  if [ ! -s "$STATE/forbidden-literals" ]; then
-    ci_say "forbidden-literals: pattern file missing or empty at $STATE/forbidden-literals; refusing to ship an unverified bundle"
+  if [ ! -s "$STATE/privacy-secrets" ]; then
+    ci_say "privacy-secrets: pattern file missing or empty at $STATE/privacy-secrets; refusing to ship an unverified bundle"
     return 1
   fi
-  [ -d "$1" ] || { ci_say "forbidden-literals: directory missing: $1"; return 1; }
-  ! grep -riqF -f "$STATE/forbidden-literals" "$1"
+  [ -d "$1" ] || { ci_say "privacy-secrets: directory missing: $1"; return 1; }
+  ! grep -riqF -f "$STATE/privacy-secrets" "$1"
 }
 # The release APK/AAB carry the same web bundle cap sync copied from
 # dist/assets; verify the shipped archives themselves, not just dist.
@@ -235,7 +237,7 @@ do_fleet_teardown() {
 # Verification is all-or-nothing: apksigner verify (v1+v2+v3),
 # bundletool manifest dump (package + git-derived versionCode and
 # versionName), and aapt2 badging of the release APK against the same
-# expected values, plus a forbidden-literals scan of the extracted
+# expected values, plus a privacy-secrets scan of the extracted
 # AAB/APK.
 
 # GitHub Release (A5): after publish, the github-release stage creates

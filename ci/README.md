@@ -71,7 +71,7 @@ leaks into a build — and runs, in order:
 15. `release-build` — rebuilds the web bundle hooks-off (no debug
     hooks, no dev TURN password), asserts the hook strings and the
     rotated dev TURN password are absent from the bundle, and the
-    forbidden literals (ops-side pattern file) are absent from all
+    literals from the shared ops-side `privacy-secrets` file are absent from all
     of `dist/` (not just `dist/assets`), re-syncs and rebuilds the
     debug APK. That artifact is what `publish` ships.
 16. `signed-release` — builds `bundleRelease` + `assembleRelease`
@@ -79,7 +79,7 @@ leaks into a build — and runs, in order:
     the keystore, never in the repo), then verifies: `apksigner
     verify`, `bundletool dump manifest` (package + git-derived
     versionCode/versionName), and `aapt2 dump badging` of the release
-    APK, plus a forbidden-literals scan of the extracted AAB/APK.
+    APK, plus a privacy-secrets scan of the extracted AAB/APK.
     Runs ONLY when HEAD carries an exact git tag and SKIPS
     cleanly (recorded as `signed_release: "skipped"`) on untagged
     commits — the A3 fail-closed rule (release builds refuse untagged
@@ -106,36 +106,38 @@ leaks into a build — and runs, in order:
 
 ## Ops-side files the pipeline reads
 
-Three files in the ops CI dir (`<host root>/ops/longtable-ci/`) hold
+Two files in the ops CI dir (`<host root>/ops/longtable-ci/`) hold
 values that must never appear in the repo; the pipeline reads them
 with `grep -f`, so they never appear on a command line or in a log:
 
 - `dev-turn-password` -- the rotated dev TURN password. The
   `release-build` stage asserts it is absent from the web bundle.
-- `forbidden-literals` -- one literal per line, no blank lines (an
-  empty pattern matches everything): the dev-box hostname and the
-  burned TURN credential. The `release-build` stage asserts neither
-  appears in the web bundle; `signed-release` asserts the same for
-  the extracted release AAB/APK. A missing or empty file fails the
-  run closed -- nothing ships unverified.
-- `privacy-secrets` -- one literal per line, no blank lines: the
-  specific values the `secret-scan` stage and the release-notes scan
-  check for (dev-box hostname, burned TURN credential, testnet
-  password, internal paths). A missing file fails the run closed --
-  the scan cannot run without its patterns.
+- `privacy-secrets` -- one literal per line, no blank lines (an
+  empty pattern matches everything): the specific values every
+  privacy gate checks for -- dev-box hostname, burned TURN
+  credential, testnet password, internal paths. The `secret-scan`
+  stage and the release-notes scan check the worktree, history, and
+  notes against it; the `release-build` stage asserts none of them
+  appears in the web bundle (`dist/` as a whole), and
+  `signed-release` asserts the same for the extracted release
+  AAB/APK. A missing or empty file fails the run closed -- no gate
+  can run without its patterns, and nothing ships unverified.
 
-All three files are mode `0600`, created once by the operator, and
+Both files are mode `0600`, created once by the operator, and
 are NOT managed by `ci/install-ci.sh` (install only copies
-`run-pipeline.sh` and the units). If `forbidden-literals` is ever
-lost, re-derive it from the fragment-assembled `LEGACY_*` constants
-in git history (they survive in the public history by design of the
-Oct-15 scrub): the hostname is the legacy hub id minus its `-dev`
-suffix, the credential is the legacy TURN credential value.
-`privacy-secrets` re-derives the same way (the hostname and burned
-credential are also in `forbidden-literals`; the testnet password and
-internal paths are in the pre-rewrite backup bundle
-`ops/longtable-history-backup-20261015.bundle`, box-only, never
-pushed).
+`run-pipeline.sh` and the units). If `privacy-secrets` is ever
+lost, re-derive it: the hostname and burned credential from the
+fragment-assembled `LEGACY_*` constants in git history (they
+survive in the public history by design of the Oct-15 scrub): the
+hostname is the legacy hub id minus its `-dev` suffix, the
+credential is the legacy TURN credential value. The testnet
+password is in the pre-rewrite backup bundle
+`ops/longtable-history-backup-20261015.bundle` (box-only, never
+pushed). The three internal paths are generic literals, described
+here by role, not by value: the muscle store root, the operator's
+home directory, and the sandbox home directory. The first two are
+also in the backup bundle; the third is a defensive tripwire that
+was never in the repo.
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits
