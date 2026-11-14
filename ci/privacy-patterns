@@ -1,0 +1,36 @@
+# privacy-patterns — generic ERE patterns for the Longtable privacy scan.
+# Checked into the repo. This file holds NO identifying values: no
+# hostnames, no LAN addresses, no internal paths, no credential
+# literals. Specific values (hostnames, the burned/rotated TURN
+# credentials, internal paths) live in the ops-side secrets file
+# ($STATE/privacy-secrets, 0600, never in git) and are matched with
+# grep -F. Lines starting with # and blank lines are ignored by the
+# scanner (grep -f has no comment syntax; the script strips them).
+#
+# Classes: private-key headers, known token prefixes, RFC1918 address
+# ranges (generic ranges only — the 10.0.2.2 emulator alias and the
+# hub deny-list ranges are allow-listed), email addresses, real-format
+# PLC DIDs, credential-embedded URLs, phone numbers.
+#
+# Deliberately NOT covered here (documented gaps): generic
+# password-assignment shapes (password= / token: / secret:) — the
+# tree's test fixtures use those shapes with obviously-fake values
+# and a generic pattern would train allow-listing; the actual known
+# credential values are covered by the ops-side secrets file.
+# Long base64-ish tokens are also excluded: package-lock.json
+# integrity hashes dominate that class and are public by design.
+BEGIN [A-Z ]*PRIVATE KEY
+ghp_[A-Za-z0-9]{20,}
+gho_[A-Za-z0-9]{20,}
+github_pat_[A-Za-z0-9_]{20,}
+AKIA[0-9A-Z]{16}
+xox[baprs]-[A-Za-z0-9-]{10,}
+sk-[A-Za-z0-9]{20,}
+sk-ant-[A-Za-z0-9-]{10,}
+192\.168\.[0-9]+\.[0-9]+
+10\.[0-9]+\.[0-9]+\.[0-9]+
+172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+
+[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}
+did:plc:[a-z2-7]{24}
+://[^/:@ ]+:[^/@ ]+@
+(\+1[-. ])?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}

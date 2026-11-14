@@ -113,6 +113,18 @@ do_checkout() {
   git -C "$REPO" worktree prune
   git -C "$REPO" worktree add --detach "$WT" "$TARGET_HASH"
 }
+# Privacy gate (secret-scan): scan the pristine worktree for secrets,
+# private addresses/paths, and PII before anything builds. The generic
+# pattern classes live in the worktree's ci/privacy-patterns (EREs, no
+# real values); specific values live only in the ops-side
+# $STATE/privacy-secrets (0600, read with grep -f). Uses the
+# worktree's own scanner, so the stage tests the committed scanner; a
+# missing scanner, a missing secrets file, or any hit fails the run.
+# (The nightly history scan uses the latest scanner from $REPO as its
+# backstop against a commit that neuters the scanner.) See ci/README.md.
+do_secret_scan() {
+  "$WT/ci/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$WT"
+}
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_lint()      { (cd "$WT" && npm run lint); }
@@ -129,16 +141,17 @@ do_build()     {
 }
 # Release build: same tree, hooks OFF and no dev TURN password
 # injected, rebuilt after all proofs pass; its APK is the one
-# do_publish ships. Fails closed if a hook string, any dev TURN
-# credential (the burned one, or the rotated one), or any forbidden
-# literal (ops-side pattern file) survives in the bundle.
+# do_publish ships. Fails closed if a hook string or any dev TURN
+# credential (the burned one, or the rotated one) survives in the
+# bundle, or any forbidden literal (ops-side pattern file) survives
+# anywhere in dist/ -- not just dist/assets.
 do_release_build() {
   (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS -u VITE_LT_DEV_TURN_PASSWORD npm run build) &&
   ! grep -rq '__ltFriends' "$WT/dist/assets" &&
   ! grep -rq '__ltPublic' "$WT/dist/assets" &&
   ! grep -rqF 'dev-turn-password' "$WT/dist/assets" &&
   release_turn_clean &&
-  forbidden_literals_clean_dir "$WT/dist/assets" &&
+  forbidden_literals_clean_dir "$WT/dist" &&
   (cd "$WT" && npx cap sync android) &&
   (cd "$WT/android" && ./gradlew assembleDebug --console=plain)
 }
@@ -334,6 +347,11 @@ do_github_release() {
       git -C "$WT" log --format='- %s (%h)'
     fi
   } >"$notes" || { rm -f "$notes"; return 1; }
+  # Scan the generated release notes with the same privacy patterns
+  # before publishing: commit subjects are not in the source tree, so
+  # the secret-scan stage cannot see them. A hit (or a missing
+  # scanner/secrets file) fails the stage; nothing is published.
+  "$WT/ci/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$notes" || { rm -f "$notes"; return 1; }
   gh release create "$tag" --repo "$repo" --title "Longtable $tag" --notes-file "$notes" \
     "$PUBLISH_RELEASE_APK" "$PUBLISH_AAB" "$PUBLISH_RELEASE_APK.sha256" "$PUBLISH_AAB.sha256" || { rm -f "$notes"; return 1; }
   rm -f "$notes"
@@ -377,6 +395,7 @@ run_one() {
   {
     ci_say "run $run_id commit $TARGET_HASH (full log: $log)"
     ci_stage checkout        do_checkout  &&
+    ci_stage secret-scan     do_secret_scan &&
     ci_stage npm-ci          do_npm_ci    &&
     ci_stage typecheck       do_typecheck &&
     ci_stage lint            do_lint      &&

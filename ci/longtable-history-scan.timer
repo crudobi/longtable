@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Longtable all-history privacy scan (03:17 daily)
+
+[Timer]
+OnCalendar=03:17
+Persistent=true
+Unit=longtable-history-scan.service
+
+[Install]
+WantedBy=timers.target

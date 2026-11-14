@@ -1,0 +1,9 @@
+[Unit]
+Description=Longtable nightly all-history privacy scan
+After=network.target
+
+[Service]
+Type=oneshot
+User=crudobi
+ExecStart=@CI_ROOT@/ops/longtable-ci/history-scan.sh --repo @CI_ROOT@/code/longtable --state @CI_ROOT@/ops/longtable-ci
+TimeoutStartSec=3600
