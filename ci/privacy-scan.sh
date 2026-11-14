@@ -134,7 +134,7 @@ elif [ -d "$TARGET" ]; then
     (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HInoE -f "$TMP/patterns" -- > "$TMP/generic_raw" || true)
     FILE_COUNT=$(cd "$TARGET" && git ls-files | wc -l)
   else
-    (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -print0 | xargs -r -0 grep -HInoE -f "$TMP/patterns" -- > "$TMP/generic_raw" || true)
+    (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HInoE -f "$TMP/patterns" -- > "$TMP/generic_raw" || true)
     FILE_COUNT=$(cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' | wc -l)
   fi
   filter_generic "$TMP/generic_raw"
@@ -143,7 +143,7 @@ elif [ -d "$TARGET" ]; then
       (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true) |
         cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS"
     else
-      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -print0 | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true) |
+      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true) |
         cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS"
     fi
   fi
