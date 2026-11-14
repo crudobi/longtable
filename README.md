@@ -62,7 +62,7 @@ What works today:
 - Identity/crypto: libsodium (Ed25519 device keys, `did:key`)
 - Public layer: ATProto (custom lexicons in `lexicons/`), hub AppView
   (Node + SQLite FTS5)
-- Android wrapper: Capacitor 7 (app id `kitchen.longtable.app`)
+- Android wrapper: Capacitor 8 (app id `kitchen.longtable.app`)
 - Tests: vitest + an Appium device gate and oath proofs in `e2e/`
 
 ## Data model
@@ -101,7 +101,7 @@ All builds run on a dedicated build machine.
 
 ```sh
 # one-time env (per shell):
-export JAVA_HOME=<path to a Temurin 21 JDK>   # JDK 21 required; JDK 17 is too old for Capacitor 7.6+
+export JAVA_HOME=<path to a Temurin 21 JDK>   # JDK 21 required; JDK 17 is too old for Capacitor 8
 export ANDROID_HOME=<path to the Android SDK>
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
