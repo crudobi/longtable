@@ -31,6 +31,16 @@
  */
 import sodium from 'libsodium-wrappers'
 
+// libsodium's crypto functions are attached only once the WASM module has
+// loaded: `sodium.ready` MUST resolve before any synchronous export in this
+// module (canonicalRecipeHashHex, decodeBase64Strict) is called. Awaiting
+// it at module top level makes the import itself wait, so every importer -
+// sync or async, test or production - sees initialized sodium. (The async
+// verify functions used to be the only callers of ready(); the sync
+// functions raced WASM init and failed on fast runs with
+// "crypto_generichash is not a function".)
+await sodium.ready
+
 async function ready() {
   await sodium.ready
 }
