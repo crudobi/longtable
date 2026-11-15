@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { RecipeIndex } from '../db.mjs'
+import { makeDevice } from './signed-fixtures.mjs'
 
 const DID = 'did:plc:testauthor'
 
@@ -86,5 +87,58 @@ describe('RecipeIndex search', () => {
     expect(index.getRecipe(DID, 'nope')).toBeNull()
     expect(index.byAuthor(DID)).toHaveLength(3)
     expect(index.byAuthor('did:plc:someoneelse')).toHaveLength(0)
+  })
+})
+
+describe('RecipeIndex device-signature fields', () => {
+  let index
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+  })
+  afterEach(() => index.close())
+
+  it('round-trips deviceDid/deviceSignature/deviceKey through getRecipe, search and byAuthor', () => {
+    const device = makeDevice()
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/signed`,
+      did: DID,
+      rkey: 'signed',
+      cid: 'cid-signed-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'Signed Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        longtableId: 'lt-signed',
+        createdAt: '2026-10-12T00:00:00.000Z',
+        deviceDid: device.deviceDid,
+        deviceSignature: 'c2lnbmF0dXJl',
+      },
+      deviceKey: device.devicePublicKey,
+    })
+    const full = index.getRecipe(DID, 'signed')
+    expect(full.deviceDid).toBe(device.deviceDid)
+    expect(full.deviceSignature).toBe('c2lnbmF0dXJl')
+    expect(full.deviceKey).toBe(device.devicePublicKey)
+    const hit = index.search({ q: 'Signed Soup' })[0]
+    expect(hit.deviceDid).toBe(device.deviceDid)
+    expect(hit.deviceSignature).toBe('c2lnbmF0dXJl')
+    expect(hit.deviceKey).toBe(device.devicePublicKey)
+    expect(index.byAuthor(DID)[0].deviceDid).toBe(device.deviceDid)
+  })
+
+  it('same CID with changed signature fields updates the row (no stale NULLs)', () => {
+    const entry = recipe('borscht', 'AppView Borscht', ['3 beets', '1 onion'])
+    expect(index.upsert(entry)).toBe(true)
+    expect(index.getRecipe(DID, 'borscht').deviceKey).toBeNull()
+    const device = makeDevice()
+    const withSig = recipe('borscht', 'AppView Borscht', ['3 beets', '1 onion'])
+    withSig.record.deviceDid = device.deviceDid
+    withSig.record.deviceSignature = 'c2lnbmF0dXJl'
+    withSig.deviceKey = device.devicePublicKey
+    expect(index.upsert(withSig)).toBe(true)
+    expect(index.getRecipe(DID, 'borscht').deviceKey).toBe(device.devicePublicKey)
+    expect(index.getRecipe(DID, 'borscht').deviceDid).toBe(device.deviceDid)
+    expect(index.upsert(withSig)).toBe(false)
   })
 })

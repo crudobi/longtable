@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createAppView } from '../server.mjs'
+import { makeDevice } from './signed-fixtures.mjs'
 
 // The AppView is a public read API consumed cross-origin by the Longtable
 // app (Capacitor origin https://localhost). Without CORS headers the
@@ -57,6 +58,39 @@ describe('appview HTTP API', () => {
     const body = await res.json()
     expect(Array.isArray(body.results)).toBe(true)
     expect(body.results.length).toBe(0)
+  })
+
+  it('GET /recipe/ and /search carry deviceDid/deviceSignature/deviceKey', async () => {
+    const device = makeDevice()
+    app.index.upsert({
+      uri: 'at://did:plc:testauthor/kitchen.longtable.recipe/signed',
+      did: 'did:plc:testauthor',
+      rkey: 'signed',
+      cid: 'cid-signed-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'Signed Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        longtableId: 'lt-signed',
+        createdAt: '2026-10-12T00:00:00.000Z',
+        deviceDid: device.deviceDid,
+        deviceSignature: 'c2lnbmF0dXJl',
+      },
+      deviceKey: device.devicePublicKey,
+    })
+    const full = await (await fetch(`${base}/recipe/did:plc:testauthor/signed`)).json()
+    expect(full.deviceDid).toBe(device.deviceDid)
+    expect(full.deviceSignature).toBe('c2lnbmF0dXJl')
+    expect(full.deviceKey).toBe(device.devicePublicKey)
+    const search = await (await fetch(`${base}/search?q=Signed`)).json()
+    expect(search.results).toHaveLength(1)
+    expect(search.results[0].deviceDid).toBe(device.deviceDid)
+    expect(search.results[0].deviceSignature).toBe('c2lnbmF0dXJl')
+    expect(search.results[0].deviceKey).toBe(device.devicePublicKey)
+    const author = await (await fetch(`${base}/author/did:plc:testauthor`)).json()
+    expect(author.results).toHaveLength(1)
+    expect(author.results[0].deviceKey).toBe(device.devicePublicKey)
   })
 
   it('GET /recipe/:did/:rkey 404s for unknown records, still with CORS', async () => {
