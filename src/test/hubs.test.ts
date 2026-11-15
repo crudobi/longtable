@@ -12,6 +12,7 @@ import {
   DEFAULT_HUB,
   HUBS_KEY,
   LEGACY_HUB_HASHES,
+  LEGACY_HUB_HASHES_V0,
   addHub,
   getActiveHub,
   getIceServers,
@@ -150,6 +151,40 @@ describe('hub registry', () => {
     expect(migrateLegacyDefaultHub(reg)).toBe(false)
     expect(reg.hubs[0].id).toBe('hub-something-else')
     expect(reg.activeId).toBe('hub-something-else')
+  })
+
+  it('legacy migration matches a second digest set for one release (V0)', () => {
+    // Production matches both the corrected digests and the 440c8ac
+    // set for one release; synthetic values stand in for both. The
+    // name/credential checks use the set the id matched, so a mixed
+    // entry keeps the fields the matched set does not recognize.
+    const oldId = 'old-v0-hub'
+    const oldName = 'Old V0 Hub'
+    const oldCred = 'old-v0-credential'
+    const v0Hashes = {
+      id: legacyMatchHash(oldId),
+      name: legacyMatchHash(oldName),
+      credential: legacyMatchHash(oldCred),
+    }
+    const correctedHashes = {
+      id: legacyMatchHash('old-corrected-hub'),
+      name: legacyMatchHash('Old Corrected Hub'),
+      credential: legacyMatchHash('old-corrected-credential'),
+    }
+    const reg: HubRegistry = {
+      hubs: [{ ...DEFAULT_HUB, id: oldId, name: oldName, turnCredential: oldCred }],
+      activeId: oldId,
+    }
+    expect(migrateLegacyDefaultHub(reg, [correctedHashes, v0Hashes])).toBe(true)
+    expect(reg.hubs[0].id).toBe(DEFAULT_HUB.id)
+    expect(reg.hubs[0].name).toBe(DEFAULT_HUB.name)
+    expect(reg.hubs[0].turnCredential).toBeUndefined()
+    expect(reg.activeId).toBe(DEFAULT_HUB.id)
+    // The two committed sets are distinct: the V0 id digest must not
+    // equal the corrected one.
+    expect(LEGACY_HUB_HASHES_V0.id).not.toBe(LEGACY_HUB_HASHES.id)
+    expect(LEGACY_HUB_HASHES_V0.name).not.toBe(LEGACY_HUB_HASHES.name)
+    expect(LEGACY_HUB_HASHES_V0.credential).not.toBe(LEGACY_HUB_HASHES.credential)
   })
 
   it('falls back to the default hub on corrupt storage', () => {

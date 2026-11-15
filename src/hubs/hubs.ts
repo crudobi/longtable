@@ -71,9 +71,12 @@ const DEV_TURN_PASSWORD: string | undefined =
  * loadRegistry, reachable from React render initializers before
  * libsodium's WASM init -- so the codebase's BLAKE2b helper, which
  * needs `await cryptoReady()`, cannot be used here), and needs no new
- * dependency. The digests below were computed once from the old values
- * at scrub time; the unit tests pin the hash against the FNV-1a-64
- * test vectors.
+ * dependency. The digests below are derived from the values that
+ * actually shipped, in d725e40:src/hubs/hubs.ts (the scrub parent);
+ * ci/check-legacy-hub-digests.py re-derives them from git history at
+ * build time and fails the pipeline on any mismatch, so a wrong
+ * digest can never ship silently again. The unit tests pin the hash
+ * against the FNV-1a-64 test vectors.
  */
 export function legacyMatchHash(value: string): string {
   let hash = BigInt('0xcbf29ce484222325')
@@ -85,7 +88,16 @@ export function legacyMatchHash(value: string): string {
   return hash.toString(16).padStart(16, '0')
 }
 
-/** FNV-1a-64 digests of the pre-scrub legacy hub id, name, and TURN credential. */
+/**
+ * FNV-1a-64 digests of the pre-scrub legacy hub id, name, and TURN
+ * credential — the values that actually shipped (d725e40:src/hubs/hubs.ts).
+ *
+ * Correction (2026-11-15, review C1): the digests committed by 440c8ac
+ * hashed the fragment-joined strings from 0d4423e, which never shipped,
+ * so migrateLegacyDefaultHub could never fire on a real device. The
+ * corrected digests below are the ones ci/check-legacy-hub-digests.py
+ * re-derives from the pre-scrub file at build time.
+ */
 export interface LegacyHubHashes {
   id: string
   name: string
@@ -93,6 +105,20 @@ export interface LegacyHubHashes {
 }
 
 export const LEGACY_HUB_HASHES: LegacyHubHashes = {
+  id: '5e9a8751d9a03b3f',
+  name: '7eca6bcb61324caf',
+  credential: '7d1624db0754b5f6',
+}
+
+/**
+ * The 440c8ac digests (fragment-joined strings; never shipped), matched
+ * defensively for ONE release only, in case any device carries
+ * fragment-valued entries. Remove after that release: the fragment
+ * strings never shipped, so no real device should need this past one
+ * release. ci/check-legacy-hub-digests.py pins this set to the digests
+ * committed by 440c8ac.
+ */
+export const LEGACY_HUB_HASHES_V0: LegacyHubHashes = {
   id: 'aa3d84ecc2a466dc',
   name: '7dadf2009a1fa830',
   credential: '7572d0be55d53e4f',
@@ -121,27 +147,40 @@ export const DEFAULT_HUB: HubConfig = {
  * duplication. Returns true when anything changed.
  *
  * Matching is by digest (see legacyMatchHash): the stored id, name,
- * and credential are hashed and compared against LEGACY_HUB_HASHES,
- * so the old values never appear in this file or the shipped bundle.
+ * and credential are hashed and compared against the digest sets, so
+ * the old values never appear in this file or the shipped bundle.
  * `hashes` is injectable so unit tests can exercise the same code path
- * with synthetic values; production always uses LEGACY_HUB_HASHES.
+ * with synthetic values; it accepts one set or a list of sets.
+ * Production matches both LEGACY_HUB_HASHES and LEGACY_HUB_HASHES_V0
+ * (the corrected digests first); the name/credential checks use the
+ * same set the id matched, so a mixed entry keeps the fields it does
+ * not recognize. See LEGACY_HUB_HASHES_V0 for the one-release scope.
  */
 export function migrateLegacyDefaultHub(
   reg: HubRegistry,
-  hashes: LegacyHubHashes = LEGACY_HUB_HASHES,
+  hashes: LegacyHubHashes | LegacyHubHashes[] = [
+    LEGACY_HUB_HASHES,
+    LEGACY_HUB_HASHES_V0,
+  ],
 ): boolean {
-  const legacy = reg.hubs.find((h) => legacyMatchHash(h.id) === hashes.id)
+  const sets = Array.isArray(hashes) ? hashes : [hashes]
+  const legacy = reg.hubs.find((h) =>
+    sets.some((s) => legacyMatchHash(h.id) === s.id),
+  )
   if (!legacy) return false
+  const matched = sets.find((s) => legacyMatchHash(legacy.id) === s.id) as LegacyHubHashes
   legacy.id = DEFAULT_HUB_ID
-  if (legacyMatchHash(legacy.name) === hashes.name) legacy.name = DEFAULT_HUB.name
+  if (legacyMatchHash(legacy.name) === matched.name) legacy.name = DEFAULT_HUB.name
   if (
     legacy.turnCredential !== undefined &&
-    legacyMatchHash(legacy.turnCredential) === hashes.credential
+    legacyMatchHash(legacy.turnCredential) === matched.credential
   ) {
     if (DEV_TURN_PASSWORD) legacy.turnCredential = DEV_TURN_PASSWORD
     else delete legacy.turnCredential
   }
-  if (legacyMatchHash(reg.activeId) === hashes.id) reg.activeId = DEFAULT_HUB_ID
+  if (sets.some((s) => legacyMatchHash(reg.activeId) === s.id)) {
+    reg.activeId = DEFAULT_HUB_ID
+  }
   return true
 }
 
