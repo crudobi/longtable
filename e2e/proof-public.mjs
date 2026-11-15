@@ -16,9 +16,20 @@
  *      signature — all must pass.
  *   5. Forge attempts: (a) Mallory's token writing into Olga's repo — the
  *      PDS must refuse; (b) Mallory publishes a mimic record under her OWN
- *      DID claiming Olga's device — search must attribute it to Mallory,
- *      and the verifier must reject it as Olga's; (c) verifier forge
- *      selftest (attacker-key re-sign + content tamper) must reject both.
+ *      DID claiming Olga's device — the AppView must DROP it at ingest (no
+ *      valid binding/device signature for it), never index it under any
+ *      DID, and count it in stats.signatureRejected; the verifier must
+ *      reject it as Olga's; (c) verifier forge selftest (attacker-key
+ *      re-sign + content tamper) must reject both; (d) NEW (C2): a
+ *      tampered record in the AUTHOR's own repo — altered content under
+ *      the genuine device signature — must be dropped by the AppView at
+ *      ingest (the repo-commit signature is the PDS's own and cannot
+ *      catch this), counted, never searchable, 404 on /recipe/, while
+ *      the genuine record stays indexed.
+ *   4b. Response contract: /recipe/ + /search serve deviceDid,
+ *      deviceSignature and deviceKey (bound device public key, standard
+ *      base64 — byte-identical to the binding record's devicePublicKey);
+ *      the values must match the author's pubkey/self binding record.
  *   6. Privacy audit: with recipes private / friends-only / public on the
  *      device, the verified repo dump must contain ONLY the public one (+
  *      the pubkey binding). Private and friends-only bytes never left.
@@ -98,6 +109,12 @@ async function appviewSearch(params) {
   if (!res.ok) return []
   const { results } = await res.json()
   return results || []
+}
+
+async function appviewStats() {
+  const res = await fetch(`${APPVIEW}/stats`)
+  if (!res.ok) return null
+  return res.json()
 }
 
 async function pollUntil(fn, timeout = 30000, interval = 250) {
@@ -323,6 +340,38 @@ async function main() {
     console.log(v.out.trim())
     step('verifier: author record fully verifies (repo sig + lexicon + binding + device sig)', v.code === 0)
 
+    // ---- 4b. Response contract: /recipe/ serves the signature fields ----
+    const bindingRec = await xrpc(
+      PDS_HOST,
+      `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.pubkey&rkey=self`,
+    )
+    const fullRes = await fetch(`${APPVIEW}/recipe/${encodeURIComponent(AUTHOR.did)}/${encodeURIComponent(stewId)}`)
+    const full = await fullRes.json()
+    step(
+      'contract: /recipe/ serves deviceDid/deviceSignature/deviceKey',
+      fullRes.status === 200 &&
+        typeof full.deviceDid === 'string' &&
+        typeof full.deviceSignature === 'string' &&
+        typeof full.deviceKey === 'string',
+      `HTTP ${fullRes.status}`,
+    )
+    step(
+      'contract: deviceKey equals the binding record devicePublicKey',
+      full.deviceKey === bindingRec.json?.value?.devicePublicKey,
+    )
+    step(
+      'contract: deviceDid equals the binding record deviceDid',
+      full.deviceDid === bindingRec.json?.value?.deviceDid,
+    )
+    const searchHit = (await appviewSearch({ q: STEW })).find((r) => r.did === AUTHOR.did)
+    step(
+      'contract: /search summary carries the same signature fields',
+      !!searchHit &&
+        searchHit.deviceDid === full.deviceDid &&
+        searchHit.deviceSignature === full.deviceSignature &&
+        searchHit.deviceKey === full.deviceKey,
+    )
+
     // ---- 5. Forge attempts --------------------------------------------------
     // (a) Mallory's token, Olga's repo — the PDS itself must refuse.
     const mallorySession = await createSession(ATTACKER.handle, ATTACKER.password)
@@ -339,6 +388,11 @@ async function main() {
     step('forge: cross-account write into author repo refused by PDS', crossWrite.status >= 400, `HTTP ${crossWrite.status}`)
 
     // (b) Mallory's mimic: her own repo, Olga's device DID, garbage signature.
+    // C2: the AppView verifies device signatures at ingest now. Mallory has
+    // no pubkey binding for Olga's device (and no valid signature of her
+    // own), so the mimic must NEVER be indexed — not merely attributed to
+    // her. Capture stats first: the drop must show up as signatureRejected.
+    const statsBeforeMimic = await appviewStats()
     const authorPubkey = await xrpc(
       PDS_HOST,
       `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.pubkey&rkey=self`,
@@ -366,11 +420,15 @@ async function main() {
       },
     })
     step('forge setup: mimic published under attacker DID', mimic.status === 200, `HTTP ${mimic.status}`)
-    const mimicFound = await pollUntil(async () => {
-      const rs = await appviewSearch({ q: STEW })
-      return rs.find((r) => r.did === ATTACKER.did) || null
+    const mimicRejected = await pollUntil(async () => {
+      const st = await appviewStats()
+      return st && (st.signatureRejected ?? 0) > (statsBeforeMimic?.signatureRejected ?? 0) ? st : null
     }, 30000, 500)
-    step('forge: mimic is attributed to the ATTACKER did, never the author', !!mimicFound.value)
+    step('forge: mimic counted as signature-rejected by the AppView', !!mimicRejected.value)
+    const mimicSearch = await appviewSearch({ q: STEW })
+    step('forge: mimic is NOT indexed under any DID', !mimicSearch.some((r) => r.did === ATTACKER.did))
+    const mimicRecipe = await fetch(`${APPVIEW}/recipe/${encodeURIComponent(ATTACKER.did)}/mimic-stew`)
+    step('forge: mimic 404s on /recipe/', mimicRecipe.status === 404)
     const afterMimic = await appviewSearch({ q: STEW })
     const authorEntries = afterMimic.filter((r) => r.did === AUTHOR.did)
     step(
@@ -385,6 +443,47 @@ async function main() {
     const vForge = runVerifier(['forge-selftest', AUTHOR.did, stewId])
     console.log(vForge.out.trim())
     step('verifier: re-sign + tamper forgeries both rejected', vForge.code === 0)
+
+    // (d) Tampered record served through the AppView: the AUTHOR's own
+    // session writes a record with altered content but the GENUINE device
+    // signature. The PDS accepts it — the repo-commit signature is the
+    // PDS's own and cannot catch this — so the AppView's device-signature
+    // check at ingest is the only thing standing between the tamper and
+    // search results.
+    const authorSession = await createSession(AUTHOR.handle, AUTHOR.password)
+    const genuineRec = await xrpc(
+      PDS_HOST,
+      `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.recipe&rkey=${encodeURIComponent(stewId)}`,
+    )
+    const statsBeforeTamper = await appviewStats()
+    const tampered = await xrpc(PDS_HOST, 'com.atproto.repo.putRecord', {
+      method: 'POST',
+      token: authorSession.accessJwt,
+      body: {
+        repo: AUTHOR.did,
+        collection: 'kitchen.longtable.recipe',
+        rkey: 'tampered-stew',
+        record: {
+          ...genuineRec.json.value,
+          ingredients: [...genuineRec.json.value.ingredients, '1 cup motor oil'],
+        },
+      },
+    })
+    step('forge setup: tampered record written to author repo (genuine signature)', tampered.status === 200, `HTTP ${tampered.status}`)
+    const tamperRejected = await pollUntil(async () => {
+      const st = await appviewStats()
+      return st && (st.signatureRejected ?? 0) > (statsBeforeTamper?.signatureRejected ?? 0) ? st : null
+    }, 30000, 500)
+    step('appview: tampered record counted as signature-rejected', !!tamperRejected.value)
+    const tamperSearch = await appviewSearch({ q: STEW })
+    step('appview: tampered record NOT in search', !tamperSearch.some((r) => r.rkey === 'tampered-stew'))
+    const tamperRecipe = await fetch(`${APPVIEW}/recipe/${encodeURIComponent(AUTHOR.did)}/tampered-stew`)
+    step('appview: tampered record 404s on /recipe/', tamperRecipe.status === 404)
+    const stillGenuine = await appviewSearch({ q: STEW })
+    step(
+      'appview: genuine stew still indexed after tamper rejection',
+      stillGenuine.some((r) => r.did === AUTHOR.did && r.rkey === stewId),
+    )
 
     // ---- 6. Privacy audit ----------------------------------------------------
     await createRecipe(A, PIE, ['1 pie crust', '3 apples'], 'Bake until golden.')

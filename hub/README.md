@@ -7,9 +7,18 @@ can discover them.
 
 **What a hub can never do:** read anything. Friend traffic is end-to-end
 encrypted on the devices; the relay only sees ciphertext. Public recipes
-are cryptographically signed on the author's device and the hub verifies
-the signature before indexing — a hub cannot forge or alter them. All of
-a user's recipes, friends, and identity live on their own devices, so
+are signed on the author's device (Ed25519 device key) and the hub's
+AppView verifies each signature before indexing: at ingest it loads the
+author's `kitchen.longtable.pubkey/self` binding from the same
+signature-verified repo, checks the binding signature and that the bound
+key matches the device DID, then recomputes each recipe's canonical hash
+and verifies its device signature against the bound key — records that
+fail any check are dropped and counted, never indexed. The AppView also
+serves each recipe's `deviceDid`, `deviceSignature` and bound `deviceKey`
+so clients can re-verify the signature themselves before displaying it.
+(The repo-commit signature alone is not this guarantee — the PDS holds
+the repo key and produces it.) All of a user's recipes, friends, and
+identity live on their own devices, so
 **any hub can disappear at any time and nobody loses anything** — clients
 fail over to any other hub they know, or pair directly with no hub at all.
 
