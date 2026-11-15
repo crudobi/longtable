@@ -73,7 +73,7 @@ function recipeRecord(device, extra = {}) {
 
 describe('canonical recipe hash', () => {
   it('matches the independently computed BLAKE2b-256 vector (libsodium + @noble/hashes agreed)', () => {
-    // Vector computed 2026-11-15 on waflurgiooh: the same canonical array
+    // Vector computed 2026-11-15 on the dev box: the same canonical array
     // hashed by libsodium crypto_generichash(32) AND by @noble/hashes
     // blake2b(dkLen 32) — both gave this hex. It pins the canonical
     // array construction (field order + defaults), not just the primitive.
