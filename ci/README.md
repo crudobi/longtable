@@ -37,44 +37,55 @@ leaks into a build — and runs, in order:
    `ci/privacy-allowlist` (file-glob + ERE, matched against the
    matched text). Fails closed: a missing scanner, a missing secrets
    file, or any hit fails the run before anything builds.
-3. `npm-ci` — `npm ci`
-4. `typecheck` — `tsc --noEmit`
-5. `lint` — `npm run lint`
-6. `unit-tests` — `vitest run`
-7. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
+3. `legacy-hub-digests` — (`ci/check-legacy-hub-digests.py`): re-derives
+   the expected FNV-1a-64 digests of the pre-scrub legacy hub values
+   from git history (`git show d725e40:src/hubs/hubs.ts`, the scrub
+   parent) and compares them against the committed
+   `LEGACY_HUB_HASHES` in `src/hubs/hubs.ts`; pins the defensive
+   `LEGACY_HUB_HASHES_V0` set against the digests committed by
+   440c8ac. Prints digests/match booleans only, never the values.
+   Fails closed on any mismatch or an unavailable revision — this is
+   the check whose absence let the 440c8ac digests (which hash
+   strings that never shipped) pass the bundle gate (review C1,
+   2026-11-15).
+4. `npm-ci` — `npm ci`
+5. `typecheck` — `tsc --noEmit`
+6. `lint` — `npm run lint`
+7. `unit-tests` — `vitest run`
+8. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
    its own vitest suite (ingest filtering, verify-then-index rejection,
    FTS5 search, HTTP API + CORS). The service-dependent proofs
    (`e2e/proof-public.mjs`, `appview` e2e) run against the standing local
    testnet instead — they need live PLC/PDS/AppView processes and fixed
    ports, which a pristine-worktree stage cannot own.
-8. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
-9. `cap-sync` — `npx cap sync android`
-10. `apk` — `gradlew assembleDebug` (JDK 21)
-11. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
+9. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
+10. `cap-sync` — `npx cap sync android`
+11. `apk` — `gradlew assembleDebug` (JDK 21)
+12. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
    boots all three emulator AVDs from bare state if needed (AVD
    creation + fixture-CA trust, verified), ensures the support
    services (Appium, HTTPS fixture, signaling, TURN, ATProto testnet
    + seed, AppView, TLS proxies), and installs the new APK on every
    device.
-12. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
-13. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
+13. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
+14. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
    recipe, the new APK upgrades over it, data must survive. Runs on
    **every** commit — this is the test whose absence let the Phase 1
    storage swap orphan user data, and it does not get tiered away.
-14. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
+15. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
     `proof-importer`, `proof-localapi`, `proof-hubfail` — the
     multi-device oath proofs, one stage each via
     `e2e/run-fleet.sh run <proof>`, in dependency order, each with an
     app-data reset on its devices first. (`proof-thirdparty` consumes
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
-15. `release-build` — rebuilds the web bundle hooks-off (no debug
+16. `release-build` — rebuilds the web bundle hooks-off (no debug
     hooks, no dev TURN password), asserts the hook strings and the
     rotated dev TURN password are absent from the bundle, and the
     literals from the shared ops-side `privacy-secrets` file are absent from all
     of `dist/` (not just `dist/assets`), re-syncs and rebuilds the
     debug APK. That artifact is what `publish` ships.
-16. `signed-release` — builds `bundleRelease` + `assembleRelease`
+17. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
     verify`, `bundletool dump manifest` (package + git-derived
@@ -85,13 +96,13 @@ leaks into a build — and runs, in order:
     commits — the A3 fail-closed rule (release builds refuse untagged
     or dirty HEADs) is never relaxed. Tag a commit (e.g. `v0.1.0`)
     and push commit + tag together to cut a signed release.
-17. `publish` — copies the debug APK to the published location in the
+18. `publish` — copies the debug APK to the published location in the
     builds dir (`longtable-debug.apk`); when the signed-release stage
     published, also copies `longtable-release.aab` +
     `longtable-release.apk` (+ `longtable-release-mapping.txt` when
     produced — currently not, `minifyEnabled false`) with `.sha256`
     sidecars. Copies are atomic (`.tmp` + rename).
-18. `github-release` — creates a GitHub Release for the tag (A5)
+19. `github-release` — creates a GitHub Release for the tag (A5)
     with the signed `longtable-release.aab` +
     `longtable-release.apk` and their `.sha256` sidecars,
     changelog from `git log` since the previous tag. The generated

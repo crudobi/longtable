@@ -125,6 +125,19 @@ do_checkout() {
 do_secret_scan() {
   "$WT/ci/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$WT"
 }
+# Legacy-hub digest check (review C1): the migration in src/hubs/hubs.ts
+# matches the pre-scrub default hub by FNV-1a-64 digest, and the digests
+# committed by 440c8ac hashed strings that never shipped — so the
+# migration could never fire and no test caught it. The check script
+# re-derives the expected digests from git history (git show of the
+# pre-scrub file) and compares them against the committed constants,
+# printing digests/match booleans only. It runs in the pristine worktree
+# so it tests the committed constants; it fails closed when the
+# pre-scrub rev is unavailable (e.g. shallow history) or any digest
+# mismatches. Runs right after secret-scan, before anything builds.
+do_legacy_digests() {
+  "$WT/ci/check-legacy-hub-digests.py" "$WT"
+}
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_lint()      { (cd "$WT" && npm run lint); }
@@ -398,6 +411,7 @@ run_one() {
     ci_say "run $run_id commit $TARGET_HASH (full log: $log)"
     ci_stage checkout        do_checkout  &&
     ci_stage secret-scan     do_secret_scan &&
+    ci_stage legacy-hub-digests do_legacy_digests &&
     ci_stage npm-ci          do_npm_ci    &&
     ci_stage typecheck       do_typecheck &&
     ci_stage lint            do_lint      &&
