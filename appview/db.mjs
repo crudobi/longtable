@@ -43,7 +43,7 @@ function asIntOrNull(v) {
 }
 
 /** Normalize a lexicon-shaped recipe record + repo provenance into a row. */
-export function recordToRow({ uri, did, rkey, cid, record }) {
+export function recordToRow({ uri, did, rkey, cid, record, deviceKey }) {
   return {
     uri,
     did,
@@ -59,6 +59,14 @@ export function recordToRow({ uri, did, rkey, cid, record }) {
     tags: asArray(record?.tags).map(String),
     images: asArray(record?.images),
     longtable_id: typeof record?.longtableId === 'string' ? record.longtableId : null,
+    // Served back to clients so they can verify the device signature at
+    // read time (response contract: deviceDid / deviceSignature /
+    // deviceKey). device_key is the bound device public key, standard
+    // base64 — byte-identical to the pubkey binding record's
+    // devicePublicKey field — supplied by the caller, not the record.
+    device_did: typeof record?.deviceDid === 'string' ? record.deviceDid : null,
+    device_signature: typeof record?.deviceSignature === 'string' ? record.deviceSignature : null,
+    device_key: typeof deviceKey === 'string' ? deviceKey : null,
     created_at: typeof record?.createdAt === 'string' ? record.createdAt : null,
     updated_at:
       typeof record?.updatedAt === 'string'
@@ -78,6 +86,9 @@ function rowToSummary(row) {
     ingredients: JSON.parse(row.ingredients),
     tags: JSON.parse(row.tags),
     updatedAt: row.updated_at,
+    deviceDid: row.device_did,
+    deviceSignature: row.device_signature,
+    deviceKey: row.device_key,
   }
 }
 
@@ -99,6 +110,9 @@ function rowToFull(row) {
     longtableId: row.longtable_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    deviceDid: row.device_did,
+    deviceSignature: row.device_signature,
+    deviceKey: row.device_key,
   }
 }
 
@@ -129,10 +143,24 @@ export class RecipeIndex {
         images TEXT NOT NULL DEFAULT '[]',
         longtable_id TEXT,
         created_at TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        device_did TEXT,
+        device_signature TEXT,
+        device_key TEXT
       );
       CREATE INDEX IF NOT EXISTS recipes_by_did ON recipes(did);
     `)
+    // Pre-C2 index DBs lack the device-signature columns: add them in
+    // place. Rows indexed before this fix carry NULLs until their next
+    // verified reconcile re-upserts them with signatures.
+    for (const col of ['device_did TEXT', 'device_signature TEXT', 'device_key TEXT']) {
+      const name = col.split(' ')[0]
+      const exists = this.db
+        .prepare('PRAGMA table_info(recipes)')
+        .all()
+        .some((c) => c.name === name)
+      if (!exists) this.db.exec(`ALTER TABLE recipes ADD COLUMN ${col}`)
+    }
     this.ftsEnabled = false
     try {
       this.db.exec(`
@@ -162,20 +190,32 @@ export class RecipeIndex {
    */
   upsert(entry) {
     const row = recordToRow(entry)
-    const existing = this.db.prepare('SELECT cid FROM recipes WHERE uri = ?').get(row.uri)
-    if (existing && existing.cid === row.cid) return false
+    const existing = this.db
+      .prepare('SELECT cid, device_did, device_signature, device_key FROM recipes WHERE uri = ?')
+      .get(row.uri)
+    if (
+      existing &&
+      existing.cid === row.cid &&
+      existing.device_did === row.device_did &&
+      existing.device_signature === row.device_signature &&
+      existing.device_key === row.device_key
+    ) {
+      return false
+    }
     this.db
       .prepare(
         `INSERT INTO recipes (uri, did, rkey, cid, name, description, ingredients, instructions,
-                               prep, cook, yield, tags, images, longtable_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               prep, cook, yield, tags, images, longtable_id, created_at, updated_at,
+                               device_did, device_signature, device_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(uri) DO UPDATE SET
            did=excluded.did, rkey=excluded.rkey, cid=excluded.cid, name=excluded.name,
            description=excluded.description, ingredients=excluded.ingredients,
            instructions=excluded.instructions, prep=excluded.prep, cook=excluded.cook,
            yield=excluded.yield, tags=excluded.tags, images=excluded.images,
            longtable_id=excluded.longtable_id, created_at=excluded.created_at,
-           updated_at=excluded.updated_at`,
+           updated_at=excluded.updated_at, device_did=excluded.device_did,
+           device_signature=excluded.device_signature, device_key=excluded.device_key`,
       )
       .run(
         row.uri,
@@ -194,6 +234,9 @@ export class RecipeIndex {
         row.longtable_id,
         row.created_at,
         row.updated_at,
+        row.device_did,
+        row.device_signature,
+        row.device_key,
       )
     this.#syncFts(row)
     return true

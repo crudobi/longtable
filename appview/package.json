@@ -3,6 +3,7 @@
     "@atproto/common": "^0.4.0",
     "@atproto/crypto": "^0.4.0",
     "@atproto/repo": "^0.6.0",
+    "libsodium-wrappers": "^0.8.4",
     "ws": "^8.18.0"
   },
   "description": "Longtable hub AppView: filtered firehose ingest of public recipes from the local PDS, cryptographic verify-then-index, SQLite FTS5 search API.",

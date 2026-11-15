@@ -2,7 +2,8 @@
 
 The discovery hub for public Longtable recipes. It ingests public recipes
 from the local ATProto PDS, **verifies them cryptographically before
-indexing**, and serves a small search API over a local SQLite index.
+indexing — repo-commit signature AND per-recipe device signature —**
+and serves a small search API over a local SQLite index.
 
 ```
 PDS firehose ──(filtered #commit events)──▶ reconcile(did)
@@ -62,11 +63,25 @@ the socket reconnects automatically after a drop.
    MST: `MST.load` + `reachableLeaves()` + `getAndParseRecord` from
    `@atproto/repo`) and require every record's CID to be in the verified
    creates set before it can be diffed into the index.
+5. Verify every recipe's **device signature** (`device-signature.mjs`,
+   the same scheme as `src/public/publish.ts` and the independent
+   verifier in `scripts/verify-public` — same canonical BLAKE2b-256 hash,
+   same `longtable-pubkey:v1` / `longtable-recipe:v1` messages, same
+   libsodium Ed25519 `verifyDetached`): load the author's
+   `kitchen.longtable.pubkey/self` binding from the same verified CAR,
+   check the binding signature and that the binding's `devicePublicKey`
+   is exactly the key for its `deviceDid`, then check each recipe's
+   `deviceDid` is the bound device and its `deviceSignature` verifies
+   against the bound key over the recomputed canonical hash of the
+   record as served. Records failing any check are dropped and counted
+   (`rejected` + `signatureRejected`), never indexed.
 
-Reconcile then diffs: upsert recipes present in the verified state, delete
-indexed recipes for that DID that are no longer in it. Stats keep
-`{indexed, rejected, lastReconcileAt}`; any verification failure increments
-`rejected` and indexes nothing.
+Reconcile then diffs: upsert verified recipes present in the repo state,
+delete indexed recipes for that DID that are no longer in it — including
+recipes whose device signature stopped verifying (e.g. the author
+rebound to a new device key). Stats keep
+`{indexed, rejected, signatureRejected, lastReconcileAt}`; any
+verification failure increments `rejected` and indexes nothing.
 
 ### What a hostile hub / ingest source can and cannot do
 
@@ -81,6 +96,15 @@ indexed recipes for that DID that are no longer in it. Stats keep
   rkey, record})` computes the claimed record's CID with `cidForRecord`
   from `@atproto/repo` and indexes only if that exact CID is present in the
   verified repo state; otherwise `rejected` increments.
+- **Cannot forge or alter recipe content.** The repo-commit signature is
+  produced by the PDS, which holds the repo key — so a compromised PDS
+  (or anything that writes straight into a repo) could get altered bytes
+  into a "verified" repo state. The device signature stops that: the
+  device key never leaves the author's phone, the AppView recomputes the
+  canonical hash from the served bytes and verifies the detached
+  signature against the bound key, and any mismatch is dropped and
+  counted in `signatureRejected`. Rebinding to a new device key drops
+  recipes signed by the old one.
 - **Cannot resurrect or hide deletions.** Because reconcile diffs against
   the full verified state, a record deleted from the repo disappears from
   the index at the next reconcile of that DID, no matter what any
@@ -89,16 +113,25 @@ indexed recipes for that DID that are no longer in it. Stats keep
   (a full-CAR fetch + verify per trigger) and can withhold events (the
   index goes stale until the next event for that DID or a manual
   reconcile). It cannot make the index *wrong* — only late. The trust
-  anchors are the PLC-served DID document and the PDS CAR; if those two are
-  themselves compromised for a DID, that DID's key is compromised and no
-  AppView-side check can save it (key rotation via PLC is the remedy).
+  anchors are the PLC-served DID document, the PDS CAR, and the author's
+  device key (via the pubkey binding in the same CAR). A compromised PDS
+  can withhold or delete records (availability), but cannot make the
+  index contain a recipe the author's device never signed. One residual
+  the AppView cannot close on its own: a hub serving its HTTP API
+  dishonestly could return JSON that is not its index at all — clients
+  must re-verify the served `deviceDid` / `deviceSignature` / `deviceKey`
+  before displaying a recipe (client-side verification is the follow-up
+  half of C2).
 
 ## Index
 
 `node:sqlite` `DatabaseSync`. Table `recipes(uri PK, did, rkey, cid, name,
 description, ingredients JSON, instructions JSON, prep, cook, yield, tags
-JSON, images JSON, longtable_id, created_at, updated_at)`, diffed in from
-verified repo state only. FTS5 virtual table `recipes_fts(uri UNINDEXED,
+JSON, images JSON, longtable_id, created_at, updated_at, device_did,
+device_signature, device_key)` — the last three are the served signature
+fields (pre-C2 index DBs gain them by migration; rows carry NULLs until
+their next verified reconcile). Only device-verified rows are ever
+diffed in. FTS5 virtual table `recipes_fts(uri UNINDEXED,
 name, ingredients_text, tags_text)` is kept in sync on every upsert/delete.
 **FTS5 is available** in this box's Node v24 `node:sqlite` (verified). If it
 ever weren't, `RecipeIndex` falls back to LIKE-based search with identical
@@ -114,12 +147,27 @@ listed ingredient must match (token-prefix per ingredient token, so
 | Route | Response |
 | --- | --- |
 | `GET /health` | `{ok: true}` |
-| `GET /stats` | `{indexed, rejected, lastReconcileAt, total, fts5}` |
-| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt}]}` ranked by FTS rank |
+| `GET /stats` | `{indexed, rejected, signatureRejected, lastReconcileAt, total, fts5}` |
+| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt, deviceDid, deviceSignature, deviceKey}]}` ranked by FTS rank |
 | `GET /search?ingredients=egg,flour` | recipes containing **all** listed ingredients (AND) |
 | `GET /search?q=...&ingredients=...` | both filters combined |
-| `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs) or 404 |
-| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes |
+| `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs, `deviceDid`, `deviceSignature`, `deviceKey`) or 404 |
+| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same three signature fields |
+
+Response contract (for clients verifying at read time): every per-recipe
+object carries `deviceDid` (the author's Longtable device DID, a
+`did:key:z...` Ed25519 DID, exactly as in the recipe record),
+`deviceSignature` (standard padded base64 Ed25519 detached signature,
+exactly as in the recipe record, over
+`longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>` where
+`hashHex` is the BLAKE2b-256 hex of the canonical JSON array — see
+`device-signature.mjs`), and `deviceKey` (standard padded base64 of the
+32-byte Ed25519 device public key — byte-identical to the `devicePublicKey`
+field of the author's `kitchen.longtable.pubkey/self` binding record, NOT
+the did:key string and NOT hex). A client verifies by checking the
+did:key derived from `deviceKey` equals `deviceDid`, recomputing the
+canonical hash from the served record fields, and verifying the detached
+signature against `deviceKey`.
 
 DIDs in paths may be sent raw (`did:plc:...`) or URL-encoded.
 
@@ -151,12 +199,20 @@ npm test          # vitest unit tests: FTS search, ingredient AND, reconcile
                   # which runs without appview's node_modules, from trying
                   # to execute this subpackage's tests)
 npm run test:e2e  # e2e/appview.e2e.mjs against the live local testnet:
-                  # author publishes -> searchable (latency printed);
-                  # attacker publishes same name -> both, own DIDs;
-                  # forged ingestClaim in the author's name -> rejected,
-                  # never searchable; author deletes -> disappears.
+                  # author publishes a device-signed recipe (binding first)
+                  # -> searchable (latency printed); /recipe/ + /search
+                  # carry deviceDid/deviceSignature/deviceKey; attacker
+                  # publishes same name, signed under their OWN binding
+                  # -> both, own DIDs; forged ingestClaim in the author's
+                  # name -> rejected, never searchable; author publishes
+                  # a TAMPERED record (genuine signature, altered content)
+                  # -> dropped at ingest, counted in signatureRejected,
+                  # never searchable, 404 on /recipe/; author deletes
+                  # -> disappears.
                   # Needs the testnet up + accounts at
                   # <LT_ROOT>/ops/longtable-atproto/accounts.json
+                  # (or PDS_URL/PLC_URL/ACCOUNTS_FILE for an isolated
+                  # testnet on other ports).
 ```
 
 ## Layout
@@ -166,5 +222,7 @@ npm run test:e2e  # e2e/appview.e2e.mjs against the live local testnet:
 - `ingest.mjs` — firehose subscription, filtering, `reconcileRepo`,
   `ingestClaim` forge-test hook
 - `verify.mjs` — DID-doc key extraction, CAR fetch, `verifyRepoCar`
+- `device-signature.mjs` — pubkey-binding + per-recipe device-signature
+  verification (canonical hash, binding/recipe messages, did:key)
 - `db.mjs` — `RecipeIndex` (SQLite + FTS5)
 - `test/` — vitest unit tests · `e2e/` — live-testnet e2e

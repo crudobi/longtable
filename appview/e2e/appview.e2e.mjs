@@ -8,17 +8,30 @@
  * ({author:{handle,password,did}, attacker:{handle,password,did}}).
  *
  * Flow: start the AppView in-process on :3211 with a temp DB -> author
- * publishes a recipe -> poll search until the firehose->verify->index path
- * surfaces it (latency printed) -> attacker publishes a same-named recipe
- * (both must appear, each under its own DID) -> ingestClaim a forged record
- * in the author's name (must be rejected, never searchable) -> author
+ * publishes a device-signed recipe (binding first) -> poll search until
+ * the firehose->verify->index path surfaces it (latency printed) ->
+ * /recipe/ + /search must carry deviceDid/deviceSignature/deviceKey ->
+ * attacker publishes a same-named recipe, signed under their OWN binding
+ * (both must appear, each under its own DID) -> ingestClaim a forged
+ * record in the author's name (must be rejected, never searchable) ->
+ * author publishes a TAMPERED record (genuine signature, altered
+ * content) in their own repo (must be dropped at ingest, counted in
+ * stats.signatureRejected, never searchable, 404 on /recipe/) -> author
  * deletes the record (must disappear from search).
  */
 import fs from 'node:fs'
 import os from 'node:os'
+import crypto from 'node:crypto'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { AtpAgent } from '@atproto/api'
 import { createAppView } from '../server.mjs'
+import {
+  canonicalRecipeHashHex,
+  recipeSignatureMessage,
+  pubkeyBindingMessage,
+  didKeyFromPublicKeyBytes,
+} from '../device-signature.mjs'
 
 const PDS_URL = process.env.PDS_URL ?? 'http://localhost:2583'
 const PLC_URL = process.env.PLC_URL ?? 'http://localhost:2582'
@@ -83,6 +96,55 @@ async function login(account) {
   return agent
 }
 
+// The e2e publishes through raw createRecord (not the app UI), so it must
+// do the device's job itself: mint a device keypair, publish the pubkey
+// binding, and sign each recipe record — otherwise the AppView's
+// device-signature gate (C2) correctly drops every record as unsigned.
+// Keys are node:crypto Ed25519 (independent signer from the libsodium
+// verifier), fresh per run; the binding is overwritten on re-runs.
+function makeDevice() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519')
+  const publicKeyBytes = new Uint8Array(publicKey.export({ type: 'spki', format: 'der' }).subarray(-32))
+  return {
+    privateKey,
+    publicKeyBytes,
+    deviceDid: didKeyFromPublicKeyBytes(publicKeyBytes),
+    devicePublicKey: Buffer.from(publicKeyBytes).toString('base64'),
+  }
+}
+
+function signMsg(device, message) {
+  return crypto.sign(null, Buffer.from(message, 'utf8'), device.privateKey).toString('base64')
+}
+
+async function publishBinding(agent, account, device) {
+  await agent.com.atproto.repo.putRecord({
+    repo: account.did,
+    collection: 'kitchen.longtable.pubkey',
+    rkey: 'self',
+    record: {
+      $type: 'kitchen.longtable.pubkey',
+      deviceDid: device.deviceDid,
+      devicePublicKey: device.devicePublicKey,
+      signature: signMsg(
+        device,
+        pubkeyBindingMessage(account.did, device.deviceDid, device.devicePublicKey),
+      ),
+      createdAt: new Date().toISOString(),
+    },
+  })
+}
+
+function signedRecipeRecord(device, accountDid, name, longtableId, ingredients) {
+  const record = recipeRecord(name, longtableId, ingredients)
+  const hashHex = canonicalRecipeHashHex(record)
+  return {
+    ...record,
+    deviceDid: device.deviceDid,
+    deviceSignature: signMsg(device, recipeSignatureMessage(accountDid, record.longtableId, hashHex)),
+  }
+}
+
 async function main() {
   // Gate: testnet must be up.
   try {
@@ -117,11 +179,13 @@ async function main() {
 
     // --- author publishes ---
     const authorAgent = await login(author)
+    const authorDevice = makeDevice()
+    await publishBinding(authorAgent, author, authorDevice)
     const t0 = Date.now()
     const created = await authorAgent.com.atproto.repo.createRecord({
       repo: author.did,
       collection: COLLECTION,
-      record: recipeRecord('AppView Borscht', 'e2e-borscht-author', ['3 beets', '1 onion']),
+      record: signedRecipeRecord(authorDevice, author.did, 'AppView Borscht', 'e2e-borscht-author', ['3 beets', '1 onion']),
     })
     authorUri = created.data.uri
     authorRkey = authorUri.split('/').pop()
@@ -149,13 +213,30 @@ async function main() {
 
     const full = await getJson(`/recipe/${encodeURIComponent(author.did)}/${authorRkey}`)
     check('GET /recipe returns full record', full.name === 'AppView Borscht' && full.did === author.did)
+    check(
+      'GET /recipe serves deviceDid/deviceSignature/deviceKey',
+      full.deviceDid === authorDevice.deviceDid &&
+        full.deviceKey === authorDevice.devicePublicKey &&
+        typeof full.deviceSignature === 'string' &&
+        full.deviceSignature.length > 0,
+      JSON.stringify({ deviceDid: full.deviceDid, deviceKey: full.deviceKey }),
+    )
+    check(
+      'search summary carries the same signature fields',
+      found.value.deviceDid === authorDevice.deviceDid &&
+        found.value.deviceKey === authorDevice.devicePublicKey &&
+        typeof found.value.deviceSignature === 'string',
+      JSON.stringify(found.value),
+    )
 
     // --- attacker publishes a same-named recipe in their OWN repo ---
     const attackerAgent = await login(attacker)
+    const attackerDevice = makeDevice()
+    await publishBinding(attackerAgent, attacker, attackerDevice)
     const created2 = await attackerAgent.com.atproto.repo.createRecord({
       repo: attacker.did,
       collection: COLLECTION,
-      record: recipeRecord('AppView Borscht', 'e2e-borscht-attacker', ['2 beets', '1 carrot']),
+      record: signedRecipeRecord(attackerDevice, attacker.did, 'AppView Borscht', 'e2e-borscht-attacker', ['2 beets', '1 carrot']),
     })
     attackerUri = created2.data.uri
     attackerRkey = attackerUri.split('/').pop()
@@ -198,6 +279,39 @@ async function main() {
       stats.total === statsBefore.total,
       `before=${statsBefore.total} after=${stats.total}`,
     )
+
+    // --- tampered record: in the author's OWN repo, genuine signature, altered content ---
+    // The PDS accepts it (the repo commit signature is the PDS's own), so
+    // this is the AppView-level forgery: the device signature must fail
+    // and the record must never be indexed.
+    const statsBeforeTamper = await getJson('/stats')
+    const genuineRec = await authorAgent.com.atproto.repo.getRecord({
+      repo: author.did,
+      collection: COLLECTION,
+      rkey: authorRkey,
+    })
+    const tampered = {
+      ...genuineRec.data.value,
+      ingredients: [...genuineRec.data.value.ingredients, '1 cup motor oil'],
+    }
+    const tamperedCreated = await authorAgent.com.atproto.repo.createRecord({
+      repo: author.did,
+      collection: COLLECTION,
+      record: tampered,
+    })
+    const tamperedRkey = tamperedCreated.data.uri.split('/').pop()
+    console.log(`author published tampered record ${tamperedCreated.data.uri} (genuine signature, altered ingredients)`)
+    const tamperRejected = await waitFor('tampered record rejected (stats.signatureRejected increases)', async () => {
+      const s = await getJson('/stats')
+      return s.signatureRejected > (statsBeforeTamper.signatureRejected ?? 0) ? s : null
+    })
+    check('tampered record counted as signature-rejected', !!tamperRejected.value, JSON.stringify(tamperRejected.value))
+    const tamperedSearch = await getJson('/search?q=Borscht')
+    check('tampered record absent from search', !tamperedSearch.results.some((r) => r.rkey === tamperedRkey))
+    const tamperedGet = await fetch(`${BASE}/recipe/${encodeURIComponent(author.did)}/${tamperedRkey}`)
+    check('tampered record 404s on /recipe/', tamperedGet.status === 404)
+    const stillThere = await getJson('/search?q=Borscht')
+    check('genuine recipe still searchable after tamper rejection', stillThere.results.some((r) => r.uri === authorUri))
 
     // --- author deletes -> reconcile diff removes it from search ---
     await authorAgent.com.atproto.repo.deleteRecord({
