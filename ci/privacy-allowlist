@@ -29,3 +29,5 @@ hub/hub.mjs	192\.168\.255\.255
 *package-lock.json	i@izs\.me
 # Reserved test domain; seed fixtures are fake by construction (audit b9).
 *	@test\.local
+# Build-host hostname in a test comment, not a secret (2026-11-17 watchdog: device-signature.appview-test.mjs:76 names the waflurgiooh build host; no secret value involved).
+appview/test/device-signature.appview-test.mjs	waflurgiooh
