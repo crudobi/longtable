@@ -107,6 +107,18 @@ filter_generic() {
   done < "$raw"
 }
 
+# Filter raw secrets hits (file:line:match-or-line) through the allow-list,
+# recording survivors as file:line:secret. Secrets hits previously bypassed
+# the allow-list entirely (2026-11-17: a hostname entry could not exempt a
+# secrets-class hit); now both classes filter the same way.
+filter_secrets() {
+  local raw=$1 hit f rest ln m
+  while IFS= read -r hit || [ -n "$hit" ]; do
+    f=${hit%%:*}; rest=${hit#*:}; ln=${rest%%:*}; m=${rest#*:}
+    allowlisted "$f" "$m" || printf '%s:%s:secret\n' "$f" "$ln" >> "$HITS"
+  done < "$raw"
+}
+
 if [ -n "$REV" ]; then
   # --- revision mode: git grep at <rev> in TARGET (a git repo) ---
   [ -d "$TARGET" ] || { echo "privacy-scan: --rev target is not a directory: $TARGET" >&2; exit 2; }
@@ -117,7 +129,8 @@ if [ -n "$REV" ]; then
   filter_generic "$TMP/generic_raw"
   if [ -n "$SECRETS" ]; then
     (cd "$TARGET" && git grep -I -n -i -F -f "$SECRETS" "$REV" -- 2>/dev/null || true) |
-      cut -d: -f2- | cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS"
+      cut -d: -f2- > "$TMP/secrets_raw"
+    filter_secrets "$TMP/secrets_raw"
   fi
 elif [ -f "$TARGET" ]; then
   # --- single-file mode (e.g. release notes) ---
@@ -125,7 +138,8 @@ elif [ -f "$TARGET" ]; then
   grep -HInoE -f "$TMP/patterns" -- "$TARGET" > "$TMP/generic_raw" || true
   filter_generic "$TMP/generic_raw"
   if [ -n "$SECRETS" ]; then
-    grep -HIniF -f "$SECRETS" -- "$TARGET" | cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS" || true
+    grep -HIniF -f "$SECRETS" -- "$TARGET" > "$TMP/secrets_raw" || true
+    filter_secrets "$TMP/secrets_raw"
   fi
 elif [ -d "$TARGET" ]; then
   # --- directory mode: tracked files if a repo, else all files ---
@@ -140,11 +154,11 @@ elif [ -d "$TARGET" ]; then
   filter_generic "$TMP/generic_raw"
   if [ -n "$SECRETS" ]; then
     if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
-      (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true) |
-        cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS"
+      (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true)  > "$TMP/secrets_raw"
+      filter_secrets "$TMP/secrets_raw"
     else
-      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true) |
-        cut -d: -f1,2 | sed 's/$/:secret/' >> "$HITS"
+      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HIniF -f "$SECRETS" -- 2>/dev/null || true)  > "$TMP/secrets_raw"
+      filter_secrets "$TMP/secrets_raw"
     fi
   fi
 else
