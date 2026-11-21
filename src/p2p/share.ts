@@ -26,7 +26,7 @@
  * without leaving would resurrect the room on the next launch.
  */
 import * as Y from 'yjs'
-import { getOrCreateDoc, getRepo } from '../store/repo'
+import { getOrCreateDoc, getRepo, dropDoc } from '../store/repo'
 import type { KeyValueStore } from '../identity/identity'
 import { getOrCreateIndex, RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
@@ -440,6 +440,14 @@ export async function shareRecipe(
  * local Y.Doc with the same guid; applies the embedded snapshot for instant
  * content, then y-webrtc handles live sync. Registers the recipe in the
  * local index so it appears in the list.
+ *
+ * Rel L5 residual: a join that fails AFTER the room is up — the
+ * content wait times out, or the synced content fails validation —
+ * tears itself down (provider destroyed, doc wiped) instead of
+ * leaving a live provider attached to an orphaned doc no index entry
+ * points at. Only a FRESH join tears down: when this device already
+ * held the share, the doc is the user's own (or an earlier join's)
+ * and is never wiped from under it — the error just propagates.
  */
 /**
  * Wait until the shared doc has content (title set) or timeout.
@@ -456,7 +464,10 @@ async function waitForContent(doc: Y.Doc, timeoutMs: number): Promise<void> {
   throw new Error('Timed out waiting for the shared recipe to arrive.')
 }
 
-export async function joinShare(payload: SharePayload): Promise<void> {
+export async function joinShare(
+  payload: SharePayload,
+  opts: { contentTimeoutMs?: number } = {},
+): Promise<void> {
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, payload.recipeId)
   // Fresh-GUID binding: a payload names the recipe id its content merges
@@ -481,26 +492,50 @@ export async function joinShare(payload: SharePayload): Promise<void> {
     }
     Y.applyUpdate(doc, base64ToU8(payload.snapshot))
   }
-  await joinRoom(payload.room, doc, payload.signaling, payload.secret)
-  if (!payload.snapshot) {
-    await waitForContent(doc, 20000)
+  // Fresh join (no share record yet): a failure from here on tears the
+  // join down completely — see the header comment. A re-join of an
+  // existing share keeps today's behavior (error propagates, nothing
+  // is torn down).
+  const hadShare = getShare(payload.recipeId) !== undefined
+  try {
+    await joinRoom(payload.room, doc, payload.signaling, payload.secret)
+    if (!payload.snapshot) {
+      await waitForContent(doc, opts.contentTimeoutMs ?? 20000)
+    }
+    // Content validation (S9): the snapshot / synced content is
+    // unauthenticated bytes. Validate shape + caps before registering — a
+    // failure leaves the recipe unlisted and saves no share record. (When
+    // the payload came through parseSharePayload its snapshot was already
+    // validated on a scratch doc; this covers the no-snapshot path and
+    // programmatic callers that skip parsing.) The VALIDATED doc title is
+    // registered — not payload.title, which used to be trusted verbatim.
+    const title = validateSharedDoc(doc)
+    await registerSharedRecipe(repo, payload.recipeId, title)
+    saveShare({
+      recipeId: payload.recipeId,
+      room: payload.room,
+      signaling: payload.signaling,
+      role: 'guest',
+      ...(payload.secret ? { secret: payload.secret } : {}),
+    })
+  } catch (e) {
+    if (!hadShare) {
+      // Provider teardown never throws (leaveShare); the doc wipe is
+      // best-effort — if IndexedDB refuses, the provider is still
+      // dead and the doc is unreachable (no index entry, no record),
+      // so the failure is a disk leak, logged, not a live sync.
+      leaveShare(payload.recipeId)
+      try {
+        await dropDoc(repo, payload.recipeId)
+      } catch (wipeError) {
+        console.warn(
+          'timed-out join: provider torn down but the orphaned doc could not be wiped',
+          wipeError,
+        )
+      }
+    }
+    throw e
   }
-  // Content validation (S9): the snapshot / synced content is
-  // unauthenticated bytes. Validate shape + caps before registering — a
-  // failure leaves the recipe unlisted and saves no share record. (When
-  // the payload came through parseSharePayload its snapshot was already
-  // validated on a scratch doc; this covers the no-snapshot path and
-  // programmatic callers that skip parsing.) The VALIDATED doc title is
-  // registered — not payload.title, which used to be trusted verbatim.
-  const title = validateSharedDoc(doc)
-  await registerSharedRecipe(repo, payload.recipeId, title)
-  saveShare({
-    recipeId: payload.recipeId,
-    room: payload.room,
-    signaling: payload.signaling,
-    role: 'guest',
-    ...(payload.secret ? { secret: payload.secret } : {}),
-  })
 }
 
 /**
