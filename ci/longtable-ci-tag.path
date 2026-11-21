@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch Longtable tags for new releases (Wave 6C)
+
+[Path]
+PathChanged=@CI_ROOT@/code/longtable/.git/refs/tags
+PathChanged=@CI_ROOT@/code/longtable/.git/packed-refs
+Unit=longtable-ci.service
+
+[Install]
+WantedBy=multi-user.target
