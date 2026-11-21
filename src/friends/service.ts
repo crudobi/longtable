@@ -26,6 +26,7 @@ import {
   getFriend,
   listFriends,
   removeFriend,
+  shelfGuidFor,
   type FriendRecord,
 } from './friends'
 import { secretKv } from '../secrets/secretStore'
@@ -34,14 +35,25 @@ import {
   ensureRecipeKey,
   getRecipeKey,
   loadVault,
+  newRecipeKeyRecord,
   processChannel,
   publishShare,
-  rotateRecipeKey,
+  readEnvelope,
+  readManifestEntry,
+  readPayload,
+  saveRecipeKeyRecord,
   setKeyFriends,
+  shelfShareIsCurrent,
   unpublishShare,
   type ReceivedShare,
+  type RecipeKeyRecord,
 } from './shelf'
-import { getRepo, type YjsStore } from '../store/repo'
+import {
+  getRecipeProvenance,
+  recordReceivedProvenance,
+} from './provenance'
+import { getOrCreateDoc, getRepo, type YjsStore } from '../store/repo'
+import type { Recipe } from '../types'
 import {
   createRecipe,
   getOrCreateIndex,
@@ -69,6 +81,13 @@ export function setDisplayName(name: string, kv: KeyValueStore = secretKv): void
  * Share `recipeId` with exactly `friendDids` (the full authorized set).
  * If the set shrank since last time, the key rotates BEFORE publishing, so
  * a removed friend's envelope can never open the new payloads.
+ *
+ * Per-friend isolation (M1-rel): each friend's publish is independent —
+ * one friend's channel failing no longer aborts the rest (the old loop
+ * threw on the first failure and left the remaining friends stale with
+ * no retry). Failures are collected and thrown as one aggregated error
+ * after every friend was attempted; the startup sweep repairs any
+ * friend left stale.
  */
 export async function shareRecipeWithFriends(
   recipeId: string,
@@ -95,7 +114,6 @@ export async function shareRecipeWithFriends(
         await unpublishShare(doc, identity, getDisplayName(kv), recipeId, did)
       }
     }
-    keyRec = await rotateRecipeKey(recipeId, friendDids, kv)
   } else {
     setKeyFriends(recipeId, friendDids, kv)
     keyRec = { ...keyRec, friends: [...friendDids] }
@@ -110,12 +128,110 @@ export async function shareRecipeWithFriends(
   if (!fresh) throw new Error(`recipe vanished: ${recipeId}`)
 
   const myName = getDisplayName(kv)
-  for (const did of friendDids) {
-    const friend = getFriend(did, kv)
-    if (!friend) continue
-    const doc = await getChannelDoc(friend, repo)
-    await publishShare(doc, identity, myName, fresh, recipeId, keyRec, did)
+  if (removed.length > 0) {
+    // Rotate-before-republish, atomically (M7): the new key is only
+    // committed once every remaining friend holds the new payload.
+    await rotateAndRepublishRecipe(
+      recipeId,
+      friendDids,
+      fresh,
+      identity,
+      kv,
+      repo,
+    )
+  } else {
+    const failures: string[] = []
+    for (const did of friendDids) {
+      try {
+        const friend = getFriend(did, kv)
+        if (!friend) {
+          failures.push(`${did}: no friend record`)
+          continue
+        }
+        const doc = await getChannelDoc(friend, repo)
+        await publishShare(doc, identity, myName, fresh, recipeId, keyRec, did)
+      } catch (e) {
+        failures.push(`${did}: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(
+        `Could not share with ${failures.length} friend${failures.length === 1 ? '' : 's'}: ${failures.join('; ')}`,
+      )
+    }
   }
+
+  // M7 shrink path: a de-authorized friend who now holds NO shared
+  // recipe keeps a live connection to the shelf channel otherwise.
+  // Disconnecting per recipe would break their OTHER shared recipes
+  // (one channel per pair carries every recipe), so the channel is
+  // only torn down when the friend has nothing left in the vault.
+  for (const did of removed) {
+    const stillHolds = Object.values(loadVault(kv)).some((rec) =>
+      rec.friends.includes(did),
+    )
+    if (!stillHolds) disconnectFriendChannel(did)
+  }
+}
+
+/**
+ * Rotate a recipe's key and republish to `remainingDids`, atomically
+ * (M7): the candidate key is published to every remaining friend
+ * FIRST and only committed to the vault once all of them hold it. A
+ * failure anywhere leaves the vault on the old key — whose payloads
+ * are still valid — and rolls the friends who already got the new
+ * payload back to the old one, so no friend is left holding an
+ * envelope for a key the owner does not have. Throws an aggregated
+ * error listing the friends that could not be reached.
+ */
+export async function rotateAndRepublishRecipe(
+  recipeId: string,
+  remainingDids: string[],
+  recipe: Recipe,
+  identity: Identity,
+  kv: KeyValueStore = secretKv,
+  repo: YjsStore = getRepo(),
+): Promise<RecipeKeyRecord> {
+  const prev = getRecipeKey(recipeId, kv)
+  const candidate = await newRecipeKeyRecord(prev, remainingDids)
+  const myName = getDisplayName(kv)
+  const succeeded: string[] = []
+  const failures: string[] = []
+  for (const did of remainingDids) {
+    try {
+      const friend = getFriend(did, kv)
+      if (!friend) {
+        failures.push(`${did}: no friend record`)
+        continue
+      }
+      const doc = await getChannelDoc(friend, repo)
+      await publishShare(doc, identity, myName, recipe, recipeId, candidate, did)
+      succeeded.push(did)
+    } catch (e) {
+      failures.push(`${did}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  if (failures.length > 0) {
+    // Roll back the friends who already got the new payload, best
+    // effort, so the shelf converges back onto the committed key.
+    if (prev) {
+      for (const did of succeeded) {
+        try {
+          const friend = getFriend(did, kv)
+          if (!friend) continue
+          const doc = await getChannelDoc(friend, repo)
+          await publishShare(doc, identity, myName, recipe, recipeId, prev, did)
+        } catch {
+          /* rollback is best-effort; the sweep repairs what is left */
+        }
+      }
+    }
+    throw new Error(
+      `Could not re-key for ${failures.length} friend${failures.length === 1 ? '' : 's'}: ${failures.join('; ')}`,
+    )
+  }
+  await saveRecipeKeyRecord(recipeId, candidate, kv)
+  return candidate
 }
 
 /** Republish a friends-only recipe after a local edit (no set change). */
@@ -134,11 +250,24 @@ export async function republishIfShared(
   const recipe = await getRecipe(repo, entry.url)
   if (!recipe) return
   const myName = getDisplayName(kv)
+  const failures: string[] = []
   for (const did of keyRec.friends) {
-    const friend = getFriend(did, kv)
-    if (!friend) continue
-    const doc = await getChannelDoc(friend, repo)
-    await publishShare(doc, identity, myName, recipe, recipeId, keyRec, did)
+    try {
+      const friend = getFriend(did, kv)
+      if (!friend) {
+        failures.push(`${did}: no friend record`)
+        continue
+      }
+      const doc = await getChannelDoc(friend, repo)
+      await publishShare(doc, identity, myName, recipe, recipeId, keyRec, did)
+    } catch (e) {
+      failures.push(`${did}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `Could not republish to ${failures.length} friend${failures.length === 1 ? '' : 's'}: ${failures.join('; ')}`,
+    )
   }
 }
 
@@ -152,23 +281,136 @@ export async function unshareRecipeEverywhere(
   const keyRec = getRecipeKey(recipeId, kv)
   if (!keyRec) return
   const myName = getDisplayName(kv)
+  const failures: string[] = []
   for (const did of keyRec.friends) {
-    const friend = getFriend(did, kv)
-    if (!friend) continue
-    const doc = await getChannelDoc(friend, repo)
-    await unpublishShare(doc, identity, myName, recipeId, did)
+    try {
+      const friend = getFriend(did, kv)
+      if (!friend) continue
+      const doc = await getChannelDoc(friend, repo)
+      await unpublishShare(doc, identity, myName, recipeId, did)
+    } catch (e) {
+      failures.push(`${did}: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
   dropRecipeKey(recipeId, kv)
+  if (failures.length > 0) {
+    throw new Error(
+      `Could not strip the share from ${failures.length} friend${failures.length === 1 ? '' : 's'}: ${failures.join('; ')}`,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Unfriend + re-key
+// Unfriend + re-key (atomic + resumable, M-N4)
 // ---------------------------------------------------------------------------
 
 /**
- * Remove a friend entirely: rotate every recipe key they held and
- * republish those recipes to their remaining authorized friends, clear my
- * payloads from the ex-friend's channel, then drop the friend + channel.
+ * A revocation that has not finished yet, persisted so a crash or a
+ * failed publish mid-unfriend cannot strand the ex-friend connected
+ * with live keys. The friend-record snapshot keeps the channel
+ * derivation (shelf guid / room) available after the friend record
+ * itself is removed, so a later launch can finish the job.
+ */
+export interface PendingRevocation {
+  friendDid: string
+  friend: FriendRecord
+  recipeIds: string[]
+  completedRecipeIds: string[]
+  createdAt: string
+  lastAttemptAt: string
+  failures: Record<string, string>
+}
+
+const PENDING_REVOCATIONS_KEY = 'longtable:pending-revocations:v1'
+
+export function loadPendingRevocations(
+  kv: KeyValueStore = secretKv,
+): PendingRevocation[] {
+  try {
+    const raw = kv.getItem(PENDING_REVOCATIONS_KEY)
+    if (!raw) return []
+    const arr: unknown = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return (arr as PendingRevocation[]).filter(
+      (p): p is PendingRevocation =>
+        typeof p === 'object' &&
+        p !== null &&
+        typeof (p as PendingRevocation).friendDid === 'string' &&
+        typeof (p as PendingRevocation).friend === 'object' &&
+        Array.isArray((p as PendingRevocation).recipeIds),
+    )
+  } catch {
+    return []
+  }
+}
+
+export function savePendingRevocations(
+  kv: KeyValueStore,
+  pendings: PendingRevocation[],
+): void {
+  kv.setItem(PENDING_REVOCATIONS_KEY, JSON.stringify(pendings))
+}
+
+function upsertPendingRevocation(
+  kv: KeyValueStore,
+  pending: PendingRevocation,
+): void {
+  const all = loadPendingRevocations(kv).filter(
+    (p) => p.friendDid !== pending.friendDid,
+  )
+  all.push(pending)
+  savePendingRevocations(kv, all)
+}
+
+function dropPendingRevocation(kv: KeyValueStore, friendDid: string): void {
+  savePendingRevocations(
+    kv,
+    loadPendingRevocations(kv).filter((p) => p.friendDid !== friendDid),
+  )
+}
+
+/**
+ * Revoke one friend from one recipe: strip my payload from their
+ * channel doc, then rotate the key and republish to the remaining
+ * friends (M7 atomic rotate). The ex-friend's channel doc is opened
+ * WITHOUT joining its provider (getOrCreateDoc, not getChannelDoc) —
+ * the channel was disconnected first, and rejoining it here would
+ * hand the ex-friend live sync again mid-revocation.
+ */
+async function revokeFriendFromRecipe(
+  recipeId: string,
+  exFriend: FriendRecord,
+  identity: Identity,
+  kv: KeyValueStore,
+  repo: YjsStore,
+  snap: Awaited<ReturnType<IndexHandle['doc']>>,
+): Promise<void> {
+  const exDoc = await getOrCreateDoc(repo, shelfGuidFor(exFriend))
+  await unpublishShare(exDoc, identity, getDisplayName(kv), recipeId, exFriend.did)
+  const entry = snap?.recipes[recipeId]
+  if (!entry) return // recipe gone locally: nothing left to republish
+  const recipe = await getRecipe(repo, entry.url)
+  if (!recipe) return
+  const remaining = (getRecipeKey(recipeId, kv)?.friends ?? []).filter(
+    (d) => d !== exFriend.did,
+  )
+  await rotateAndRepublishRecipe(recipeId, remaining, recipe, identity, kv, repo)
+}
+
+/**
+ * Remove a friend entirely: disconnect their channel FIRST (they stop
+ * receiving immediately, even if a rotation below fails), then rotate
+ * every recipe key they held and republish those recipes to their
+ * remaining authorized friends, clear my payloads from the ex-friend's
+ * channel, then drop the friend record.
+ *
+ * Resumable (M-N4): a pending-revocation record is persisted BEFORE
+ * any key is rotated and updated after each recipe, so a throw
+ * anywhere leaves a record the startup sweep (resumePendingRevocations)
+ * finishes on the next launch. Per-recipe failures are isolated — one
+ * unreachable friend's channel no longer aborts the rest — and the
+ * function throws an aggregated error listing the unfinished recipes
+ * instead of silently leaving the ex-friend connected.
  * The ex-friend keeps old versions they already decrypted; every future
  * version is sealed under keys they never receive.
  */
@@ -179,43 +421,184 @@ export async function unfriendAndRekey(
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   const ex = getFriend(friendDid, kv)
-  if (!ex) return
-  const index = await getOrCreateIndex(repo)
-  const snap = await index.doc()
-  const myName = getDisplayName(kv)
+  const existingPending = loadPendingRevocations(kv).find(
+    (p) => p.friendDid === friendDid,
+  )
+  const target = ex ?? existingPending?.friend
+  if (!target) return
 
-  // Every recipe whose key this friend held.
+  // 1. Disconnect FIRST: the ex-friend stops receiving live shelf
+  // updates now, whatever happens below.
+  disconnectFriendChannel(friendDid)
+
+  // 2. Persist the pending revocation before mutating any key.
   const vault = loadVault(kv)
   const affected = Object.entries(vault)
     .filter(([, rec]) => rec.friends.includes(friendDid))
     .map(([recipeId]) => recipeId)
-
-  // Clear my side of the ex-friend's channel (payloads + manifest refs).
-  const exDoc = await getChannelDoc(ex, repo)
-  for (const recipeId of affected) {
-    await unpublishShare(exDoc, identity, myName, recipeId, friendDid)
+  const pending: PendingRevocation = {
+    friendDid,
+    friend: target,
+    recipeIds: [...new Set([...(existingPending?.recipeIds ?? []), ...affected])],
+    completedRecipeIds: [...(existingPending?.completedRecipeIds ?? [])],
+    createdAt: existingPending?.createdAt ?? new Date().toISOString(),
+    lastAttemptAt: new Date().toISOString(),
+    failures: { ...(existingPending?.failures ?? {}) },
   }
+  upsertPendingRevocation(kv, pending)
 
-  // Rotate + republish each affected recipe to its remaining friends.
-  for (const recipeId of affected) {
-    const entry = snap?.recipes[recipeId]
-    if (!entry) continue
-    const recipe = await getRecipe(repo, entry.url)
-    if (!recipe) continue
-    const remaining = (getRecipeKey(recipeId, kv)?.friends ?? []).filter(
-      (d) => d !== friendDid,
-    )
-    const keyRec = await rotateRecipeKey(recipeId, remaining, kv)
-    for (const did of remaining) {
-      const friend = getFriend(did, kv)
-      if (!friend) continue
-      const doc = await getChannelDoc(friend, repo)
-      await publishShare(doc, identity, myName, recipe, recipeId, keyRec, did)
+  // 3. Per-recipe revocation, isolated + persisted as it goes.
+  const index = await getOrCreateIndex(repo)
+  const snap = await index.doc()
+  for (const recipeId of [...pending.recipeIds]) {
+    if (pending.completedRecipeIds.includes(recipeId)) continue
+    try {
+      await revokeFriendFromRecipe(recipeId, target, identity, kv, repo, snap)
+      pending.completedRecipeIds.push(recipeId)
+      delete pending.failures[recipeId]
+    } catch (e) {
+      pending.failures[recipeId] =
+        e instanceof Error ? e.message : String(e)
     }
+    pending.lastAttemptAt = new Date().toISOString()
+    upsertPendingRevocation(kv, pending)
   }
 
+  // 4. The friend record goes regardless — the pending snapshot keeps
+  // everything a resume needs — and the channel stays disconnected.
   removeFriend(friendDid, kv)
   disconnectFriendChannel(friendDid)
+
+  if (Object.keys(pending.failures).length === 0) {
+    dropPendingRevocation(kv, friendDid)
+    return
+  }
+  const names = Object.keys(pending.failures).join(', ')
+  throw new Error(
+    `Could not finish removing that friend: ${Object.keys(pending.failures).length} recipe(s) still need re-keying (${names}). They will be retried on the next launch.`,
+  )
+}
+
+/**
+ * Finish any pending revocations left by an interrupted unfriend
+ * (M-N4): called on startup, before the friends-only sweep. Returns
+ * how many revocations finished and how many recipes are still open.
+ * Never throws — an unfinished revocation stays pending for the next
+ * launch, it never aborts startup.
+ */
+export async function resumePendingRevocations(
+  identity: Identity,
+  kv: KeyValueStore = secretKv,
+  repo: YjsStore = getRepo(),
+): Promise<{ finished: number; stillPending: number }> {
+  let finished = 0
+  const pendings = loadPendingRevocations(kv)
+  for (const pending of pendings) {
+    try {
+      disconnectFriendChannel(pending.friendDid)
+      const index = await getOrCreateIndex(repo)
+      const snap = await index.doc()
+      for (const recipeId of [...pending.recipeIds]) {
+        if (pending.completedRecipeIds.includes(recipeId)) continue
+        try {
+          await revokeFriendFromRecipe(
+            recipeId,
+            pending.friend,
+            identity,
+            kv,
+            repo,
+            snap,
+          )
+          pending.completedRecipeIds.push(recipeId)
+          delete pending.failures[recipeId]
+        } catch (e) {
+          pending.failures[recipeId] =
+            e instanceof Error ? e.message : String(e)
+        }
+        pending.lastAttemptAt = new Date().toISOString()
+        upsertPendingRevocation(kv, pending)
+      }
+      removeFriend(pending.friendDid, kv)
+      disconnectFriendChannel(pending.friendDid)
+      if (Object.keys(pending.failures).length === 0) {
+        dropPendingRevocation(kv, pending.friendDid)
+        finished++
+      }
+    } catch {
+      /* keep pending — the next launch retries */
+    }
+  }
+  return {
+    finished,
+    stillPending: loadPendingRevocations(kv).length,
+  }
+}
+
+/**
+ * Startup friends-only sweep (M1-rel): make every friend's shelf hold
+ * exactly their own current shares — nothing more, nothing less.
+ *
+ * For each recipe in the key vault, for each listed friend: if the
+ * friend is authorized and the shelf copy is not current (missing
+ * payload/envelope/manifest entry, or a stale keyId/hash), republish
+ * it. If the friend is NOT authorized (or the recipe is gone locally),
+ * strip any shelf copy left behind by a failed unpublish/unfriend.
+ * A healthy shelf is read-only: current copies are left untouched,
+ * so the sweep is cheap and idempotent. Pending revocations are
+ * resumed first, so an interrupted unfriend finishes before the
+ * sweep re-checks the shelves.
+ */
+export async function sweepFriendsOnlyShares(
+  identity: Identity,
+  kv: KeyValueStore = secretKv,
+  repo: YjsStore = getRepo(),
+): Promise<{
+  republished: number
+  removed: number
+  revocationsFinished: number
+  failures: { shareId: string; reason: string }[]
+}> {
+  const resume = await resumePendingRevocations(identity, kv, repo)
+  const vault = loadVault(kv)
+  const index = await getOrCreateIndex(repo)
+  const snap = await index.doc()
+  const myName = getDisplayName(kv)
+  let republished = 0
+  let removed = 0
+  const failures: { shareId: string; reason: string }[] = []
+  for (const [recipeId, keyRec] of Object.entries(vault)) {
+    const entry = snap?.recipes[recipeId]
+    const recipe = entry ? await getRecipe(repo, entry.url) : null
+    for (const friend of listFriends(kv)) {
+      try {
+        const doc = await getOrCreateDoc(repo, shelfGuidFor(friend))
+        if (recipe && keyRec.friends.includes(friend.did)) {
+          if (
+            !shelfShareIsCurrent(doc, identity.did, recipeId, keyRec.keyId, friend.did)
+          ) {
+            await publishShare(doc, identity, myName, recipe, recipeId, keyRec, friend.did)
+            republished++
+          }
+        } else {
+          const hasCopy =
+            readPayload(doc, recipeId) !== null ||
+            readEnvelope(doc, recipeId, friend.did) !== null ||
+            readManifestEntry(doc, identity.did, recipeId) !== null
+          if (hasCopy) {
+            await unpublishShare(doc, identity, myName, recipeId, friend.did)
+            removed++
+          }
+        }
+      } catch (e) {
+        failures.push({
+          shareId: recipeId,
+          reason: `${friend.did}: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    }
+    if (!recipe) dropRecipeKey(recipeId, kv)
+  }
+  return { republished, removed, revocationsFinished: resume.finished, failures }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +630,24 @@ export function saveReceivedMap(
   mapping: Record<string, ReceivedMapping>,
 ): void {
   kv.setItem(RECEIVED_KEY, JSON.stringify(mapping))
+  // H4 backfill: a mapping entry without provenance (imported before
+  // provenance existed, or restored from a backup) still marks a
+  // received copy — its owner DID is in the mapping key itself.
+  for (const [key, m] of Object.entries(mapping)) {
+    if (!m || typeof m.localId !== 'string') continue
+    if (getRecipeProvenance(m.localId, kv)) continue
+    const { ownerDid, recipeId } = parseReceivedKey(key)
+    recordReceivedProvenance(
+      m.localId,
+      {
+        ownerDid,
+        ownerName: getFriend(ownerDid, kv)?.name ?? '',
+        recipeId,
+        receivedAt: new Date().toISOString(),
+      },
+      kv,
+    )
+  }
 }
 
 function loadReceived(kv: KeyValueStore): Record<string, ReceivedMapping> {
@@ -317,13 +718,15 @@ export async function importReceivedShares(
     // Failures are reported via onFailure and the loop continues.
     try {
       const doc = await getChannelDoc(friend, repo)
-      const { received, failures } = await processChannel(doc, identity)
+      // M1-sec: this doc is `friend`'s channel — manifests from any
+      // other DID in it are rejected, not imported.
+      const { received, failures } = await processChannel(doc, identity, friend.did)
       for (const f of failures) onFailure?.(f)
       for (const share of received) {
         // Per-share isolation (S9): a share whose decrypted recipe fails
         // validation is skipped and reported, never aborts the import.
         try {
-          await upsertReceived(index, share, mapping, repo)
+          await upsertReceived(index, share, mapping, repo, kv)
           count++
         } catch (e) {
           onFailure?.({
@@ -352,6 +755,7 @@ async function upsertReceived(
   share: ReceivedShare,
   mapping: Record<string, ReceivedMapping>,
   repo: YjsStore,
+  kv: KeyValueStore,
 ): Promise<void> {
   const key = receivedKey(share.ownerDid, share.recipeId)
   const existing = mapping[key]
@@ -369,11 +773,37 @@ async function upsertReceived(
       updatedAt: share.recipe.updatedAt,
     })
     mapping[key] = { localId: summary.id, updatedAt: share.updatedAt }
+    // H4: this local copy is received, not owned — record provenance
+    // so it can never be re-published public or QR-shared onward.
+    recordReceivedProvenance(
+      summary.id,
+      {
+        ownerDid: share.ownerDid,
+        ownerName: share.ownerName,
+        recipeId: share.recipeId,
+        receivedAt: new Date().toISOString(),
+      },
+      kv,
+    )
     return
   }
   if (existing.updatedAt === share.updatedAt) return // already current
   await updateRecipe(repo, index, existing.localId, input)
   existing.updatedAt = share.updatedAt
+  // H4 backfill: an older received copy updated here may predate
+  // provenance — make sure it is marked before the next import ends.
+  if (!getRecipeProvenance(existing.localId, kv)) {
+    recordReceivedProvenance(
+      existing.localId,
+      {
+        ownerDid: share.ownerDid,
+        ownerName: share.ownerName,
+        recipeId: share.recipeId,
+        receivedAt: new Date().toISOString(),
+      },
+      kv,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------

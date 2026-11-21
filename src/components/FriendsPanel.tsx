@@ -72,7 +72,9 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
     if (pairingRef.current) return
     pairingRef.current = true
     try {
-      const rec = await runPairing(identity, myName, inv, null)
+      const rec = await runPairing(identity, myName, inv, null, undefined, undefined, {
+        singleUse: true,
+      })
       setStatus(`You are now friends with ${rec.name || shortDid(rec.did)}.`)
       await joinFriendChannel(rec)
       await importReceivedShares(identity)
@@ -95,7 +97,10 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
       // Scanned or pasted, the text takes the exact same parse path.
       const inv = parseFriendInvite(text ?? joinCode)
       setDisplayName(myName)
-      const rec = await runPairing(identity, myName, inv, inv.did)
+      const rec = await runPairing(identity, myName, inv, inv.did, undefined, undefined, {
+        singleUse: true,
+        expectedPeerName: inv.name,
+      })
       setStatus(`You are now friends with ${rec.name || shortDid(rec.did)}.`)
       await joinFriendChannel(rec)
       const n = await importReceivedShares(identity)

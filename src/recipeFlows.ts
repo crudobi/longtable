@@ -20,7 +20,9 @@ import {
   unpublishRecipe,
 } from './public/publish'
 import { AtprotoClient, loadSession, saveSession } from './public/atproto'
-import type { Identity } from './identity/identity'
+import { getRecipeProvenance, receivedRecipeRefusal } from './friends/provenance'
+import { secretKv } from './secrets/secretStore'
+import type { Identity, KeyValueStore } from './identity/identity'
 import type { Recipe, VisibilityTier } from './types'
 
 /**
@@ -43,6 +45,12 @@ export interface FlowContext {
    * be taken down ('the copies shared with friends', 'the public copy').
    */
   onRemoteProblem?: (label: string) => void
+  /**
+   * Store the provenance check reads (H4). Defaults to the app's
+   * secret store — the same store importReceivedShares records
+   * provenance into. Tests pass their injected store here.
+   */
+  kv?: KeyValueStore
 }
 
 /**
@@ -139,6 +147,11 @@ export async function applyVisibilityFlow(
   }
 
   if (tier === 'public') {
+    // H4: a recipe received from a friend is not this device's to
+    // publish — checked before any session or network step, so the
+    // refusal is the same for the UI and the localhost API.
+    const provenance = getRecipeProvenance(id, ctx.kv ?? secretKv)
+    if (provenance) throw new Error(receivedRecipeRefusal(provenance))
     const session = loadSession()
     if (!session || !idn) throw new VisibilitySessionError()
     const client = new AtprotoClient(session.pdsUrl, {

@@ -86,6 +86,41 @@ export function getRecipeKey(
   return loadVault(kv)[recipeId]
 }
 
+/**
+ * Build a fresh key record for `recipeId` WITHOUT saving it (M7
+ * rotate atomicity): the caller publishes under the candidate first and
+ * only commits it to the vault — via saveRecipeKeyRecord — once every
+ * authorized friend holds the new payload. A crash or a failed publish
+ * mid-loop therefore leaves the vault on the old key, whose payloads
+ * are still valid, instead of stranding friends on envelopes for a key
+ * the owner no longer has.
+ */
+export async function newRecipeKeyRecord(
+  prev: RecipeKeyRecord | undefined,
+  friends: string[],
+): Promise<RecipeKeyRecord> {
+  await cryptoReady()
+  return {
+    keyId: crypto.randomUUID(),
+    key: u8ToBase64(sodium.randombytes_buf(sodium.crypto_secretbox_KEYBYTES)),
+    version: (prev?.version ?? 0) + 1,
+    friends: [...friends],
+  }
+}
+
+/** Commit a key record to the vault (the second half of a staged rotate). */
+export async function saveRecipeKeyRecord(
+  recipeId: string,
+  rec: RecipeKeyRecord,
+  kv: KeyValueStore = secretKv,
+): Promise<void> {
+  const vault = loadVault(kv)
+  vault[recipeId] = rec
+  saveVault(vault, kv)
+  // See ensureRecipeKey: the rotated key must be durable before use.
+  await flushSecrets()
+}
+
 /** Get the recipe's current key, creating version 1 on first share. */
 export async function ensureRecipeKey(
   recipeId: string,
@@ -119,19 +154,10 @@ export async function rotateRecipeKey(
   friends: string[],
   kv: KeyValueStore = secretKv,
 ): Promise<RecipeKeyRecord> {
-  await cryptoReady()
   const vault = loadVault(kv)
   const prev = vault[recipeId]
-  const rec: RecipeKeyRecord = {
-    keyId: crypto.randomUUID(),
-    key: u8ToBase64(sodium.randombytes_buf(sodium.crypto_secretbox_KEYBYTES)),
-    version: (prev?.version ?? 0) + 1,
-    friends: [...friends],
-  }
-  vault[recipeId] = rec
-  saveVault(vault, kv)
-  // See ensureRecipeKey: the rotated key must be durable before use.
-  await flushSecrets()
+  const rec = await newRecipeKeyRecord(prev, friends)
+  await saveRecipeKeyRecord(recipeId, rec, kv)
   return rec
 }
 
@@ -221,6 +247,16 @@ export interface ShelfShareRef {
   recipeId: string
   keyId: string
   updatedAt: string
+  /**
+   * BLAKE2b-256 hex of the payload ciphertext bytes (M1-sec). The
+   * manifest (and the per-recipe manifest entry) binds the exact
+   * ciphertext bytes, so a room peer replaying an older payload under
+   * the same keyId — or swapping in different bytes — fails the hash
+   * check instead of decrypting stale content. Absent on manifests
+   * written by pre-fix builds (compat: the hash check is skipped
+   * only when neither the ref nor the payload carries one).
+   */
+  payloadHash?: string
 }
 
 export interface ShelfManifest {
@@ -238,8 +274,38 @@ export interface SharePayloadEntry {
   ownerDid: string
   keyId: string
   updatedAt: string
+  /** BLAKE2b-256 hex of the ciphertext bytes (M1-sec; see ShelfShareRef). */
+  payloadHash?: string
   /** base64 secretbox ciphertext (nonce‖ct) of the serialized recipe. */
   ciphertext: string
+}
+
+/**
+ * One share's manifest entry (M-N1): a single Y.Map key per recipe,
+ * signed on its own. Publishing a recipe writes exactly this key — no
+ * read of the existing manifest, no rewrite of the whole share list —
+ * so two owner devices publishing different recipes to the same friend
+ * can no longer race on one manifest key (Yjs map LWW) and lose the
+ * loser's share ref while its payload + envelope stay, undiscoverable.
+ * The whole-manifest key (`manifest:<did>`) is still written as a
+ * legacy index for pre-fix readers, and still read as a fallback, but
+ * it is no longer the authoritative record of what is shared.
+ */
+export interface ShelfManifestEntry {
+  did: string
+  name: string
+  share: ShelfShareRef
+  updatedAt: string
+  /** Base64 detached Ed25519 signature over the canonical entry bytes. */
+  sig: string
+}
+
+/** BLAKE2b-256 hex of the raw ciphertext bytes behind a base64 payload. */
+export async function payloadHashFor(ciphertextB64: string): Promise<string> {
+  await cryptoReady()
+  return sodium.to_hex(
+    sodium.crypto_generichash(32, base64ToU8(ciphertextB64), null),
+  )
 }
 
 export interface KeyEnvelope {
@@ -320,6 +386,120 @@ function writeManifest(doc: Y.Doc, m: ShelfManifest): void {
   })
 }
 
+// --- Per-recipe manifest entries (M-N1) ---------------------------------
+
+export const manifestEntryKey = (did: string, recipeId: string): string =>
+  `manifest-entry:${did}:${recipeId}`
+
+/** Canonical bytes a manifest-entry signature covers (everything except `sig`). */
+function manifestEntryBytes(e: Omit<ShelfManifestEntry, 'sig'>): Uint8Array {
+  return utf8ToU8(
+    JSON.stringify({
+      did: e.did,
+      name: e.name,
+      share: e.share,
+      updatedAt: e.updatedAt,
+    }),
+  )
+}
+
+export async function buildManifestEntry(
+  identity: Identity,
+  name: string,
+  share: ShelfShareRef,
+): Promise<ShelfManifestEntry> {
+  const base = {
+    did: identity.did,
+    name,
+    share,
+    updatedAt: new Date().toISOString(),
+  }
+  const sig = await signDetached(identity, manifestEntryBytes(base))
+  return { ...base, sig: u8ToBase64(sig) }
+}
+
+export async function verifyManifestEntry(e: ShelfManifestEntry): Promise<boolean> {
+  if (typeof e.sig !== 'string') return false
+  try {
+    return await verifyDetached(e.did, manifestEntryBytes(e), base64ToU8(e.sig))
+  } catch {
+    return false
+  }
+}
+
+export function readManifestEntry(
+  doc: Y.Doc,
+  did: string,
+  recipeId: string,
+): ShelfManifestEntry | null {
+  return readJson<ShelfManifestEntry>(doc, manifestEntryKey(did, recipeId))
+}
+
+function writeManifestEntry(doc: Y.Doc, e: ShelfManifestEntry): void {
+  doc.transact(() => {
+    shelfMap(doc).set(manifestEntryKey(e.did, e.share.recipeId), JSON.stringify(e))
+  })
+}
+
+function deleteManifestEntry(doc: Y.Doc, did: string, recipeId: string): void {
+  doc.transact(() => {
+    shelfMap(doc).delete(manifestEntryKey(did, recipeId))
+  })
+}
+
+/**
+ * All per-recipe manifest entries in the shelf doc, plus the keys whose
+ * values could not be parsed or are not well-formed entries. Unparseable
+ * entries are REPORTED (M-N1), never silently skipped the way
+ * allManifests used to skip unparseable whole manifests.
+ */
+export function allManifestEntries(doc: Y.Doc): {
+  entries: ShelfManifestEntry[]
+  corruptKeys: string[]
+} {
+  const entries: ShelfManifestEntry[] = []
+  const corruptKeys: string[] = []
+  shelfMap(doc).forEach((raw, key) => {
+    if (!key.startsWith('manifest-entry:') || typeof raw !== 'string') return
+    try {
+      const e = JSON.parse(raw) as ShelfManifestEntry
+      if (
+        e &&
+        typeof e === 'object' &&
+        typeof e.did === 'string' &&
+        typeof e.name === 'string' &&
+        e.share &&
+        typeof e.share === 'object' &&
+        typeof (e.share as ShelfShareRef).shareId === 'string' &&
+        typeof (e.share as ShelfShareRef).recipeId === 'string' &&
+        typeof (e.share as ShelfShareRef).keyId === 'string' &&
+        typeof e.sig === 'string'
+      ) {
+        entries.push(e)
+      } else {
+        corruptKeys.push(key)
+      }
+    } catch {
+      corruptKeys.push(key)
+    }
+  })
+  return { entries, corruptKeys }
+}
+
+/** Whole-manifest (`manifest:<did>`) keys whose value is not valid JSON. */
+export function allManifestCorruptKeys(doc: Y.Doc): string[] {
+  const out: string[] = []
+  shelfMap(doc).forEach((raw, key) => {
+    if (!key.startsWith('manifest:') || typeof raw !== 'string') return
+    try {
+      JSON.parse(raw)
+    } catch {
+      out.push(key)
+    }
+  })
+  return out
+}
+
 export function readPayload(doc: Y.Doc, shareId: string): SharePayloadEntry | null {
   return readJson<SharePayloadEntry>(doc, payloadKey(shareId))
 }
@@ -367,12 +547,14 @@ export async function publishShare(
 ): Promise<void> {
   const ciphertext = await encryptRecipePayload(keyRec.key, recipe)
   const sealedKey = await wrapKeyForDid(keyRec.key, friendDid)
+  const hash = await payloadHashFor(ciphertext)
   const payload: SharePayloadEntry = {
     shareId: recipeId,
     recipeId,
     ownerDid: identity.did,
     keyId: keyRec.keyId,
     updatedAt: recipe.updatedAt,
+    payloadHash: hash,
     ciphertext,
   }
   const envelope: KeyEnvelope = {
@@ -382,24 +564,37 @@ export async function publishShare(
     keyId: keyRec.keyId,
     sealedKey,
   }
+  const shareRef: ShelfShareRef = {
+    shareId: recipeId,
+    recipeId,
+    keyId: keyRec.keyId,
+    updatedAt: recipe.updatedAt,
+    payloadHash: hash,
+  }
   doc.transact(() => {
     const map = shelfMap(doc)
     map.set(payloadKey(recipeId), JSON.stringify(payload))
     map.set(envelopeKey(recipeId, friendDid), JSON.stringify(envelope))
   })
-  // Refresh my manifest, preserving other shares already listed in it.
-  const existing = readManifest(doc, identity.did)
-  const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
-  shares.push({
-    shareId: recipeId,
-    recipeId,
-    keyId: keyRec.keyId,
-    updatedAt: recipe.updatedAt,
-  })
-  writeManifest(doc, await buildManifest(identity, myName, shares))
+  // Authoritative record (M-N1): one signed entry for this recipe only.
+  // No read of any existing manifest, so a concurrent publish of a
+  // different recipe to the same friend cannot lose this share ref.
+  await writeManifestEntry(doc, await buildManifestEntry(identity, myName, shareRef))
+  // Legacy whole-manifest index, best-effort: pre-fix readers still
+  // need it, but its read-modify-write can no longer lose a share —
+  // the per-recipe entry above is authoritative. A corrupt legacy
+  // manifest must never fail this publish.
+  try {
+    const existing = readManifest(doc, identity.did)
+    const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
+    shares.push(shareRef)
+    writeManifest(doc, await buildManifest(identity, myName, shares))
+  } catch {
+    /* legacy index unavailable — the per-recipe entry stands alone */
+  }
 }
 
-/** Remove a recipe's payload/envelope/manifest ref from a shelf doc. */
+/** Remove a recipe's payload/envelope/manifest refs from a shelf doc. */
 export async function unpublishShare(
   doc: Y.Doc,
   identity: Identity,
@@ -412,9 +607,42 @@ export async function unpublishShare(
     map.delete(payloadKey(recipeId))
     map.delete(envelopeKey(recipeId, friendDid))
   })
-  const existing = readManifest(doc, identity.did)
-  const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
-  writeManifest(doc, await buildManifest(identity, myName, shares))
+  deleteManifestEntry(doc, identity.did, recipeId)
+  try {
+    const existing = readManifest(doc, identity.did)
+    const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
+    writeManifest(doc, await buildManifest(identity, myName, shares))
+  } catch {
+    /* legacy index unavailable — the per-recipe entry is already gone */
+  }
+}
+
+/**
+ * Is the shelf copy of `recipeId` for `friendDid` exactly the current
+ * version — manifest entry (or legacy manifest ref) + payload +
+ * envelope all present, all citing `keyId`, payload hash matching?
+ * The startup sweep (M1-rel) uses this so a healthy shelf is left
+ * untouched and only a missing/stale/mismatched copy is republished.
+ */
+export function shelfShareIsCurrent(
+  doc: Y.Doc,
+  ownerDid: string,
+  recipeId: string,
+  keyId: string,
+  friendDid: string,
+): boolean {
+  const entry = readManifestEntry(doc, ownerDid, recipeId)
+  const ref =
+    entry?.share ??
+    readManifest(doc, ownerDid)?.shares.find((s) => s.recipeId === recipeId)
+  if (!ref || ref.keyId !== keyId) return false
+  const payload = readPayload(doc, recipeId)
+  if (!payload || payload.keyId !== keyId) return false
+  if (payload.ownerDid !== ownerDid) return false
+  if (ref.payloadHash && payload.payloadHash !== ref.payloadHash) return false
+  const envelope = readEnvelope(doc, recipeId, friendDid)
+  if (!envelope || envelope.keyId !== keyId || envelope.to !== friendDid) return false
+  return true
 }
 
 export interface ReceivedShare {
@@ -438,24 +666,88 @@ export interface ProcessFailure {
  * verify its signature, then for each listed share open my key envelope
  * and decrypt the payload. Anything I am not authorized for lands in
  * `failures` with an explicit reason — never silently, never partially.
+ *
+ * Binding (M1-sec): a share is accepted only when the manifest ref, the
+ * payload, and the envelope agree on shareId/recipeId/keyId AND on the
+ * payload hash — the manifest's payloadHash is the BLAKE2b-256 of the
+ * exact ciphertext bytes, so a replayed older payload under the same
+ * keyId, or bytes swapped under a current manifest, fails closed. The
+ * payload must name the manifest's DID as its owner and the envelope
+ * must name me. When `expectedOwnerDid` is given (the friend whose
+ * channel this doc is — importReceivedShares always passes it), a
+ * manifest from any other DID is rejected: a per-pair channel doc must
+ * only ever carry that friend's shares.
+ *
+ * Sources (M-N1): per-recipe manifest entries are the authoritative
+ * record; the legacy whole manifest is still honored for pre-fix docs.
+ * A share listed by either source is imported once. But fail-closed
+ * cuts both ways: if EITHER source lists a share and fails its
+ * signature check, the share is NOT imported via the other source —
+ * a tampered legacy manifest still blocks the share, exactly as
+ * before. Unparseable manifest keys (either kind) are reported as
+ * failures, never silently skipped.
  */
 export async function processChannel(
   doc: Y.Doc,
   identity: Identity,
+  expectedOwnerDid?: string,
 ): Promise<{ received: ReceivedShare[]; failures: ProcessFailure[] }> {
   const received: ReceivedShare[] = []
   const failures: ProcessFailure[] = []
+  const fail = (shareId: string, reason: string): void => {
+    failures.push({ shareId, reason })
+  }
+
+  // One share, possibly listed by two sources: `failed` once set by a
+  // bad signature in either source blocks the import outright.
+  interface ShareState {
+    did: string
+    ref: ShelfShareRef
+    failed: boolean
+  }
+  const states = new Map<string, ShareState>()
+  const stateKey = (did: string, shareId: string): string => `${did}:${shareId}`
+  const addRef = (did: string, ref: ShelfShareRef, ok: boolean, badReason: string): void => {
+    const key = stateKey(did, ref.shareId)
+    const existing = states.get(key)
+    if (!existing) {
+      states.set(key, { did, ref, failed: !ok })
+      if (!ok) fail(ref.shareId, badReason)
+      return
+    }
+    if (!ok) {
+      existing.failed = true
+      fail(ref.shareId, badReason)
+    }
+  }
+
+  // Unparseable manifest keys are failures, not silent skips (M-N1).
+  for (const key of allManifestCorruptKeys(doc)) {
+    fail(key, 'shelf manifest is unparseable')
+  }
+  const { entries, corruptKeys } = allManifestEntries(doc)
+  for (const key of corruptKeys) {
+    fail(key, 'shelf manifest entry is unparseable')
+  }
+
   for (const manifest of allManifests(doc)) {
     if (manifest.did === identity.did) continue
     // One poisoned manifest must never abort the other friends' imports
     // (S7): everything per-manifest runs inside this try, and any throw
     // lands in failures under the manifest's DID — never propagates.
     try {
+      if (expectedOwnerDid && manifest.did !== expectedOwnerDid) {
+        fail(
+          `manifest:${manifest.did}`,
+          `manifest from ${manifest.did} is not from the expected friend ${expectedOwnerDid}`,
+        )
+        continue
+      }
       if (!Array.isArray(manifest.shares)) {
-        failures.push({
-          shareId: `manifest:${manifest.did}`,
-          reason: `manifest from ${manifest.did} lists no shares array`,
-        })
+        fail(
+          `manifest:${manifest.did}`,
+          `manifest from ${manifest.did} lists no shares array`,
+        )
         continue
       }
       if (!(await verifyManifest(manifest))) {
@@ -466,67 +758,153 @@ export async function processChannel(
             typeof (raw as { shareId?: unknown }).shareId === 'string'
               ? (raw as { shareId: string }).shareId
               : `manifest:${manifest.did}`
-          failures.push({
-            shareId,
-            reason: `manifest signature from ${manifest.did} did not verify`,
-          })
+          fail(shareId, `manifest signature from ${manifest.did} did not verify`)
+          // Mark the share failed so a per-recipe entry for the same
+          // share cannot rescue a tampered whole manifest.
+          const ref =
+            raw && typeof raw === 'object'
+              ? (raw as ShelfShareRef)
+              : { shareId, recipeId: shareId, keyId: '', updatedAt: '' }
+          const key = stateKey(manifest.did, shareId)
+          const existing = states.get(key)
+          if (existing) existing.failed = true
+          else states.set(key, { did: manifest.did, ref, failed: true })
         }
         continue
       }
       for (const ref of manifest.shares) {
         if (!ref || typeof ref !== 'object' || typeof ref.shareId !== 'string') {
-          failures.push({
-            shareId: `manifest:${manifest.did}`,
-            reason: `manifest from ${manifest.did} lists a malformed share reference`,
-          })
+          fail(
+            `manifest:${manifest.did}`,
+            `manifest from ${manifest.did} lists a malformed share reference`,
+          )
           continue
         }
-        const payload = readPayload(doc, ref.shareId)
-        if (!payload) {
-          failures.push({ shareId: ref.shareId, reason: 'payload missing from shelf' })
-          continue
-        }
-        const envelope = readEnvelope(doc, ref.shareId, identity.did)
-        if (!envelope) {
-          failures.push({
-            shareId: ref.shareId,
-            reason: 'no key envelope addressed to me (not authorized)',
-          })
-          continue
-        }
-        if (envelope.keyId !== payload.keyId || envelope.keyId !== ref.keyId) {
-          failures.push({
-            shareId: ref.shareId,
-            reason: 'key id mismatch between manifest, payload, and envelope',
-          })
-          continue
-        }
-        try {
-          const keyB64 = await unwrapKey(identity, envelope.sealedKey)
-          const recipe = await decryptRecipePayload(keyB64, payload.ciphertext)
-          received.push({
-            ownerDid: manifest.did,
-            ownerName: manifest.name,
-            shareId: ref.shareId,
-            recipeId: ref.recipeId,
-            keyId: ref.keyId,
-            updatedAt: payload.updatedAt,
-            recipe,
-          })
-        } catch (e) {
-          failures.push({
-            shareId: ref.shareId,
-            reason: `decryption failed: ${e instanceof Error ? e.message : String(e)}`,
-          })
-        }
+        addRef(manifest.did, ref, true, '')
       }
     } catch (e) {
-      failures.push({
-        shareId: `manifest:${manifest.did}`,
-        reason: `manifest from ${manifest.did} could not be processed: ${
+      fail(
+        `manifest:${manifest.did}`,
+        `manifest from ${manifest.did} could not be processed: ${
           e instanceof Error ? e.message : String(e)
         }`,
-      })
+      )
+    }
+  }
+
+  for (const entry of entries) {
+    if (entry.did === identity.did) continue
+    try {
+      if (expectedOwnerDid && entry.did !== expectedOwnerDid) {
+        fail(
+          `manifest:${entry.did}`,
+          `manifest entry from ${entry.did} is not from the expected friend ${expectedOwnerDid}`,
+        )
+        const key = stateKey(entry.did, entry.share.shareId)
+        const existing = states.get(key)
+        if (existing) existing.failed = true
+        else
+          states.set(key, { did: entry.did, ref: entry.share, failed: true })
+        continue
+      }
+      const ok = await verifyManifestEntry(entry)
+      addRef(
+        entry.did,
+        entry.share,
+        ok,
+        `manifest entry signature from ${entry.did} did not verify`,
+      )
+    } catch (e) {
+      fail(
+        `manifest:${entry.did}`,
+        `manifest entry from ${entry.did} could not be processed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      )
+    }
+  }
+
+  for (const state of states.values()) {
+    if (state.failed) continue
+    const { did, ref } = state
+    try {
+      const payload = readPayload(doc, ref.shareId)
+      if (!payload) {
+        fail(ref.shareId, 'payload missing from shelf')
+        continue
+      }
+      const envelope = readEnvelope(doc, ref.shareId, identity.did)
+      if (!envelope) {
+        fail(ref.shareId, 'no key envelope addressed to me (not authorized)')
+        continue
+      }
+      if (envelope.keyId !== payload.keyId || envelope.keyId !== ref.keyId) {
+        fail(ref.shareId, 'key id mismatch between manifest, payload, and envelope')
+        continue
+      }
+      // DID + content binding (M1-sec): the payload must be the exact
+      // bytes the manifest vouches for, owned by the manifest's DID.
+      if (payload.ownerDid !== did) {
+        fail(ref.shareId, 'payload owner does not match the manifest DID')
+        continue
+      }
+      if (payload.shareId !== ref.shareId || payload.recipeId !== ref.recipeId) {
+        fail(ref.shareId, 'payload does not match the manifest reference')
+        continue
+      }
+      if (payload.updatedAt !== ref.updatedAt) {
+        fail(ref.shareId, 'payload version does not match the manifest')
+        continue
+      }
+      if (envelope.to !== identity.did) {
+        fail(ref.shareId, 'key envelope is not addressed to me')
+        continue
+      }
+      if (ref.payloadHash) {
+        if (!payload.payloadHash || payload.payloadHash !== ref.payloadHash) {
+          fail(ref.shareId, 'payload hash does not match the manifest')
+          continue
+        }
+        const actual = await payloadHashFor(payload.ciphertext)
+        if (actual !== ref.payloadHash) {
+          fail(ref.shareId, 'payload bytes do not match the manifest hash')
+          continue
+        }
+      } else if (payload.payloadHash) {
+        const actual = await payloadHashFor(payload.ciphertext)
+        if (actual !== payload.payloadHash) {
+          fail(ref.shareId, 'payload bytes do not match the payload hash')
+          continue
+        }
+      }
+      try {
+        const keyB64 = await unwrapKey(identity, envelope.sealedKey)
+        const recipe = await decryptRecipePayload(keyB64, payload.ciphertext)
+        received.push({
+          ownerDid: did,
+          ownerName:
+            entries.find((e) => e.did === did)?.name ??
+            allManifests(doc).find((m) => m.did === did)?.name ??
+            '',
+          shareId: ref.shareId,
+          recipeId: ref.recipeId,
+          keyId: ref.keyId,
+          updatedAt: payload.updatedAt,
+          recipe,
+        })
+      } catch (e) {
+        fail(
+          ref.shareId,
+          `decryption failed: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+    } catch (e) {
+      fail(
+        ref.shareId,
+        `share from ${did} could not be processed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      )
     }
   }
   return { received, failures }
