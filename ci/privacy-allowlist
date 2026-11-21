@@ -26,6 +26,18 @@ hub/hub.mjs	^172\.16\.0\.0$
 hub/hub.mjs	^172\.31\.255\.255$
 hub/hub.mjs	^192\.168\.0\.0$
 hub/hub.mjs	^192\.168\.255\.255$
+# TURN deny-list ranges in e2e/run-fleet.sh (Wave 4 merge fixup,
+# 2026-11-21): the test-rig TURN relay's denied-peer-ip list (M17) is
+# the SAME ranges as hub/hub.mjs DENIED_PEER_RANGES above (audit b2) —
+# IETF-reserved ranges, identical on every network; not the dev LAN.
+# The merge is the first tree holding both 4C's deny lines and 4E's
+# pinned scanner, which is why CI failed at secret-scan on e61ff93.
+e2e/run-fleet.sh	^10\.0\.0\.0$
+e2e/run-fleet.sh	^10\.255\.255\.255$
+e2e/run-fleet.sh	^172\.16\.0\.0$
+e2e/run-fleet.sh	^172\.31\.255\.255$
+e2e/run-fleet.sh	^192\.168\.0\.0$
+e2e/run-fleet.sh	^192\.168\.255\.255$
 # GitHub SSH remote user@host. Public service endpoint, not a personal
 # email; appears in origin-URL handling.
 *	^git@github\.com$
