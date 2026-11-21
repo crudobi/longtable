@@ -298,12 +298,35 @@ export async function importReceivedShares(
   const mapping = loadReceived(kv)
   let count = 0
   for (const friend of listFriends(kv)) {
-    const doc = await getChannelDoc(friend, repo)
-    const { received, failures } = await processChannel(doc, identity)
-    for (const f of failures) onFailure?.(f)
-    for (const share of received) {
-      await upsertReceived(index, share, mapping, repo)
-      count++
+    // Per-friend isolation (S7): a poisoned channel — or a channel that
+    // fails to load at all — must not abort the other friends' imports.
+    // Failures are reported via onFailure and the loop continues.
+    try {
+      const doc = await getChannelDoc(friend, repo)
+      const { received, failures } = await processChannel(doc, identity)
+      for (const f of failures) onFailure?.(f)
+      for (const share of received) {
+        // Per-share isolation (S9): a share whose decrypted recipe fails
+        // validation is skipped and reported, never aborts the import.
+        try {
+          await upsertReceived(index, share, mapping, repo)
+          count++
+        } catch (e) {
+          onFailure?.({
+            shareId: share.shareId,
+            reason: `share could not be saved: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          })
+        }
+      }
+    } catch (e) {
+      onFailure?.({
+        shareId: `friend:${friend.did}`,
+        reason: `channel for ${friend.did} could not be processed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      })
     }
   }
   kv.setItem(RECEIVED_KEY, JSON.stringify(mapping))

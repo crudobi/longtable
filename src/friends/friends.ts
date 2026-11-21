@@ -11,8 +11,15 @@
  *      hash (v2), so a copied DID — or a hello replayed from another
  *      pairing — can't impersonate anyone.
  *   3. Both persist a friend record and derive a persistent friend channel:
- *      a y-webrtc room whose name and password come from the pair secret
- *      (known only to the two devices, exchanged out-of-band in the invite).
+ *      a y-webrtc room whose password comes from the pair secret (known
+ *      only to the two devices, exchanged out-of-band in the invite) and
+ *      whose name/doc is bound to BOTH DIDs as well (channelTag, v2) — so
+ *      two pairings on one reused invite land in different rooms with
+ *      different shelf docs instead of collapsing into one shared channel
+ *      (S8). Records made before this fix carry no channelTag and keep
+ *      the legacy pairId-only derivation, so existing pairings work
+ *      untouched; a new pairing against an older build negotiates down
+ *      to the legacy derivation via the hello's channelVersion.
  *
  * No account, no email, no hub account: the hub is signaling-only, exactly
  * as in Phase 1. Friend records and the pair secret live in localStorage.
@@ -42,6 +49,16 @@ export interface FriendRecord {
   pairSecret: string
   /** BLAKE2b-256 hex of the pair secret; basis for channel room/doc names. */
   pairId: string
+  /**
+   * Symmetric channel tag (S8, v2): `<pairId prefix>-<hash(pairId + both
+   * DIDs, sorted)>`, computed identically by both sides of the pairing.
+   * Two pairings on one reused invite therefore get DIFFERENT rooms/docs
+   * even though they share the pair secret — the guests never share a
+   * shelf, a room password, or a shelf-doc guid. Absent = pre-fix record:
+   * the legacy pairId-only derivation (compat path — existing pairings
+   * keep working untouched).
+   */
+  channelTag?: string
   /** Signaling server both devices met on; channels rejoin through it. */
   signaling: string
   addedAt: string
@@ -167,6 +184,14 @@ interface Hello {
   name: string
   /** base64 detached signature over the v2 hello message (see helloMessage). */
   sig: string
+  /**
+   * Channel-derivation version this side supports (S8). 2 = DID-bound
+   * rooms/docs. Absent = pre-fix build (legacy pairId-only derivation).
+   * Advisory only — NOT covered by the hello signature, so a pairing-room
+   * MITM could force a downgrade to the legacy derivation (exactly the
+   * pre-fix behavior, no worse); it cannot forge a pairing.
+   */
+  channelVersion?: number
 }
 
 const HELLO_MAP = 'pairing'
@@ -223,7 +248,13 @@ export async function runPairing(
       identity,
       helloMessage(invite.room, identity.did, pairId),
     )
-    const mine: Hello = { did: identity.did, name: myName, sig: u8ToBase64(sig) }
+    const mine: Hello = {
+      did: identity.did,
+      name: myName,
+      sig: u8ToBase64(sig),
+      // v2 channel binding (S8): this side derives DID-bound rooms/docs.
+      channelVersion: 2,
+    }
     doc.transact(() => {
       doc.getMap(HELLO_MAP).set(identity.did, JSON.stringify(mine))
     })
@@ -261,6 +292,14 @@ export async function runPairing(
           signaling: invite.signaling,
           addedAt: new Date().toISOString(),
         }
+        // v2 channel binding (S8): only when the peer advertised v2.
+        // Both sides compute the same symmetric tag from the pair secret
+        // and the two DIDs; an older peer sends no channelVersion and the
+        // pairing stays on the legacy derivation, so mixed-version
+        // pairings still connect (on the old, shared-room derivation).
+        if (hello.channelVersion === 2) {
+          rec.channelTag = channelTagFor(pairId, identity.did, hello.did)
+        }
         saveFriend(rec, kv)
         return rec
       }
@@ -283,14 +322,47 @@ const channelProviders = new Map<string, WebrtcProviderType>()
 const observedDocs = new Set<string>()
 const channelListeners = new Set<(friendDid: string) => void>()
 
+/**
+ * FNV-1a-64 hex — same algorithm as hubs.ts legacyMatchHash, copied here
+ * so friends.ts does not depend on a hub-migration helper. Synchronous
+ * (channel derivation runs from sync record lookups, before libsodium
+ * WASM init) and deterministic across engines. NOT a secrecy boundary:
+ * room names transit the signaling server in plaintext; the room
+ * password (pairSecret) is the secret. The hash only binds the room/doc
+ * to the two DIDs.
+ */
+export function didBindingHash(value: string): string {
+  let hash = BigInt('0xcbf29ce484222325')
+  const bytes = new TextEncoder().encode(value)
+  for (const b of bytes) {
+    hash ^= BigInt(b)
+    hash = (hash * BigInt('0x100000001b3')) & BigInt('0xffffffffffffffff')
+  }
+  return hash.toString(16).padStart(16, '0')
+}
+
+/**
+ * Symmetric channel tag for one pairing (S8): identical on both sides,
+ * different for every other DID pair. The two DIDs are sorted so the
+ * inviter and the guest compute the same tag from the same pair secret.
+ * Two pairings on one reused invite therefore land in different rooms
+ * with different shelf docs, even though they share the pair secret.
+ */
+export function channelTagFor(pairId: string, didA: string, didB: string): string {
+  const [lo, hi] = didA < didB ? [didA, didB] : [didB, didA]
+  return `${pairId.slice(0, 32)}-${didBindingHash(`${pairId}:${lo}:${hi}`)}`
+}
+
 /** Local Y.Doc guid for a friend channel's shelf document. */
 export function shelfGuidFor(friend: FriendRecord): string {
-  return `shelf-${friend.pairId.slice(0, 32)}`
+  // v2 (channelTag present): DID-bound doc. Legacy (absent): the
+  // pairId-only doc — existing pairings keep working untouched.
+  return `shelf-${friend.channelTag ?? friend.pairId.slice(0, 32)}`
 }
 
 /** y-webrtc room for a friend channel. */
 export function channelRoomFor(friend: FriendRecord): string {
-  return `longtable-friend-${friend.pairId.slice(0, 32)}`
+  return `longtable-friend-${friend.channelTag ?? friend.pairId.slice(0, 32)}`
 }
 
 /** Subscribe to shelf-doc updates for any friend channel. */
