@@ -29,7 +29,10 @@
  *   4b. Response contract: /recipe/ + /search serve deviceDid,
  *      deviceSignature and deviceKey (bound device public key, standard
  *      base64 — byte-identical to the binding record's devicePublicKey);
- *      the values must match the author's pubkey/self binding record.
+ *      the values must match the recipe's OWN device binding record
+ *      (per-device rkey, resolved from the verified repo CAR — H-N1:
+ *      the client binds per device and never writes the legacy `self`
+ *      record, so `self` names a stale device).
  *   6. Privacy audit: with recipes private / friends-only / public on the
  *      device, the verified repo dump must contain ONLY the public one (+
  *      the pubkey binding). Private and friends-only bytes never left.
@@ -141,6 +144,25 @@ function runVerifier(args) {
   } catch (e) {
     return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` }
   }
+}
+
+// Read-only CAR lookups via the independent verifier (H-N1): the recipe's
+// own device binding, and the recipe record itself. These read the
+// verified repo CAR — the same ground truth `verify` checks — and resolve
+// the binding by deviceDid, at whatever rkey it lives at. Never the legacy
+// `self` rkey: the client binds per device and never writes `self`, so
+// `self` names a stale device. A lookup failure throws: fail closed,
+// never compare against an undefined binding.
+function runBinding(did, rkey) {
+  const v = runVerifier(['binding', did, rkey])
+  if (v.code !== 0) throw new Error(`verifier binding lookup failed for ${did}/${rkey}: ${v.out}`)
+  return JSON.parse(v.out.trim())
+}
+
+function runRecord(did, rkey) {
+  const v = runVerifier(['record', did, rkey])
+  if (v.code !== 0) throw new Error(`verifier record lookup failed for ${did}/${rkey}: ${v.out}`)
+  return JSON.parse(v.out.trim())
 }
 
 /* ---------------- app-side helpers -------------------------------------- */
@@ -341,10 +363,10 @@ async function main() {
     step('verifier: author record fully verifies (repo sig + lexicon + binding + device sig)', v.code === 0)
 
     // ---- 4b. Response contract: /recipe/ serves the signature fields ----
-    const bindingRec = await xrpc(
-      PDS_HOST,
-      `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.pubkey&rkey=self`,
-    )
+    // The reference binding is the recipe's OWN device binding, resolved
+    // from the verified repo CAR (H-N1) — not the legacy `self` record,
+    // which this client never writes and which names a stale device.
+    const binding = runBinding(AUTHOR.did, stewId)
     const fullRes = await fetch(`${APPVIEW}/recipe/${encodeURIComponent(AUTHOR.did)}/${encodeURIComponent(stewId)}`)
     const full = await fullRes.json()
     step(
@@ -357,13 +379,16 @@ async function main() {
     )
     step(
       'contract: deviceKey equals the binding record devicePublicKey',
-      full.deviceKey === bindingRec.json?.value?.devicePublicKey,
+      full.deviceKey === binding.devicePublicKey,
     )
     step(
       'contract: deviceDid equals the binding record deviceDid',
-      full.deviceDid === bindingRec.json?.value?.deviceDid,
+      full.deviceDid === binding.deviceDid,
     )
-    const searchHit = (await appviewSearch({ q: STEW })).find((r) => r.did === AUTHOR.did)
+    // Match by rkey, not just by author DID: the index legitimately holds
+    // genuine stews from several devices/runs (H-N1), each with its own
+    // device fields — the first author hit is not necessarily this stew.
+    const searchHit = (await appviewSearch({ q: STEW })).find((r) => r.did === AUTHOR.did && r.rkey === stewId)
     step(
       'contract: /search summary carries the same signature fields',
       !!searchHit &&
@@ -392,12 +417,17 @@ async function main() {
     // no pubkey binding for Olga's device (and no valid signature of her
     // own), so the mimic must NEVER be indexed — not merely attributed to
     // her. Capture stats first: the drop must show up as signatureRejected.
+    // The mimic claims the genuine CURRENT device (H-N1: the binding
+    // resolved for the fresh stew) — not the stale legacy `self` record.
     const statsBeforeMimic = await appviewStats()
-    const authorPubkey = await xrpc(
-      PDS_HOST,
-      `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.pubkey&rkey=self`,
-    )
-    const authorDeviceDid = authorPubkey.json?.value?.deviceDid
+    const authorDeviceDid = binding.deviceDid
+    // Author rkeys before the mimic: the index legitimately holds genuine
+    // stews from several devices/runs (H-N1), so the attribution check
+    // below compares sets instead of assuming exactly one record.
+    const authorBeforeMimic = (await appviewSearch({ q: STEW }))
+      .filter((r) => r.did === AUTHOR.did)
+      .map((r) => r.rkey)
+      .sort()
     const mimic = await xrpc(PDS_HOST, 'com.atproto.repo.putRecord', {
       method: 'POST',
       token: mallorySession.accessJwt,
@@ -431,9 +461,12 @@ async function main() {
     step('forge: mimic 404s on /recipe/', mimicRecipe.status === 404)
     const afterMimic = await appviewSearch({ q: STEW })
     const authorEntries = afterMimic.filter((r) => r.did === AUTHOR.did)
+    const authorRkeys = authorEntries.map((r) => r.rkey).sort()
     step(
-      'forge: author attribution unchanged (exactly the genuine record)',
-      authorEntries.length === 1 && authorEntries[0].rkey === stewId,
+      'forge: author attribution unchanged (genuine records intact, mimic added none)',
+      authorEntries.some((r) => r.rkey === stewId) &&
+        authorRkeys.length === authorBeforeMimic.length &&
+        authorRkeys.every((rk, i) => rk === authorBeforeMimic[i]),
       `${authorEntries.length} author entr(ies)`,
     )
     const vMimic = runVerifier(['verify', ATTACKER.did, 'mimic-stew'])
@@ -451,10 +484,9 @@ async function main() {
     // check at ingest is the only thing standing between the tamper and
     // search results.
     const authorSession = await createSession(AUTHOR.handle, AUTHOR.password)
-    const genuineRec = await xrpc(
-      PDS_HOST,
-      `com.atproto.repo.getRecord?repo=${encodeURIComponent(AUTHOR.did)}&collection=kitchen.longtable.recipe&rkey=${encodeURIComponent(stewId)}`,
-    )
+    // Read the genuine record from the verified repo CAR — the same
+    // snapshot the verifier just checked — not a live PDS read.
+    const genuineRec = runRecord(AUTHOR.did, stewId)
     const statsBeforeTamper = await appviewStats()
     const tampered = await xrpc(PDS_HOST, 'com.atproto.repo.putRecord', {
       method: 'POST',
@@ -464,8 +496,8 @@ async function main() {
         collection: 'kitchen.longtable.recipe',
         rkey: 'tampered-stew',
         record: {
-          ...genuineRec.json.value,
-          ingredients: [...genuineRec.json.value.ingredients, '1 cup motor oil'],
+          ...genuineRec,
+          ingredients: [...genuineRec.ingredients, '1 cup motor oil'],
         },
       },
     })
@@ -509,7 +541,7 @@ async function main() {
       'privacy audit: public recipe IS in the repo',
       auditText.includes(`kitchen.longtable.recipe/${stewId}`),
     )
-    step('privacy audit: pubkey binding present', auditText.includes('kitchen.longtable.pubkey/self'))
+    step('privacy audit: pubkey binding present', auditText.includes(`kitchen.longtable.pubkey/${binding.rkey}`))
     step(
       'privacy audit: private recipe ABSENT from repo',
       !auditText.includes(PIE),
@@ -535,7 +567,9 @@ async function main() {
     step('unpublish: record gone from PDS', !!goneFromPds.value)
     const goneFromSearch = await pollUntil(async () => {
       const rs = await appviewSearch({ q: STEW })
-      return rs.every((r) => r.did !== AUTHOR.did) ? true : null
+      // This record is gone when no author entry carries ITS rkey — older
+      // genuine stews from other devices/runs (H-N1) legitimately stay.
+      return rs.every((r) => !(r.did === AUTHOR.did && r.rkey === stewId)) ? true : null
     }, 30000, 500)
     step('unpublish: record gone from AppView search', !!goneFromSearch.value)
   } finally {

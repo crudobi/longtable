@@ -18,6 +18,18 @@
  *                               signature with a fresh attacker key, and
  *                               tamper with its contents — both forgeries
  *                               must FAIL verification.
+ *   binding <did> <rkey>        Print (one JSON line) the pubkey binding
+ *                               for the recipe's own device: its rkey,
+ *                               deviceDid and devicePublicKey. Read-only
+ *                               lookup for proofs — resolves the binding
+ *                               by deviceDid from the verified repo CAR,
+ *                               never by the legacy `self` rkey (H-N1:
+ *                               clients bind per device and never write
+ *                               `self`).
+ *   record <did> <rkey>         Print (one JSON line) one recipe record
+ *                               from the verified repo CAR. Read-only
+ *                               lookup for proofs: the verified snapshot
+ *                               the other modes check against.
  *
  * Env: PLC_URL (default http://localhost:2582), PDS_URL (default
  * http://localhost:2583), LEXICONS_DIR (default ../../lexicons).
@@ -298,6 +310,48 @@ async function modeAudit(did) {
   return 0
 }
 
+// Read-only lookups for proofs (H-N1): resolve a recipe's own device
+// binding — or the recipe record itself — from the verified repo CAR,
+// the same ground truth `verify` uses. The binding is found by deviceDid,
+// at whatever rkey it lives at (the per-device rkey, or the legacy `self`
+// record as migration) — never by assuming the `self` rkey.
+async function modeBinding(did, rkey) {
+  await sodium.ready
+  const { records } = await loadVerifiedRepo(did)
+  const entry = records.find((r) => r.collection === 'kitchen.longtable.recipe' && r.rkey === rkey)
+  if (!entry) {
+    console.error(`binding: recipe ${rkey} not found in verified repo`)
+    return 1
+  }
+  const pubkeyEntry = records.find(
+    (r) => r.collection === 'kitchen.longtable.pubkey' && r.record?.deviceDid === entry.record.deviceDid,
+  )
+  if (!pubkeyEntry) {
+    console.error(`binding: no pubkey binding for device ${entry.record.deviceDid} in verified repo`)
+    return 1
+  }
+  console.log(
+    JSON.stringify({
+      rkey: pubkeyEntry.rkey,
+      deviceDid: pubkeyEntry.record.deviceDid,
+      devicePublicKey: pubkeyEntry.record.devicePublicKey,
+    }),
+  )
+  return 0
+}
+
+async function modeRecord(did, rkey) {
+  await sodium.ready
+  const { records } = await loadVerifiedRepo(did)
+  const entry = records.find((r) => r.collection === 'kitchen.longtable.recipe' && r.rkey === rkey)
+  if (!entry) {
+    console.error(`record: recipe ${rkey} not found in verified repo`)
+    return 1
+  }
+  console.log(JSON.stringify(entry.record))
+  return 0
+}
+
 async function modeForgeSelftest(did, rkey) {
   await sodium.ready
   const { records } = await loadVerifiedRepo(did)
@@ -347,8 +401,10 @@ try {
   if (mode === 'verify') code = await modeVerify(did, rkey)
   else if (mode === 'audit') code = await modeAudit(did)
   else if (mode === 'forge-selftest') code = await modeForgeSelftest(did, rkey)
+  else if (mode === 'binding') code = await modeBinding(did, rkey)
+  else if (mode === 'record') code = await modeRecord(did, rkey)
   else {
-    console.error('usage: verify-public.mjs <verify|audit|forge-selftest> <did> [rkey]')
+    console.error('usage: verify-public.mjs <verify|audit|forge-selftest|binding|record> <did> [rkey]')
     code = 2
   }
   process.exit(code)
