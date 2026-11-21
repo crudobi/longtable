@@ -55,3 +55,12 @@ ci/privacy-allowlist	^waflurgiooh$
 # The message scan would otherwise fail on every commit. Any OTHER
 # address in a message still fails the scan.
 *	^crudobi@proton\.me$
+# Wave 5B2 test fixture (2026-11-21): isSafeEndpointUrl assertion
+# expecting false for a credential-embedded loopback URL. The
+# user:pass pair is a placeholder in a test, not a real credential;
+# scoped to this one test file so no other file is exempted.
+src/test/wave5b2.test.ts	^://user:pass@$
+# Self-exemption for the entry above: the allowlist names the
+# matched literal, so it would trip its own scan without this
+# (same shape as the waflurgiooh self-exemption above).
+ci/privacy-allowlist	^://user:pass@$

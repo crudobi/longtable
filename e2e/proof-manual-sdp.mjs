@@ -45,8 +45,8 @@ function sleep(ms) {
 
 async function makeSession(udid) {
   const driver = await remote({
-    hostname: '127.0.0.1',
-    port: 4723,
+    hostname: new URL(APPIUM).hostname,
+    port: Number(new URL(APPIUM).port),
     path: '/',
     logLevel: 'error',
     capabilities: {

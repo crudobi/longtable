@@ -279,7 +279,9 @@ export async function dropDoc(store: YjsStore, guid: string): Promise<void> {
   const cached = store.docs.get(guid)
   store.docs.delete(guid)
   store.pending.delete(guid)
-  if (cached) {
+  if (cached?.persistence) {
+    // Null in degraded mode (L-N3): an in-memory doc has no
+    // IndexedDB database to wipe, so there is nothing to clear.
     await cached.persistence.clearData()
   }
 }
