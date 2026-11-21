@@ -67,33 +67,42 @@ the socket reconnects automatically after a drop.
    the same scheme as `src/public/publish.ts` and the independent
    verifier in `scripts/verify-public` — same canonical BLAKE2b-256 hash,
    same `longtable-pubkey:v1` / `longtable-recipe:v1` messages, same
-   libsodium Ed25519 `verifyDetached`): load the author's
-   `kitchen.longtable.pubkey/self` binding from the same verified CAR,
-   check the binding signature and that the binding's `devicePublicKey`
-   is exactly the key for its `deviceDid`, then check each recipe's
-   `deviceDid` is the bound device and its `deviceSignature` verifies
-   against the bound key over the recomputed canonical hash of the
-   record as served. Records failing any check are dropped and counted
-   (`rejected` + `signatureRejected`), never indexed.
+   libsodium Ed25519 `verifyDetached`): load ALL of the author's
+   `kitchen.longtable.pubkey` bindings from the same verified CAR — one
+   record per device at its per-device rkey
+   (`dev-` + first 32 hex of BLAKE2b-256 of the deviceDid; the legacy
+   single-slot rkey `self` counts as one device's binding, so existing
+   published recipes keep verifying) — check each binding signature and
+   that each binding's `devicePublicKey` is exactly the key for its
+   `deviceDid`, then check each recipe's `deviceSignature` verifies
+   against ITS OWN device's bound key over the recomputed canonical
+   hash of the record as served. Records failing any check are dropped
+   and counted (`rejected` + `signatureRejected`), never indexed.
 
 Reconcile then diffs: upsert verified recipes present in the repo state,
 delete indexed recipes for that DID that are no longer in it — including
-recipes whose device signature stopped verifying (e.g. the author
-rebound to a new device key). Stats keep
+recipes whose device's binding was deleted or stopped verifying
+(deleting a device's binding is that device's revocation; publishing
+from a new device only ADDS a binding and never drops another device's
+recipes — H-N1). Stats keep
 `{indexed, rejected, signatureRejected, sweepSkipped, lastReconcileAt}`; any
 verification failure increments `rejected` and indexes nothing.
 
-Two exceptions to the sweep, both fail-closed the other way. First, a
-*missing* pubkey binding (`missing-binding`: the binding record is simply
-absent from the fetched CAR) is ambiguous — the binding commit may not
-have arrived yet, the CAR may be partial, or the publisher may have no
-binding at all — so reconcile rejects the DID's new records but SKIPS
-the sweep-delete and keeps previously-verified rows until they are
-re-verified (N1 / M-N5). Any other binding failure (invalid key, bad
-binding signature, key mismatch) is positive evidence the binding is
-wrong, so the sweep runs as before. A verified-EMPTY repo state (no
-binding and no recipe records) is the author's deletion, so its sweep
-runs too. Second, reconcile fires on firehose events only by default,
+Two exceptions to the sweep, both fail-closed the other way. First, NO
+pubkey binding at all (`missing-binding`: no binding record at any
+accepted rkey in the fetched CAR) is ambiguous — a binding commit may
+not have arrived yet, the CAR may be partial, or the publisher may
+have no binding at all — so reconcile rejects the DID's new records
+but SKIPS the sweep-delete and keeps previously-verified rows until
+they are re-verified (N1 / M-N5). A recipe whose device has no binding
+while OTHER devices are bound is different: that device specifically
+is unbound (its binding was deleted or never existed), so its records
+are rejected and their rows ARE swept. Any other binding failure
+(invalid key, bad binding signature, key mismatch) is positive
+evidence the binding is wrong, so the sweep runs as before. A
+verified-EMPTY repo state (no binding and no recipe records) is the
+author's deletion, so its sweep runs too. Second, reconcile fires on
+firehose events only by default,
 which never heals a dormant author — so a **startup reconcile** plus an
 **hourly periodic sweep** (`reconcileAllDids`, interval
 `APPVIEW_RECONCILE_INTERVAL_MS`, default 3600000) re-verifies every
@@ -122,8 +131,10 @@ not this sweep — the sweep only revisits DIDs already in the index.
   device key never leaves the author's phone, the AppView recomputes the
   canonical hash from the served bytes and verifies the detached
   signature against the bound key, and any mismatch is dropped and
-  counted in `signatureRejected`. Rebinding to a new device key drops
-  recipes signed by the old one.
+  counted in `signatureRejected`. Rebinding is additive: a new device
+  publishes its own binding and its recipes index alongside the old
+  device's — only DELETING a device's binding drops that device's
+  recipes (its revocation).
 - **Cannot resurrect or hide deletions.** Because reconcile diffs against
   the full verified state, a record deleted from the repo disappears from
   the index at the next reconcile of that DID, no matter what any
@@ -186,11 +197,16 @@ exactly as in the recipe record, over
 `hashHex` is the BLAKE2b-256 hex of the canonical JSON array — see
 `device-signature.mjs`), and `deviceKey` (standard padded base64 of the
 32-byte Ed25519 device public key — byte-identical to the `devicePublicKey`
-field of the author's `kitchen.longtable.pubkey/self` binding record, NOT
-the did:key string and NOT hex). A client verifies by checking the
+field of the author's `kitchen.longtable.pubkey` binding record for THAT
+recipe's device — one record per device since H-N1, the legacy `self`
+record being one device's binding — NOT the did:key string and NOT hex). A client verifies by checking the
 did:key derived from `deviceKey` equals `deviceDid`, recomputing the
 canonical hash from the served record fields, and verifying the detached
-signature against `deviceKey`.
+signature against `deviceKey`. Since S3/H-N4 the client does not stop
+there: it fetches the binding for the recipe's deviceDid directly from
+the author's PDS and verifies the binding signature itself (see
+`src/public/binding.ts`), so a hub that substitutes its own key is
+detected — the served `deviceKey` must equal the PDS-bound key.
 
 DIDs in paths may be sent raw (`did:plc:...`) or URL-encoded.
 

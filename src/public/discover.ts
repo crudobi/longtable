@@ -14,7 +14,8 @@
  * `results`/`recipes`/bare-array envelopes) so the client tolerates the
  * hub's exact envelope choices.
  *
- * Verification (review C2, 2026-11-15) — TRUST SPLIT, read before touching:
+ * Verification (review C2, 2026-11-15; binding channel S3/H-N4,
+ * 2026-11-21) — TRUST SPLIT, read before touching:
  *
  *   fetchPublicRecipe verifies the full record BEFORE it is returned (and
  *   therefore before anything displays it), and FAILS CLOSED: any missing
@@ -24,16 +25,24 @@
  *   PDS forgery and AppView data tampering/corruption — the signature is
  *   recomputed from the record exactly as served.
  *
- *   What this check does NOT do: it does not verify the deviceDid↔
- *   deviceKey binding itself. That binding (the `kitchen.longtable.pubkey`
- *   /self record, signed over
- *   `longtable-pubkey:v1\n<accountDid>\n<deviceDid>\n<devicePublicKey>`)
- *   was verified by the AppView at ingest; the client takes the served
- *   deviceKey as the bound key for the served deviceDid, and additionally
- *   requires the two to be consistent with each other (the deviceDid must
- *   be the did:key of exactly the served deviceKey bytes). A hub that
- *   could substitute its own bound key is outside what the client can
- *   detect — that is the AppView-ingest half of C2, not this one.
+ *   The binding itself is verified too, through a channel the AppView
+ *   is not part of (see src/public/binding.ts): the client fetches the
+ *   author's `kitchen.longtable.pubkey` record for the recipe's deviceDid
+ *   DIRECTLY from the author's PDS and verifies the binding signature
+ *   itself, then verifies the recipe against that PDS-bound key — the
+ *   served deviceKey must equal the bound key. A hub that substitutes
+ *   its own key and re-signs is now detected: its deviceDid has no
+ *   binding in the author's repo (`binding-not-found`), and serving
+ *   the genuine deviceDid with a different key fails
+ *   (`deviceKey-mismatch`).
+ *
+ *   Residual trust (stated in binding.ts, not hidden): the author's PDS
+ *   is still trusted to serve the binding actually in the author's
+ *   repo — a compromised PDS could insert a forged binding the way it
+ *   could forge any record — and first sight of a device is
+ *   trust-on-first-use (the client pins devices per author and the
+ *   detail view shows the deviceDid plus known/new status, so a
+ *   substitution after first sight is visible).
  *
  *   Search summaries carry deviceDid / deviceSignature / deviceKey and
  *   longtableId, but they still CANNOT be verified from the summary alone
@@ -48,7 +57,15 @@ import sodium from 'libsodium-wrappers'
 import type { RecipeInput } from '../types'
 import { AtprotoError, type AtprotoBlob } from './atproto'
 import { utf8ToU8 } from '../identity/codec'
-import { cryptoReady, publicKeyFromDid } from '../identity/identity'
+import { cryptoReady, publicKeyFromDid, type KeyValueStore } from '../identity/identity'
+import {
+  BindingVerificationError,
+  defaultPinStore,
+  devicePinState,
+  fetchAuthorBinding,
+  recordDevicePin,
+  type BindingReason,
+} from './binding'
 import {
   bytesToDataUrl,
   canonicalRecipeHash,
@@ -98,6 +115,20 @@ export type PublicRecipe = RecipeRecord & {
   rkey: string
   uri?: string
   deviceKey?: string
+  /**
+   * How the device binding was verified (S3/H-N4): 'pds' means the
+   * client fetched the binding record from the author's PDS and
+   * verified its signature itself. Absent only for records that
+   * predate this check.
+   */
+  bindingVerifiedVia?: 'pds'
+  /**
+   * Trust-on-first-use pin state at open time: true when this author+
+   * device was already pinned from an earlier sighting, false on
+   * first sight (the detail view says so — a new device for a known
+   * author is worth a glance, not a block).
+   */
+  deviceSeenBefore?: boolean
 }
 
 export interface SearchQuery {
@@ -259,6 +290,7 @@ export type RecipeVerificationReason =
   | 'deviceKey-mismatch'
   | 'missing-longtableId'
   | 'signature-invalid'
+  | BindingReason
 
 /**
  * Thrown (fail closed) when a served public record cannot be verified as
@@ -315,6 +347,16 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
  * `longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>`, verifies
  * detached-Ed25519 against the served deviceKey.
  *
+ * When `trustedDeviceKey` is given (the key the author's PDS binds to
+ * this device, fetched + verified by fetchAuthorBinding — S3/H-N4),
+ * the served deviceKey must ALSO equal that bound key, and the recipe
+ * signature is verified against the bound key: a hub that served its
+ * own key for the genuine deviceDid fails `deviceKey-mismatch`, and a
+ * hub that re-signed under its own deviceDid never gets this far (its
+ * device has no PDS binding). Without it, the served key is trusted
+ * as the bound key — the pre-H-N4 behavior, kept for direct callers
+ * and unit tests of the recipe check alone.
+ *
  * Any failure throws RecipeVerificationError — the caller must not display
  * the record. `accountDid` is the served author DID (`did`), never a DID
  * taken from the record body (records carry no account field).
@@ -322,6 +364,7 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 export async function verifyPublicRecipe(
   record: PublicRecipe,
   accountDid: string,
+  trustedDeviceKey?: string,
 ): Promise<void> {
   await cryptoReady()
   if (typeof record.longtableId !== 'string' || record.longtableId.length === 0) {
@@ -339,10 +382,21 @@ export async function verifyPublicRecipe(
   if (typeof record.deviceKey !== 'string' || record.deviceKey.length === 0) {
     throw new RecipeVerificationError('missing-deviceKey')
   }
-  const keyBytes = decodeBase64Strict(record.deviceKey, 32)
+  let keyBytes = decodeBase64Strict(record.deviceKey, 32)
   if (!keyBytes) throw new RecipeVerificationError('invalid-deviceKey')
   if (!sameBytes(didKeyBytes, keyBytes)) {
     throw new RecipeVerificationError('deviceKey-mismatch')
+  }
+  if (trustedDeviceKey !== undefined) {
+    // S3/H-N4: the key the author's PDS binds to this device is the
+    // authority — the hub-served key must be exactly that key, or the
+    // hub substituted its own.
+    const trustedBytes = decodeBase64Strict(trustedDeviceKey, 32)
+    if (!trustedBytes) throw new RecipeVerificationError('invalid-deviceKey')
+    if (!sameBytes(trustedBytes, keyBytes)) {
+      throw new RecipeVerificationError('deviceKey-mismatch')
+    }
+    keyBytes = trustedBytes
   }
   if (typeof record.deviceSignature !== 'string' || record.deviceSignature.length === 0) {
     throw new RecipeVerificationError('missing-deviceSignature')
@@ -360,12 +414,24 @@ export async function verifyPublicRecipe(
   if (!ok) throw new RecipeVerificationError('signature-invalid')
 }
 
+/** Options for fetchPublicRecipe's binding check (S3/H-N4). */
+export interface FetchPublicRecipeOptions {
+  /** PLC directory base URL (default https://plc.directory). */
+  plcUrl?: string
+  /** First PDS to try for the binding — the viewer's own PDS URL
+   * (testnet / single-PDS deployments). Falls back to PLC resolution. */
+  authorPdsUrl?: string
+  /** Trust-on-first-use pin store (default: localStorage-backed). */
+  pinStore?: KeyValueStore
+}
+
 /** Fetch one full public record from the AppView by author DID + rkey. */
 export async function fetchPublicRecipe(
   appViewUrl: string,
   did: string,
   rkey: string,
   fetchFn: FetchFn = (url, init) => fetch(url, init),
+  options: FetchPublicRecipeOptions = {},
 ): Promise<PublicRecipe> {
   const base = trimSlash(appViewUrl)
   const attempts = [
@@ -417,8 +483,30 @@ export async function fetchPublicRecipe(
     }
     // Fail closed: verify BEFORE returning — a record that does not verify
     // is never displayed as the author's, and never reaches "Save a copy".
-    await verifyPublicRecipe(full, full.did)
-    return full
+    // S3/H-N4: the binding is fetched from the author's PDS (never the
+    // AppView) and verified here; the recipe is checked against the
+    // PDS-bound key, not the hub-served one.
+    if (typeof full.deviceDid !== 'string' || full.deviceDid.length === 0) {
+      throw new RecipeVerificationError('missing-deviceDid')
+    }
+    let binding
+    try {
+      binding = await fetchAuthorBinding(full.did, full.deviceDid, fetchFn, {
+        plcUrl: options.plcUrl,
+        authorPdsUrl: options.authorPdsUrl,
+      })
+    } catch (e) {
+      if (e instanceof BindingVerificationError) {
+        throw new RecipeVerificationError(e.reason)
+      }
+      throw e
+    }
+    await verifyPublicRecipe(full, full.did, binding.devicePublicKey)
+    const pinStore = options.pinStore ?? defaultPinStore()
+    const seenBefore =
+      devicePinState(pinStore, full.did, full.deviceDid) === 'known'
+    recordDevicePin(pinStore, full.did, full.deviceDid)
+    return { ...full, bindingVerifiedVia: 'pds', deviceSeenBefore: seenBefore }
   }
   throw new AtprotoError(`public recipe not found (${lastStatus})`, lastStatus || 404)
 }

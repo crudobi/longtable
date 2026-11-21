@@ -34,8 +34,18 @@ Schema: [`lexicons/kitchen.longtable.recipe.json`](../lexicons/kitchen.longtable
 
 ### `kitchen.longtable.pubkey` (the binding)
 
-Record key `self` (a lexicon literal). Binds the author's device key to
-the account. Schema:
+One record per device. The record key is derived from the deviceDid:
+`dev-` + the first 32 hex characters of the BLAKE2b-256 of the
+deviceDid string (see `pubkeyRkeyForDeviceDid` in
+`src/public/publish.ts` / `appview/device-signature.mjs` — both pin
+the same test vector). The deviceDid itself is not the rkey: it
+contains colons, which PDS implementations validate unevenly; the
+`dev-<hex>` form is valid under every rkey rule. The legacy
+single-slot record key `self` (pre-H-N1 clients) is still honored as
+one device's binding, so existing published recipes keep verifying —
+but no current client writes it, and a second device publishing never
+overwrites the first device's binding. Binds the author's device key
+to the account. Schema:
 [`lexicons/kitchen.longtable.pubkey.json`](../lexicons/kitchen.longtable.pubkey.json).
 
 | Field | Type | Notes |
@@ -95,15 +105,19 @@ key, base64-encoded in the records.
    `did:web`) to its DID document: the `#atproto` signing key and the
    `AtprotoPersonalDataServer` service endpoint.
 3. **Fetch the records from the author's PDS** with plain XRPC:
-   `com.atproto.repo.getRecord` for `kitchen.longtable.pubkey/self`
-   and for the recipe record — or the whole repo via
+   `com.atproto.repo.getRecord` for the recipe record and for
+   `kitchen.longtable.pubkey/<rkey>` where `<rkey>` is the device's
+   per-device rkey (`dev-` + first 32 hex of BLAKE2b-256 of the
+   recipe's `deviceDid`) — or the whole repo via
    `com.atproto.sync.getRepo`.
 4. **Verify the repo** (if you fetched the CAR): `verifyRepoCar`
    against the DID-document key; confirm the record's CID in the
    verified repo state.
 5. **Verify the binding:** decode `devicePublicKey` from the pubkey
    record; check `deviceDid` matches `did:key` of that key; verify the
-   binding signature over the string above with that key.
+   binding signature over the string above with that key. A recipe
+   verifies against ITS OWN device's binding — an account may carry
+   several (one per device).
 6. **Verify the recipe:** recompute the canonical hash from the record
    fields, rebuild the signed string, and verify `deviceSignature`
    with the (now trusted) device public key.
@@ -112,6 +126,25 @@ If any step fails, the recipe is not the author's — full stop.
 `examples/third-party-client/` implements exactly this flow against an
 AppView + PDS; `scripts/verify-public/` is a deeper standalone verifier
 (repo audit + forgery self-test) built the same way.
+
+**What the AppView is (not) trusted for (S3/H-N4).** The flow above
+fetches the binding from the author's PDS, never from the AppView —
+that is the point. An AppView that serves a recipe is an index, not
+an authority: a dishonest AppView could re-sign altered content with
+its own key and serve a self-consistent forgery, so the Longtable
+client fetches the binding for the recipe's deviceDid directly from
+the author's PDS (resolving the PDS from the DID document, or from
+the viewer's own PDS as a first hint) and verifies the binding
+signature itself before it believes the recipe (`src/public/binding.ts`).
+A hub-minted device has no binding in the author's repo, so its
+forgery is rejected (`binding-not-found`). Residual trust, stated
+plainly: the author's PDS is still trusted to serve the binding
+actually in the author's repo (it holds the repo key, so a
+compromised PDS could insert a forged binding the way it could forge
+any record), and first sight of a device is trust-on-first-use — the
+client pins devices per author and the detail view shows the
+deviceDid plus known/new status, so a substitution after first sight
+is visible.
 
 ## Writing public recipes
 
@@ -124,7 +157,8 @@ Standard ATProto writes on the author's own PDS:
    collection: "kitchen.longtable.recipe", rkey: <longtableId>,
    record: {…} }`, after attaching `deviceDid` and computing
    `deviceSignature` as above. Publish the `kitchen.longtable.pubkey`
-   binding first (rkey `self`) if it isn't in the repo yet.
+   binding first (at the device's per-device rkey) if it isn't in the
+   repo yet.
 4. Unpublish: `com.atproto.repo.deleteRecord` for the recipe record.
 
 A record is not a Longtable public recipe unless it conforms to the
