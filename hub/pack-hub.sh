@@ -42,6 +42,11 @@ echo "$VERSION" > "$STAGE/VERSION"
 # Never ship dev state that may have accumulated in the service dirs.
 rm -f "$STAGE/appview/"*.db "$STAGE/appview/"*.db-journal
 rm -rf "$STAGE/appview/media" "$STAGE/appview/test"
+# Never ship npm .bin shims either: they are symlinks to dev CLIs the
+# hub never executes, and a tarball must contain no symlinks at all
+# (an absolute one once escaped the bundle — Wave 1).
+rm -rf "$STAGE/appview/node_modules/.bin" "$STAGE/signaling/node_modules/.bin" \
+  "$STAGE/services/atproto-testnet/node_modules/.bin"
 
 echo "[pack] tarring…"
 tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$STAGE_PARENT" "$NAME"
