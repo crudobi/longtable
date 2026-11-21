@@ -25,6 +25,26 @@
  * photos + times), so even if the flag is lost a re-run imports nothing
  * twice. The old database is deliberately left in place as a backup.
  *
+ * Why @automerge/automerge still ships (Rel L7, Wave 5A decision —
+ * DO NOT drop on a guess): the migration is the only path that can
+ * recover a Phase 0 cookbook, and dropping the dependency removes it
+ * for every device that has not yet run a clean v2 migration. The
+ * code-level evidence is all in place (flag-guarded with a versioned
+ * v2 flag that only a zero-failure run sets, fingerprint-deduped, old
+ * DB left as backup, corrupt docs retried not dropped), but there is
+ * NO device census: nothing in the repo or the ops state proves every
+ * Phase 0 device has migrated, and a device that has not launched
+ * since Phase 1 — or one whose migration keeps failing on a corrupt
+ * doc (which retries every launch by design) — would lose its old
+ * recipes permanently if the dependency went away. The dependency
+ * stays until a sunset is decided explicitly: announce the cutoff in
+ * a release (so an unmigrated device gets a last chance to run the
+ * migration and speak up via migrationFailureNotice), then drop the
+ * dependency + this module + the 6 MB precache allowance in the
+ * release after that. The cost of keeping it is one lazy WASM chunk
+ * (~3.6 MB, fetched only when an old database is present) and the
+ * precache limit below.
+ *
  * The Automerge dependency is loaded with a dynamic import on purpose: its
  * WASM bundle is only fetched when an old database with actual chunks is
  * present, so users who never ran Phase 0 never pay for it.

@@ -98,6 +98,15 @@ on some attempt or the run fails and names it; a pass on attempt 2
 is recorded as such in the summary, and both attempts' output is
 kept in the proof's log.
 
+Proof retries are split from full-run retries (Rel L8): when the CI
+pipeline runs a proof, a failure there is retried once in place
+(`LT_PIPELINE_PROOF_RETRIES`, default 1, in ci/run-pipeline.sh)
+against the same provisioned fleet and the same already-built APK —
+a proof failure costs one more proof run, not a whole ~15-minute
+pipeline re-run. Only after the proof-level retries are exhausted
+does the pipeline fail the run and the next trigger re-run the whole
+pipeline for the same commit.
+
 Teardown policy: only the emulators are stopped — they are the
 multi-GB RAM cost. Appium, signaling, TURN, the testnet, the AppView,
 the TLS proxies, the HTTPS fixture, and `proof-hubfail`'s packaged

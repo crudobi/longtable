@@ -95,14 +95,24 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Precache the entire app shell. The 6 MiB per-file limit is
-        // load-bearing: the Phase 0 recovery migration chunk (the
-        // Automerge WASM, pulled in dynamically by
+        // Precache the entire app shell. The per-file limit is
+        // load-bearing (Rel L7): the Phase 0 recovery migration chunk
+        // (the Automerge WASM, pulled in dynamically by
         // src/store/migrateFromAutomerge.ts) still ships and exceeds
-        // Workbox's 2 MiB default. The limit can only come down when
-        // that migration retires.
+        // Workbox's 2 MiB default — a file over the limit is silently
+        // left OUT of the precache, and the migration would then fail
+        // offline. Measured 2026-11-21 (production build, pinned
+        // @automerge/automerge 3.5.0): the largest precached file is
+        // automerge_wasm_bg at 3,644,225 bytes; next are index
+        // (~961 KB) and libsodium-wrappers (~535 KB). The limit is
+        // 4 MiB — the largest file plus ~15% headroom — tightened
+        // from the old 6 MiB, which was set when the chunk was
+        // unmeasured. Revisit the limit if the Automerge version (and
+        // its WASM size) ever changes; the limit can only come down to
+        // the 2 MiB default when the migration retires (see
+        // migrateFromAutomerge.ts: why Automerge still ships).
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm,woff2}'],
-        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         navigateFallback: 'index.html',
         cleanupOutdatedCaches: true,
         skipWaiting: true,
