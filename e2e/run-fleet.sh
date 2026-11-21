@@ -266,6 +266,29 @@ ensure_turn() {
     printf 'user=longtable:%s\n' "$DEV_TURN_PASSWORD"
     printf 'lt-cred-mech\n'
     printf 'no-stdout-log\n'
+    # M17: the test-rig TURN relay had ZERO denied-peer-ip lines — the
+    # same open-relay shape the shipped hub hardening (M11) closed.
+    # Same ranges as hub/hub.mjs DENIED_PEER_RANGES, plus the M10
+    # quotas/caps, so the rig cannot relay toward the LAN either.
+    printf 'denied-peer-ip=0.0.0.0-0.255.255.255\n'
+    printf 'denied-peer-ip=10.0.0.0-10.255.255.255\n'
+    printf 'denied-peer-ip=100.64.0.0-100.127.255.255\n'
+    printf 'denied-peer-ip=127.0.0.0-127.255.255.255\n'
+    printf 'denied-peer-ip=169.254.0.0-169.254.255.255\n'
+    printf 'denied-peer-ip=172.16.0.0-172.31.255.255\n'
+    printf 'denied-peer-ip=192.168.0.0-192.168.255.255\n'
+    printf 'denied-peer-ip=224.0.0.0-239.255.255.255\n'
+    printf 'denied-peer-ip=192.0.0.0-192.0.0.255\n'
+    printf 'denied-peer-ip=198.18.0.0-198.19.255.255\n'
+    printf 'denied-peer-ip=240.0.0.0-255.255.255.255\n'
+    printf 'denied-peer-ip=::1\n'
+    printf 'denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff\n'
+    printf 'denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff\n'
+    printf 'denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff\n'
+    printf 'total-quota=100\n'
+    printf 'user-quota=100\n'
+    printf 'max-bps=1048576\n'
+    printf 'bps-capacity=52428800\n'
     printf 'log-file=%s\n' "$TURN_LOG"
   } > "$TURN_CONF.tmp"
   chmod 600 "$TURN_CONF.tmp"
@@ -316,11 +339,33 @@ ensure_testnet() {
   fi
 }
 
+# OPS-1 (Wave 3 merge follow-up): the standing AppView does not track
+# main — ensure_appview() only restarted it when down or the testnet
+# restarted, so a merge changing appview/ silently tested against stale
+# ingest. The fingerprint is the git tree hash of appview/ plus the
+# TLS-proxy script (both served from this checkout); when it changes
+# since the last start, the AppView AND its TLS proxy are bounced so
+# the running code is the checked-out code. The file is created on
+# first run without bouncing. If git cannot fingerprint (non-git copy),
+# the check is skipped with a warning — never a failure.
+APPVIEW_FINGERPRINT_FILE=$OPS_DIR/longtable-ci/appview.fingerprint
+appview_fingerprint() {
+  git -C "$REPO" rev-parse "HEAD:appview" "HEAD:services/atproto-testnet/tls-proxy.mjs" 2>/dev/null || echo "unknown"
+}
+
 ensure_appview() {
+  local fingerprint=""
+  fingerprint=$(appview_fingerprint)
   if curl -sf --max-time 3 http://localhost:3210/health > /dev/null 2>&1; then
     if [ "$TESTNET_STARTED" = "1" ]; then
       say "appview: testnet was restarted — bouncing appview so ingest reconnects to the fresh PDS"
       tmux kill-session -t lt-appview 2>/dev/null || true
+    elif [ "$fingerprint" = "unknown" ]; then
+      say "appview: already up (fingerprint unavailable — cannot check for appview/ changes)"
+    elif [ -f "$APPVIEW_FINGERPRINT_FILE" ] && [ "$(cat "$APPVIEW_FINGERPRINT_FILE")" != "$fingerprint" ]; then
+      say "appview: appview/ changed since last start — bouncing appview + tls-appview proxy so the running code tracks main"
+      tmux kill-session -t lt-appview 2>/dev/null || true
+      tmux kill-session -t lt-tls-appview 2>/dev/null || true
     else
       say "appview: already up"
     fi
@@ -335,6 +380,10 @@ ensure_appview() {
     fi
     tmux new -s lt-appview -d "cd $APPVIEW_DIR && env APPVIEW_PORT=3210 APPVIEW_DB=$APPVIEW_DB PDS_URL=http://localhost:2583 PLC_URL=http://localhost:2582 node index.mjs"
     wait_http http://localhost:3210/health 30 || { say "ERROR: appview did not start" >&2; return 1; }
+    # Record the fingerprint of the code just started (OPS-1).
+    if [ -n "$fingerprint" ] && [ "$fingerprint" != "unknown" ]; then
+      printf '%s\n' "$fingerprint" > "$APPVIEW_FINGERPRINT_FILE"
+    fi
   fi
   if curl -skf --max-time 3 https://127.0.0.1:3211/health > /dev/null 2>&1; then
     say "tls-appview proxy: already up"
@@ -448,14 +497,34 @@ reset_app() { # serials...
 PROOF_ATTEMPTS="${LT_FLEET_PROOF_ATTEMPTS:-2}"
 
 reboot_serials() { # serials... — guest reboot (emulator process stays up)
-  local s i
+  # M4-rel: fail fast. The old loop polled sys.boot_completed but
+  # proceeded regardless after 40 tries, so a dead guest silently ran
+  # the next proof attempt against a device that never came back. Now
+  # every serial must report boot_completed=1 within the window (40 x
+  # 3s + settle), with per-device logging; otherwise this returns 1
+  # naming the serials that never came back, and the caller aborts.
+  local s i failed=""
   for s in "$@"; do "$ADB" -s "$s" reboot > /dev/null 2>&1 || true; done
   for s in "$@"; do
+    local booted=0
     for i in $(seq 1 40); do
-      [ "$("$ADB" -s "$s" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+      if [ "$("$ADB" -s "$s" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+        booted=1
+        break
+      fi
       sleep 3
     done
+    if [ "$booted" = "1" ]; then
+      say "reboot: $s back (sys.boot_completed=1 after ${i} poll(s))"
+    else
+      say "ERROR: reboot: $s never reported sys.boot_completed=1 after 40 polls (120s)" >&2
+      failed="$failed $s"
+    fi
   done
+  if [ -n "$failed" ]; then
+    say "ERROR: reboot_serials failed for:${failed}" >&2
+    return 1
+  fi
   sleep 10 # let radios/services settle after the reboot
 }
 
@@ -488,7 +557,10 @@ do_run_proof() { # proof-name
     say "--- attempt $attempt of $p FAILED rc=$rc ($((SECONDS-t0))s)"
     if [ "$attempt" -lt "$PROOF_ATTEMPTS" ]; then
       say "rebooting ($serials) and resetting before retry"
-      reboot_serials $serials
+      # M4-rel: a guest that never comes back fails the proof now —
+      # retrying against a dead device only burns the remaining
+      # attempts and hides the reboot failure.
+      reboot_serials $serials || { record "$p" fail $((SECONDS-overall_t0)); say "--- step $p FAILED: device(s) did not come back after reboot — log: $log"; return 1; }
     fi
   done
   record "$p" fail $((SECONDS-overall_t0))

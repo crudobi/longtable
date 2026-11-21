@@ -44,6 +44,23 @@ beforeAll(async () => {
     fetchImpl,
     log: { log() {}, info() {}, warn() {}, error() {} },
   })
+  // M12: /media/ only serves blobs an indexed recipe of the DID
+  // references — index the recipe the test fetches, or the gate 404s.
+  app.index.upsert({
+    uri: `at://${DID}/kitchen.longtable.recipe/pic`,
+    did: DID,
+    rkey: 'pic',
+    cid: 'cid-pic',
+    record: {
+      $type: 'kitchen.longtable.recipe',
+      name: 'Pic Soup',
+      ingredients: ['1 egg'],
+      instructions: ['Cook it.'],
+      longtableId: 'lt-pic',
+      createdAt: '2026-10-12T00:00:00.000Z',
+      images: [{ ref: { $link: CID } }],
+    },
+  })
   const addr = await app.listen(0)
   base = `http://127.0.0.1:${addr.port}`
 })

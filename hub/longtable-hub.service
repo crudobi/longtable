@@ -1,0 +1,47 @@
+# longtable-hub.service — systemd unit for the Longtable hub supervisor.
+#
+# M5-rel: longtable-hub started the supervisor with setsid+nohup and
+# nothing restarted it if it died. This unit is the restart mechanism:
+# on-failure with backoff, so a crashing supervisor comes back on its
+# own (the supervisor itself already restarts its children with
+# backoff; this covers the supervisor process).
+#
+# Install:
+#   1. Edit WorkingDirectory and the two paths in ExecStart to the
+#      directory you unpacked the hub tarball into.
+#   2. sudo cp longtable-hub.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now longtable-hub
+#   3. ./longtable-hub status / logs still work (same data dir).
+#
+# Notes:
+# - Do NOT run both this unit and ./longtable-hub start: both would
+#   try to own the same data dir / ports. Stop the manual instance
+#   first (./longtable-hub stop).
+# - The hub runs as the user in User= (edit it). It needs openssl on
+#   PATH and write access to the data dir. ExecStart names the node
+#   binary explicitly: it must be Node.js 22.5+ — the AppView child
+#   uses node:sqlite, which Node 20 cannot load (verified: Node 20
+#   fails with ERR_UNKNOWN_BUILTIN_MODULE). /usr/local/bin/node is
+#   the Node 24 on the reference host; point it at your local
+#   Node >= 22.5 binary if yours lives elsewhere.
+# - StartLimitBurst/Interval: 5 restarts in 5 minutes, then systemd
+#   holds the unit failed until an operator intervenes — a supervisor
+#   crash-looping forever is a fault to look at, not to spin on.
+[Unit]
+Description=Longtable hub supervisor
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=crudobi
+WorkingDirectory=/srv/longtable-hub
+ExecStart=/usr/local/bin/node /srv/longtable-hub/hub.mjs --config /srv/longtable-hub/hub.conf.json
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

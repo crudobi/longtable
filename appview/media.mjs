@@ -32,6 +32,50 @@ export const MAX_CACHE_BYTES = 512 * 1024 * 1024
  * cleanup in get() then frees the (did, cid) for a later retry. */
 export const MEDIA_FETCH_TIMEOUT_MS = 30_000
 
+/**
+ * H2 — Content-Type allowlist for served blobs. The PDS supplies the
+ * stored type and a malicious/compromised PDS could claim `text/html`
+ * (or another active type) for attacker bytes; served verbatim from
+ * the AppView origin that is stored XSS. Only image types browsers
+ * render inertly are passed through; everything else is served as
+ * `application/octet-stream` (with `Content-Disposition: attachment`
+ * at the HTTP layer) so it can never execute in the AppView origin.
+ * SVG is deliberately NOT allowlisted: inline <script> / event
+ * handlers make it an active type, not an image.
+ */
+export const MEDIA_CONTENT_TYPE_ALLOWLIST = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+])
+
+/** Map a stored Content-Type through the H2 allowlist. */
+export function safeMediaContentType(contentType) {
+  const base = String(contentType ?? '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase()
+  return MEDIA_CONTENT_TYPE_ALLOWLIST.has(base) ? base : 'application/octet-stream'
+}
+
+/**
+ * The CID(s) an indexed recipe's `images` array references. Same
+ * extraction as device-signature.mjs `imageCid`: `ref.$link` when it
+ * is a string, otherwise the bare string ref; anything else is not a
+ * CID and is skipped (it can never match a cached blob name).
+ */
+export function imageCids(images) {
+  const out = []
+  for (const img of Array.isArray(images) ? images : []) {
+    const ref = img?.ref
+    const cid = typeof ref?.$link === 'string' ? ref.$link : typeof ref === 'string' ? ref : null
+    if (cid && CID_RE.test(cid)) out.push(cid)
+  }
+  return out
+}
+
 // --- CIDv1 / sha2-256 verification ---------------------------------------
 // Blob CIDs are CIDv1 strings (multibase base32 'b…' or base58btc 'z…')
 // wrapping: varint(version=1), varint(codec), varint(0x12 = sha2-256),
@@ -190,7 +234,7 @@ export function createMediaCache({
   fetchTimeoutMs = MEDIA_FETCH_TIMEOUT_MS,
 } = {}) {
   if (!dir) throw new Error('media cache requires a directory')
-  const stats = { hits: 0, misses: 0, fetches: 0, errors: 0 }
+  const stats = { hits: 0, misses: 0, fetches: 0, errors: 0, purged: 0 }
   const inflight = new Map()
 
   const entryPaths = (did, cid) => {
@@ -234,6 +278,14 @@ export function createMediaCache({
           total += st.size
           if (!f.endsWith('.json') && !f.includes('.tmp-')) {
             entries.push({
+              did: (() => {
+                try {
+                  return decodeURIComponent(sub.name)
+                } catch {
+                  return sub.name
+                }
+              })(),
+              cid: f,
               bytesPath: path.join(subPath, f),
               metaPath: path.join(subPath, `${f}.json`),
               size: st.size,
@@ -248,8 +300,39 @@ export function createMediaCache({
     return { entries, total }
   }
 
+  /** Delete orphaned .tmp files older than an hour (interrupted writes). */
+  function sweepStaleTmp() {
+    let subs = []
+    try {
+      subs = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    const cutoff = Date.now() - 3_600_000
+    for (const sub of subs) {
+      if (!sub.isDirectory()) continue
+      const subPath = path.join(dir, sub.name)
+      let files = []
+      try {
+        files = fs.readdirSync(subPath)
+      } catch {
+        continue
+      }
+      for (const f of files) {
+        if (!f.includes('.tmp-')) continue
+        const tmpPath = path.join(subPath, f)
+        try {
+          if (fs.statSync(tmpPath).mtimeMs < cutoff) fs.unlinkSync(tmpPath)
+        } catch {
+          /* raced a delete — skip */
+        }
+      }
+    }
+  }
+
   /** Evict oldest entries until `incoming` more bytes fit the total bound. */
   function evictToFit(incoming) {
+    sweepStaleTmp()
     let { entries, total } = cacheEntries()
     if (total + incoming <= maxCacheBytes) return
     entries.sort((a, b) => a.mtimeMs - b.mtimeMs)
@@ -309,6 +392,69 @@ export function createMediaCache({
   }
 
   /**
+   * H1 — delete one cached blob (bytes + meta). Returns true when an
+   * entry was removed. Used by the ingest sweep when a recipe leaves
+   * the index (unpublish/delete) so its media stops being served.
+   */
+  function deleteBlob(did, cid) {
+    if (!isCacheableMediaId(did, cid)) return false
+    const p = entryPaths(did, cid)
+    let removed = false
+    for (const f of [p.bytes, p.meta]) {
+      try {
+        fs.unlinkSync(f)
+        removed = true
+      } catch {
+        /* already gone */
+      }
+    }
+    if (removed) stats.purged++
+    return removed
+  }
+
+  /**
+   * H1 — delete every cached blob a recipe's `images` array references.
+   * Returns the number of blobs removed.
+   */
+  function purgeImages(did, images) {
+    let n = 0
+    for (const cid of imageCids(images)) {
+      if (deleteBlob(did, cid)) n++
+    }
+    return n
+  }
+
+  /**
+   * H1 — delete every cached blob no indexed recipe references anymore
+   * (orphans: fetched under a recipe that has since left the index, or
+   * cached before media gating). `index` is the RecipeIndex (its
+   * listImageRefs() enumerates the live references). Returns the number
+   * of blobs removed. Called after the periodic reconcile sweep, never
+   * per-recipe, so it cannot race a concurrent ingest.
+   */
+  function purgeUnreferenced(index) {
+    const live = new Set()
+    for (const { did, cid } of index.listImageRefs()) live.add(`${did}/${cid}`)
+    let n = 0
+    for (const e of cacheEntries().entries) {
+      if (live.has(`${e.did}/${e.cid}`)) continue
+      try {
+        fs.unlinkSync(e.bytesPath)
+      } catch {
+        /* already gone */
+      }
+      try {
+        fs.unlinkSync(e.metaPath)
+      } catch {
+        /* no meta — fine */
+      }
+      stats.purged++
+      n++
+    }
+    return n
+  }
+
+  /**
    * Resolve a blob: cache hit → stored bytes; miss → fetch from the PDS,
    * store, return. Returns null when the PDS has no such blob (or errors).
    */
@@ -337,5 +483,5 @@ export function createMediaCache({
     return fresh ? { ...fresh, fromCache: false } : null
   }
 
-  return { get, stats, dir }
+  return { get, delete: deleteBlob, purgeImages, purgeUnreferenced, stats, dir }
 }

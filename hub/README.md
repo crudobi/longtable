@@ -24,7 +24,8 @@ fail over to any other hub they know, or pair directly with no hub at all.
 
 ## Requirements
 
-- Linux or macOS with **Node.js 20+** and **openssl** on `PATH`
+- Linux or macOS with **Node.js 22.5+** and **openssl** on `PATH`
+  (the AppView uses `node:sqlite`, which Node 20 cannot load)
 - Optional: **coturn** (`turnserver` on `PATH`) for the TURN relay.
   Without it, devices on the same network (or with direct connectivity)
   still sync; TURN only helps across restrictive NATs.
@@ -46,8 +47,9 @@ Edit `hub.conf.json`. The fields that matter:
 | `dataDir` | The ONE directory where all hub state lives (index DB, media cache, PDS data, TLS, logs). Default `./data`. |
 | `publicHost` | The hostname/IP clients use to reach this machine. Shown in the endpoint summary. |
 | `web.port` | Serves the Longtable web app (default 8080). |
+| `web.tls` | `true` serves the web app over HTTPS with the hub's own certificate (same cert as signaling); `false` (default) serves plain HTTP. The hub's cert is normally self-signed, so browsers warn on it — for a public deployment bring a CA cert via `tls.cert`/`tls.key`. Every response carries `nosniff`, `SAMEORIGIN` framing, `no-referrer`, and a `frame-ancestors 'self'` CSP, and error responses are generic (no error strings leak to clients). |
 | `signaling.port` | y-webrtc signaling over wss (default 4444). |
-| `turn.password` | Optional. If unset (or left at a placeholder), the hub **generates** a strong password on first start, prints it in the start output, and stores it in `data/turn-password.txt`. Clients need the matching username/password configured in their hub entry. |
+| `turn.password` | Optional. If unset (or left at a placeholder), the hub **generates** a strong password on first start and stores it in `data/turn-password.txt` (0600). The value is never printed — the start output gives only its length and the file path, because hub stdout goes to `data/hub.log` (0600). Clients need the matching username/password configured in their hub entry; read the value from `data/turn-password.txt`. See "Rotating the TURN password" below. |
 | `turn.externalIp` | Your public IP, if the hub is behind NAT and clients connect from elsewhere. |
 | `appview.port` | Public-recipe search API (default 3210). |
 | `pds.enabled` | Run the bundled managed PDS (default `true`). See the honest note below. |
@@ -57,9 +59,16 @@ Edit `hub.conf.json`. The fields that matter:
 
 A note on the TURN relay: its credentials are shared with every client
 of your hub by design, so the generated coturn config refuses to relay
-toward loopback, private (RFC1918), CGNAT, link-local, or multicast
-addresses — the relay can carry traffic between your hub's users, but
-it cannot be used to reach your LAN or the hub host itself.
+toward loopback, private (RFC1918), CGNAT, link-local, multicast,
+benchmarking, and reserved addresses — the relay can carry traffic
+between your hub's users, but it cannot be used to reach your LAN or
+the hub host itself. The relay is also capped: at most 100 concurrent
+allocations in total (`total-quota`/`user-quota`), 1 MiB/s per session
+(`max-bps`) and 50 MiB/s of relay capacity overall (`bps-capacity`) —
+so one abusive client cannot take the relay or the host's uplink
+without bound. `data/turnserver.conf` (which embeds the plaintext
+credential) is written 0600 via tmp+rename, and `data/hub.log` is 0600
+too.
 
 If a default port is already taken on your machine, change it here —
 every component's port is configurable.
@@ -114,6 +123,50 @@ either one dies.
 ```sh
 LT_HUB_CONFIG=./hub-b.conf.json ./longtable-hub start
 ```
+
+## Rotating the TURN password
+
+The TURN credential is one static password shared by every client of
+the hub, so rotate it whenever it may have leaked (and after any
+reinstall that re-uses an old config):
+
+```sh
+./longtable-hub stop
+rm data/turn-password.txt
+# or: set "turn.password" in hub.conf.json to a new value
+./longtable-hub start
+```
+
+On start the hub mints a fresh generated password (or uses the one in
+`hub.conf.json`) and rewrites `data/turnserver.conf` (0600). Clients
+must update their hub entry to the new credential — the old one stops
+working at once, and there is no grace period. The generated password
+is 24 random bytes; never commit a `hub.conf.json` carrying a real
+`turn.password`.
+
+## Run under systemd (supervisor restart)
+
+`./longtable-hub start` launches the supervisor with `setsid`+`nohup`
+and nothing restarts it if it dies. For an unattended hub, run it
+under systemd instead — `longtable-hub.service` ships in the tarball:
+
+```sh
+# Stop the manual instance first — never run both at once.
+./longtable-hub stop
+# Edit WorkingDirectory and the paths in ExecStart to the directory
+# you unpacked the tarball into, and User= to the hub's user.
+sudo cp longtable-hub.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now longtable-hub
+```
+
+The unit restarts the supervisor on failure with backoff
+(`Restart=on-failure`, 5 s), and holds the unit failed after 5
+restarts in 5 minutes so a crash loop gets operator attention instead
+of spinning forever. The supervisor itself already restarts its
+children (web, signaling, AppView, TURN, PDS) with backoff; the unit
+covers the supervisor process. `./longtable-hub status` / `logs`
+still work against the same data dir.
 
 ## Honest notes
 

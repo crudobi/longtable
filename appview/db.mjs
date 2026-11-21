@@ -18,13 +18,23 @@ import { DatabaseSync } from 'node:sqlite'
 export const RECIPE_COLLECTION = 'kitchen.longtable.recipe'
 export const PUBKEY_COLLECTION = 'kitchen.longtable.pubkey'
 
-/** Split a string into lowercase alphanumeric FTS terms. */
+/** Split a string into lowercase alphanumeric FTS terms.
+ * M5: Unicode-aware (\p{L}\p{N}) — the old [a-z0-9] split silently
+ * dropped every non-ASCII term, so e.g. "café" searched as "caf".
+ * Terms stay letters/digits only, so they remain safe to embed in the
+ * FTS5 MATCH expression built by ftsColumnExpr. */
 export function ftsTerms(str) {
   return String(str ?? '')
     .toLowerCase()
-    .split(/[^a-z0-9]+/i)
+    .split(/[^\p{L}\p{N}]+/u)
     .map((t) => t.trim())
     .filter((t) => t.length > 0)
+}
+
+/** Escape a LIKE pattern fragment (M5): %, _ and the escape char itself
+ * are literals in user input, never wildcards. Used with ESCAPE '\\'. */
+export function escapeLikePattern(str) {
+  return String(str ?? '').replace(/[%_\\]/g, '\\$&')
 }
 
 /** Build an FTS5 column-scoped prefix-match expression, or null if no terms. */
@@ -208,52 +218,78 @@ export class RecipeIndex {
     ) {
       return false
     }
-    this.db
-      .prepare(
-        `INSERT INTO recipes (uri, did, rkey, cid, name, description, ingredients, instructions,
-                               prep, cook, yield, tags, images, longtable_id, created_at, updated_at,
-                               device_did, device_signature, device_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(uri) DO UPDATE SET
-           did=excluded.did, rkey=excluded.rkey, cid=excluded.cid, name=excluded.name,
-           description=excluded.description, ingredients=excluded.ingredients,
-           instructions=excluded.instructions, prep=excluded.prep, cook=excluded.cook,
-           yield=excluded.yield, tags=excluded.tags, images=excluded.images,
-           longtable_id=excluded.longtable_id, created_at=excluded.created_at,
-           updated_at=excluded.updated_at, device_did=excluded.device_did,
-           device_signature=excluded.device_signature, device_key=excluded.device_key`,
-      )
-      .run(
-        row.uri,
-        row.did,
-        row.rkey,
-        row.cid,
-        row.name,
-        row.description,
-        JSON.stringify(row.ingredients),
-        JSON.stringify(row.instructions),
-        row.prep,
-        row.cook,
-        row.yield,
-        JSON.stringify(row.tags),
-        JSON.stringify(row.images),
-        row.longtable_id,
-        row.created_at,
-        row.updated_at,
-        row.device_did,
-        row.device_signature,
-        row.device_key,
-      )
-    this.#syncFts(row)
+    // M6: the row write and the FTS sync are one transaction — a
+    // crash/failure between them used to leave the index and the FTS
+    // table disagreeing (row without terms, or terms without a row).
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO recipes (uri, did, rkey, cid, name, description, ingredients, instructions,
+                                 prep, cook, yield, tags, images, longtable_id, created_at, updated_at,
+                                 device_did, device_signature, device_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(uri) DO UPDATE SET
+             did=excluded.did, rkey=excluded.rkey, cid=excluded.cid, name=excluded.name,
+             description=excluded.description, ingredients=excluded.ingredients,
+             instructions=excluded.instructions, prep=excluded.prep, cook=excluded.cook,
+             yield=excluded.yield, tags=excluded.tags, images=excluded.images,
+             longtable_id=excluded.longtable_id, created_at=excluded.created_at,
+             updated_at=excluded.updated_at, device_did=excluded.device_did,
+             device_signature=excluded.device_signature, device_key=excluded.device_key`,
+        )
+        .run(
+          row.uri,
+          row.did,
+          row.rkey,
+          row.cid,
+          row.name,
+          row.description,
+          JSON.stringify(row.ingredients),
+          JSON.stringify(row.instructions),
+          row.prep,
+          row.cook,
+          row.yield,
+          JSON.stringify(row.tags),
+          JSON.stringify(row.images),
+          row.longtable_id,
+          row.created_at,
+          row.updated_at,
+          row.device_did,
+          row.device_signature,
+          row.device_key,
+        )
+      this.#syncFts(row)
+      this.db.exec('COMMIT')
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {
+        /* already rolled back */
+      }
+      throw err
+    }
     return true
   }
 
   deleteByUri(uri) {
-    const res = this.db.prepare('DELETE FROM recipes WHERE uri = ?').run(uri)
-    if (this.ftsEnabled) {
-      this.db.prepare('DELETE FROM recipes_fts WHERE uri = ?').run(uri)
+    // M6: row + FTS deletes are one transaction, like upsert.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const res = this.db.prepare('DELETE FROM recipes WHERE uri = ?').run(uri)
+      if (this.ftsEnabled) {
+        this.db.prepare('DELETE FROM recipes_fts WHERE uri = ?').run(uri)
+      }
+      this.db.exec('COMMIT')
+      return Number(res.changes) > 0
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {
+        /* already rolled back */
+      }
+      throw err
     }
-    return Number(res.changes) > 0
   }
 
   hasUri(uri) {
@@ -262,6 +298,67 @@ export class RecipeIndex {
 
   listUrisByDid(did) {
     return this.db.prepare('SELECT uri FROM recipes WHERE did = ?').all(did).map((r) => r.uri)
+  }
+
+  /** The `images` array stored for one row (parsed, [] when absent/unparseable). */
+  imagesForUri(uri) {
+    const row = this.db.prepare('SELECT images FROM recipes WHERE uri = ?').get(uri)
+    if (!row) return []
+    try {
+      const parsed = JSON.parse(row.images)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * H1 — every (did, cid) pair any indexed recipe references, for the
+   * media cache's purgeUnreferenced(). CID extraction matches
+   * media.mjs imageCids (ref.$link, else a bare string ref).
+   */
+  listImageRefs() {
+    const refs = []
+    const cidRe = /^[A-Za-z0-9]+$/
+    for (const row of this.db.prepare('SELECT did, images FROM recipes').all()) {
+      let images = []
+      try {
+        images = JSON.parse(row.images)
+      } catch {
+        continue
+      }
+      if (!Array.isArray(images)) continue
+      for (const img of images) {
+        const ref = img?.ref
+        const cid = typeof ref?.$link === 'string' ? ref.$link : typeof ref === 'string' ? ref : null
+        if (cid && cidRe.test(cid)) refs.push({ did: row.did, cid })
+      }
+    }
+    return refs
+  }
+
+  /**
+   * M12 (media gating) — true only when an indexed recipe of `did`
+   * references blob `cid`. The /media/ handler uses this so the cache
+   * can only be primed for blobs a real recipe points at, never as an
+   * open fetch oracle for arbitrary (did, cid) pairs.
+   */
+  hasImage(did, cid) {
+    for (const row of this.db.prepare('SELECT images FROM recipes WHERE did = ?').all(did)) {
+      let images = []
+      try {
+        images = JSON.parse(row.images)
+      } catch {
+        continue
+      }
+      if (!Array.isArray(images)) continue
+      for (const img of images) {
+        const ref = img?.ref
+        const c = typeof ref?.$link === 'string' ? ref.$link : typeof ref === 'string' ? ref : null
+        if (c === cid) return true
+      }
+    }
+    return false
   }
 
   /** Every distinct author DID in the index — the periodic/startup reconcile sweep re-verifies each one (N1/S2). */
@@ -297,8 +394,10 @@ export class RecipeIndex {
   }
 
   byAuthor(did) {
+    // M12: bounded like /search (LIMIT 100) — the unbounded author
+    // listing was one unbounded read per DID.
     return this.db
-      .prepare('SELECT * FROM recipes WHERE did = ? ORDER BY updated_at DESC, name ASC')
+      .prepare('SELECT * FROM recipes WHERE did = ? ORDER BY updated_at DESC, name ASC LIMIT 100')
       .all(did)
       .map(rowToSummary)
   }
@@ -338,15 +437,17 @@ export class RecipeIndex {
     }
 
     // Fallback (no FTS5): LIKE with identical API semantics.
+    // M5: user-supplied %/_ are escaped (ESCAPE '\') so a query for
+    // "100%" cannot match "1000" — the old fallback pushed them raw.
     const clauses = []
     const params = []
     if (q) {
-      clauses.push('lower(name) LIKE ?')
-      params.push(`%${String(q).toLowerCase()}%`)
+      clauses.push("lower(name) LIKE ? ESCAPE '\'")
+      params.push(`%${escapeLikePattern(String(q).toLowerCase())}%`)
     }
     for (const ing of ingList) {
-      clauses.push('lower(ingredients) LIKE ?')
-      params.push(`%${ing.toLowerCase()}%`)
+      clauses.push("lower(ingredients) LIKE ? ESCAPE '\'")
+      params.push(`%${escapeLikePattern(ing.toLowerCase())}%`)
     }
     const sql = `SELECT * FROM recipes ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY name ASC LIMIT 100`
     return this.db.prepare(sql).all(...params).map(rowToSummary)

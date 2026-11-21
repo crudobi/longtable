@@ -28,7 +28,7 @@ mkdir -p "$STAGE"
 echo "[pack] staging $NAME…"
 # Hub runtime files.
 cp hub/hub.mjs hub/web-server.mjs hub/longtable-hub hub/hub.conf.example.json \
-   hub/README.md hub/TELEMETRY.md hub/pack-hub.sh hub/stranger-test.sh "$STAGE/"
+   hub/longtable-hub.service hub/README.md hub/TELEMETRY.md hub/pack-hub.sh hub/stranger-test.sh "$STAGE/"
 chmod +x "$STAGE/longtable-hub"
 # The built web app.
 cp -r dist "$STAGE/app"
