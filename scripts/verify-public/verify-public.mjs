@@ -186,16 +186,40 @@ function devicePublicKeyFromDid(deviceDid) {
   return raw.slice(2)
 }
 
+// The CID string for a live CAR-decoded blob ref, or null when `ref`
+// is not one. loadVerifiedRepo decodes the repo CAR with getAndParseRecord
+// (dag-cbor), where a blob ref is a multiformats CID object — numeric
+// `code`/`version`, a `multihash`, and a `toString()` that yields the
+// CID string — NOT the `{$link}` JSON shape the client signs with. The
+// signer hashed the $link CID string, so the CID object's toString() is
+// the identical hash input. This mirrors appview/device-signature.mjs
+// cidObjectToString (deliberately duplicated, not imported: this verifier
+// uses no Longtable app/client/AppView code by design, and the two copies
+// must stay in sync — the same hash input on both sides). A bare string
+// ref, a missing ref, or any other shape is NOT a CID object.
+function cidObjectToString(ref) {
+  if (ref === null || typeof ref !== 'object') return null
+  if (typeof ref.code !== 'number' || typeof ref.version !== 'number') return null
+  if (ref.multihash == null || typeof ref.toString !== 'function') return null
+  const s = ref.toString()
+  if (typeof s !== 'string' || s.length === 0) return null
+  if (!/^b[a-z2-7]+$/.test(s) && !/^z[1-9A-HJ-NP-Za-km-z]+$/.test(s)) return null
+  return s
+}
+
 // L-N4: every image ref must be a {$link} blob reference carrying a
-// string CID. Anything else throws — the signer never emits that shape,
-// so a record carrying one has no well-defined hash. Callers treat the
-// throw as a verification failure, never as a crash: modeVerify wraps
-// the signature check (see below), so a malformed record FAILs the
-// check instead of aborting the audit.
+// string CID, or a live CAR-decoded CID object (see cidObjectToString).
+// Anything else throws — the signer never emits that shape, so a record
+// carrying one has no well-defined hash. Callers treat the throw as a
+// verification failure, never as a crash: modeVerify wraps the signature
+// check (see below), so a malformed record FAILs the check instead of
+// aborting the audit.
 function imageCid(img) {
   const ref = img?.ref
   if (!ref) throw new Error('image ref is not a {$link} blob reference')
   if (typeof ref.$link === 'string' && ref.$link) return ref.$link
+  const cid = cidObjectToString(ref)
+  if (cid) return cid
   throw new Error('image ref is not a {$link} blob reference')
 }
 
