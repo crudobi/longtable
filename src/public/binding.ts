@@ -82,6 +82,7 @@ import { PUBKEY_COLLECTION, type FetchFn } from './atproto'
 import { cryptoReady, publicKeyFromDid, type KeyValueStore } from '../identity/identity'
 import { utf8ToU8 } from '../identity/codec'
 import { pubkeyBindingMessage, pubkeyRkeyForDeviceDid, type PubkeyRecord } from './publish'
+import { isSafeEndpointUrl } from '../hubs/endpointUrls'
 
 /** The public PLC directory (overridable per call for testnets). */
 export const DEFAULT_PLC_URL = 'https://plc.directory'
@@ -242,6 +243,14 @@ export async function resolveAuthorPdsUrl(
   fetchFn: FetchFn,
   plcUrl: string = DEFAULT_PLC_URL,
 ): Promise<string | null> {
+  // Sec L14: a plaintext PLC directory to a non-local host is not
+  // a usable channel (did:web resolution is always https).
+  if (
+    accountDid.startsWith('did:plc:') &&
+    !isSafeEndpointUrl(plcUrl, 'http')
+  ) {
+    return null
+  }
   let docUrl: string
   if (accountDid.startsWith('did:plc:')) {
     docUrl = `${trimSlash(plcUrl)}/${accountDid}`
@@ -300,6 +309,12 @@ async function fetchBindingFromPds(
   deviceDid: string,
   fetchFn: FetchFn,
 ): Promise<BindingFetchOutcome> {
+  // Sec L14: a plaintext PDS URL to a non-local host is not a
+  // candidate at all — return unavailable so the caller falls
+  // through to the PLC-resolved PDS (or fails closed), instead of
+  // fetching from it. The binding fetch is unauthenticated, but the
+  // rule is uniform: no plaintext to a remote host.
+  if (!isSafeEndpointUrl(pdsUrl, 'http')) return { status: 'unavailable' }
   const rkey = await pubkeyRkeyForDeviceDid(deviceDid)
   const qs = new URLSearchParams({
     repo: accountDid,

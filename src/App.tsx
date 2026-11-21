@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getRepo, registerPagehideFlush } from './store/repo'
+import { getRepo, isPersistenceDegraded, registerPagehideFlush } from './store/repo'
 import {
   createRecipe,
   createRecipesAtomic,
@@ -105,6 +105,9 @@ export default function App() {
   // overwritten) — shown as a banner with a recovery action each.
   const [identityDamaged, setIdentityDamaged] = useState<IdentityDamagedError | null>(null)
   const [corruptStores, setCorruptStores] = useState<CorruptStoreEntry[]>([])
+  // L-N3: IndexedDB persistence failed — recipes work in memory only
+  // this session and will not survive a reload. Shown as a banner.
+  const [persistenceDegraded, setPersistenceDegraded] = useState(false)
   const [friendsOpen, setFriendsOpen] = useState(false)
   const [friendShareId, setFriendShareId] = useState<string | null>(null)
   const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
@@ -120,6 +123,10 @@ export default function App() {
     const repo = getRepo()
     const index = await getOrCreateIndex(repo)
     setSummaries(await listRecipes(index))
+    // L-N3: a store call since the last refresh may have flipped the
+    // process into in-memory degraded mode — surface it now, not only
+    // at startup.
+    if (isPersistenceDegraded()) setPersistenceDegraded(true)
   }, [])
 
   const openDetail = useCallback(async (id: string) => {
@@ -227,6 +234,7 @@ export default function App() {
         listFriends()
         loadVault()
         loadShares()
+        loadSession()
         loadReceivedMap(secretKv)
         listHubs()
         loadPublications()
@@ -234,6 +242,7 @@ export default function App() {
         setCorruptStores(listCorruptStores())
       }
       await refresh()
+      if (isPersistenceDegraded()) setPersistenceDegraded(true)
     })()
       .catch((e) => setError(friendlyError(e)))
       .finally(() => setReady(true))
@@ -755,6 +764,24 @@ export default function App() {
               onClick={() => setBackupOpen(true)}
             >
               Open backup &amp; restore
+            </button>
+          </div>
+        </div>
+      )}
+      {persistenceDegraded && (
+        <div className="status error" data-testid="persistence-degraded-banner">
+          <strong>Your recipes are not being saved on this device.</strong>{' '}
+          The app could not use its on-device storage, so recipes work for
+          this session only and will be gone after a reload or restart. Free
+          up space on the device and reload to try again — and export a
+          backup before you leave, so nothing is lost.
+          <div className="modal-actions">
+            <button
+              className="primary"
+              data-testid="persistence-degraded-reload"
+              onClick={() => window.location.reload()}
+            >
+              Reload
             </button>
           </div>
         </div>

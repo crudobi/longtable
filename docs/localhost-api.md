@@ -125,6 +125,16 @@ A missing or wrong token gets **401** with an explanatory error.
 { "ok": true, "version": "1", "app": "longtable" }
 ```
 
+Health is the one unauthenticated route, by design: it only reports
+that the API is up, and it exists so scripts can find the API at all.
+The token comparison on every other route runs in constant time (Sec
+L7 — no early exit on the first differing byte). Accepted residual:
+the API binds loopback only, but on Android any app on the device can
+open a loopback connection, and an `adb forward` extends that reach to
+a tethered computer — so the token, plus the explicit opt-in, is the
+whole access control. Treat the token like a password for the
+cookbook, and do not forward the port to anything you do not trust.
+
 #### `GET /v1/identity`
 
 ```json

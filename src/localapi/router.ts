@@ -9,6 +9,13 @@
  * Rules baked in here:
  *  - GET /v1/health is the ONLY unauthenticated route. Everything else
  *    needs `Authorization: Bearer <token>` from the API settings.
+ *    The token is compared in constant time (Sec L7): a plain `!==`
+ *    leaks the first differing byte position through timing. Health
+ *    stays unauthenticated by design — it only says the API is up —
+ *    and the loopback-only bind is the boundary: on Android any local
+ *    app can reach loopback (including via an adb forward), so the
+ *    token, not the network, is the access control (accepted residual,
+ *    see docs/localhost-api.md).
  *  - Errors are `{ error: "<plain-language message>" }` with a correct
  *    status code. Stack traces and raw transport errors never surface.
  *  - Recipe writes validate with the Importer API's validator
@@ -60,6 +67,26 @@ const fail = (status: number, message: string): ApiResponse => ({
   status,
   body: { error: message },
 })
+
+/**
+ * Constant-time string equality (Sec L7). Compares every byte of both
+ * strings and folds the length difference into the result, so the
+ * runtime does not depend on where (or whether) the strings differ —
+ * a plain `!==` returns on the first differing byte and leaks its
+ * position through timing. This is a JS-level mitigation, not a
+ * cryptographic guarantee: JIT and GC jitter dominate at this scale,
+ * but the early-exit signal is gone. Exported for unit tests.
+ */
+export function constantTimeEqual(a: string, b: string): boolean {
+  const len = Math.max(a.length, b.length)
+  let diff = a.length ^ b.length
+  for (let i = 0; i < len; i++) {
+    const ac = i < a.length ? a.charCodeAt(i) : 0
+    const bc = i < b.length ? b.charCodeAt(i) : 0
+    diff |= ac ^ bc
+  }
+  return diff === 0
+}
 
 function headerValue(
   headers: Record<string, string>,
@@ -201,7 +228,8 @@ async function route(
   // Everything else is authenticated. The token lives in the API
   // settings; it is compared in full, as an Authorization bearer value.
   const auth = headerValue(req.headers, 'authorization')
-  if (!settings.token || auth !== `Bearer ${settings.token}`) {
+  // Constant-time compare (Sec L7) — see constantTimeEqual.
+  if (!settings.token || !constantTimeEqual(auth ?? '', `Bearer ${settings.token}`)) {
     return fail(
       401,
       'Missing or wrong API token. Send the token shown in Longtable ' +

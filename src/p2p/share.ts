@@ -204,12 +204,15 @@ export function loadShares(): ShareRecord[] {
 /**
  * Key/value-parameterized share-record access (Wave 3 C3: the encrypted
  * backup reads/writes share records through an injectable store instead
- * of the app's global localStorage). Same key, same shape, same
- * validation-light parse as loadShares; in the app `kv` IS localStorage,
- * so both paths see the same records. Records that fail the shape check
- * are dropped, never trusted.
+ * of the app's global store). Same key, same shape, same
+ * validation-light parse as loadShares. The default is secretKv —
+ * share records carry the 32-byte room secret, so they are crown
+ * jewels and route to the Keystore on native, exactly like
+ * loadShares(); the old raw-localStorage default was a stale
+ * pre-Keystore default that read a different store than the app
+ * writes to on native.
  */
-export function listShares(kv: KeyValueStore = localStorage): ShareRecord[] {
+export function listShares(kv: KeyValueStore = secretKv): ShareRecord[] {
   const read = readStoredJson(kv, SHARES_KEY)
   if (read.status === 'absent') return []
   if (read.status === 'corrupt') return []

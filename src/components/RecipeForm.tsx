@@ -54,15 +54,24 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
     setPhotoBusy(true)
     setSaveError(null)
     try {
-      const { urls, failed } = await filesToDataUrlsDetailed(files)
+      const { urls, failed, tooLarge } = await filesToDataUrlsDetailed(files)
       if (urls.length > 0) setPhotos((xs) => [...xs, ...urls])
+      const problems: string[] = []
       if (failed.length > 0) {
-        setSaveError(
+        problems.push(
           failed.length === 1
             ? `Couldn't attach “${failed[0]}” — the file couldn't be read as an image. Nothing was attached for it.`
             : `Couldn't attach ${failed.length} photos (${failed.join(', ')}) — those files couldn't be read as images. The rest were attached.`,
         )
       }
+      if (tooLarge.length > 0) {
+        problems.push(
+          tooLarge.length === 1
+            ? `Couldn't attach “${tooLarge[0]}” — it is still over the 5 MB photo limit after downscaling. Try a smaller photo.`
+            : `Couldn't attach ${tooLarge.length} photos (${tooLarge.join(', ')}) — they are still over the 5 MB photo limit after downscaling. The rest were attached.`,
+        )
+      }
+      if (problems.length > 0) setSaveError(problems.join(' '))
     } catch (e) {
       // attachPhotos is fired from an event handler (void) — a
       // rejection here used to vanish as an unhandled rejection (M18).

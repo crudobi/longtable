@@ -36,7 +36,11 @@ export function getDeviceClientId(): number {
 /** One cached Yjs document: the live doc plus its IndexedDB persistence. */
 export interface YjsDocEntry {
   doc: Y.Doc
-  persistence: IndexeddbPersistence
+  /**
+   * Null in degraded mode (L-N3): IndexedDB failed, so this doc lives
+   * in memory only. flush() skips null entries; nothing is persisted.
+   */
+  persistence: IndexeddbPersistence | null
 }
 
 /**
@@ -63,6 +67,138 @@ export interface YjsStore {
 let store: YjsStore | undefined
 
 /**
+ * L-N3 degraded mode (process-global): once any document's IndexedDB
+ * persistence fails (quota exceeded, IndexedDB unavailable or blocked),
+ * every document in this process is in-memory only. The flag is sticky
+ * for the process — re-trying a dead IndexedDB per document would only
+ * repeat the failure and its delay — and a reload re-attempts it. The
+ * app reads isPersistenceDegraded() at startup and shows the banner
+ * (App.tsx) so the user knows this session's edits will not survive.
+ */
+let persistenceDegraded = false
+let persistenceErrorMessage: string | null = null
+
+/** True once IndexedDB persistence has failed in this process. */
+export function isPersistenceDegraded(): boolean {
+  return persistenceDegraded
+}
+
+/** The first persistence failure's message (no stored data in it), if any. */
+export function getPersistenceErrorMessage(): string | null {
+  return persistenceErrorMessage
+}
+
+function markPersistenceDegraded(e: unknown): void {
+  if (!persistenceDegraded) {
+    console.warn(
+      '[longtable] IndexedDB persistence failed — running in-memory only for this session; ' +
+        'edits will not survive a reload:',
+      e instanceof Error ? e.message : String(e),
+    )
+  }
+  persistenceDegraded = true
+  if (persistenceErrorMessage === null) {
+    persistenceErrorMessage = e instanceof Error ? e.message : String(e)
+  }
+}
+
+/** Test hook: clear the degraded flag between tests in one file. */
+export function resetPersistenceStateForTests(): void {
+  persistenceDegraded = false
+  persistenceErrorMessage = null
+  probeOutcome = null
+}
+
+/** Result of the IndexedDB probe: ok, or the failure that proves it dead. */
+interface IndexedDbProbe {
+  ok: boolean
+  error?: unknown
+}
+
+/**
+ * How long the IndexedDB probe waits for an open that never answers
+ * (a blocked open can hang indefinitely) before calling it dead.
+ */
+const PROBE_TIMEOUT_MS = 5000
+
+/** Cached probe outcome for this process (cleared by resetPersistenceStateForTests). */
+let probeOutcome: Promise<IndexedDbProbe> | null = null
+
+/**
+ * Open a throwaway probe database to learn whether IndexedDB works at
+ * all in this process, BEFORE constructing any y-indexeddb persistence
+ * (see getOrCreateDoc). The probe database is deleted again on success.
+ * Never throws; a failure is a value. The probe runs at most once per
+ * process — a working IndexedDB is not re-probed per document, and a
+ * dead one flips the process into degraded mode anyway.
+ */
+function probeIndexedDb(dbName: string): Promise<IndexedDbProbe> {
+  if (!probeOutcome) probeOutcome = runIndexedDbProbe(dbName)
+  return probeOutcome
+}
+
+function runIndexedDbProbe(dbName: string): Promise<IndexedDbProbe> {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === 'undefined') {
+      resolve({ ok: false, error: new Error('IndexedDB is not available') })
+      return
+    }
+    let done = false
+    const finish = (result: IndexedDbProbe) => {
+      if (done) return
+      done = true
+      resolve(result)
+    }
+    const timer = setTimeout(
+      () => finish({ ok: false, error: new Error('IndexedDB open timed out') }),
+      PROBE_TIMEOUT_MS,
+    )
+    // Do not hold the test/node process open on the probe timer.
+    const maybeUnref = timer as unknown as { unref?: () => void }
+    if (typeof maybeUnref.unref === 'function') maybeUnref.unref()
+    const probeName = `${dbName}:probe`
+    let req: IDBOpenDBRequest
+    try {
+      req = indexedDB.open(probeName, 1)
+    } catch (e) {
+      clearTimeout(timer)
+      finish({ ok: false, error: e })
+      return
+    }
+    req.onsuccess = () => {
+      clearTimeout(timer)
+      try {
+        req.result.close()
+      } catch {
+        /* ignore */
+      }
+      try {
+        indexedDB.deleteDatabase(probeName)
+      } catch {
+        /* best-effort cleanup of the throwaway probe database */
+      }
+      finish({ ok: true })
+    }
+    req.onerror = () => {
+      clearTimeout(timer)
+      finish({ ok: false, error: req.error ?? new Error('IndexedDB open failed') })
+    }
+    // onblocked: another connection holds the probe DB — the timeout
+    // above decides; do not resolve early either way.
+    req.onblocked = () => undefined
+  })
+}
+
+/** A fresh in-memory doc: no persistence binding, stable clientID set now. */
+function newInMemoryDoc(guid: string): Y.Doc {
+  const doc = new Y.Doc({ guid })
+  // No IndexedDB replay to wait for, so the clientID can be set
+  // immediately (the persisted path sets it after whenSynced instead).
+  doc.clientID = getDeviceClientId()
+  return doc
+}
+
+/**
  * App-wide store singleton. One Y.Doc per recipe, persisted to IndexedDB.
  * Sync providers (P2P share rooms, friend channels) attach to these docs
  * from src/p2p and src/friends; the store itself stays a local container.
@@ -85,6 +221,7 @@ export function createRepo(dbName: string = REPO_DB_NAME): YjsStore {
     async flush(): Promise<void> {
       await Promise.all(
         [...docs.values()].map(async ({ persistence }) => {
+          if (!persistence) return
           const p = await persistence.whenSynced
           await p.get(FLUSH_KEY)
         }),
@@ -118,7 +255,7 @@ export function registerPagehideFlush(store: YjsStore): () => void {
 export function resetRepoForTests(): void {
   if (store) {
     for (const { persistence } of store.docs.values()) {
-      void persistence.destroy().catch(() => undefined)
+      if (persistence) void persistence.destroy().catch(() => undefined)
     }
     store = undefined
   }
@@ -146,6 +283,14 @@ export function docDbName(dbName: string, guid: string): string {
  * IMPORTANT: y-indexeddb silently drops updates that arrive before its
  * IndexedDB connection opens, so the doc must not be touched before the
  * returned promise resolves.
+ *
+ * L-N3: when IndexedDB persistence fails (quota exceeded, IndexedDB
+ * unavailable or blocked), this does NOT throw. Every store call goes
+ * through here, so throwing made the whole app unusable; instead the
+ * doc is created in memory (persistence: null), the process flips into
+ * degraded mode, and the app banner says the session's edits will not
+ * survive a reload. Reads, edits, shares, and friends channels all keep
+ * working in memory for this session.
  */
 export async function getOrCreateDoc(store: YjsStore, guid: string): Promise<Y.Doc> {
   const cached = store.docs.get(guid)
@@ -153,10 +298,56 @@ export async function getOrCreateDoc(store: YjsStore, guid: string): Promise<Y.D
   let p = store.pending.get(guid)
   if (!p) {
     p = (async (): Promise<Y.Doc> => {
-      const doc = new Y.Doc({ guid })
-      const persistence = new IndexeddbPersistence(docDbName(store.dbName, guid), doc)
       try {
-        await persistence.whenSynced
+        // Already degraded: do not re-attempt a dead IndexedDB.
+        if (persistenceDegraded) {
+          const memDoc = newInMemoryDoc(guid)
+          store.docs.set(guid, { doc: memDoc, persistence: null })
+          return memDoc
+        }
+        // Probe first (L-N3): y-indexeddb's whenSynced NEVER rejects —
+        // a failed open leaves it pending forever while the library's
+        // own .then on the failed open leaks an unhandled rejection.
+        // Probing with our own open (with handlers + timeout) is the
+        // only way to learn IndexedDB is dead BEFORE constructing the
+        // persistence, so the failure stays a clean fallback.
+        const probe = await probeIndexedDb(store.dbName)
+        if (!probe.ok) {
+          markPersistenceDegraded(
+            probe.error ?? new Error('IndexedDB could not be opened'),
+          )
+          const memDoc = newInMemoryDoc(guid)
+          store.docs.set(guid, { doc: memDoc, persistence: null })
+          return memDoc
+        }
+        const doc = new Y.Doc({ guid })
+        let persistence: IndexeddbPersistence | null = null
+        try {
+          persistence = new IndexeddbPersistence(docDbName(store.dbName, guid), doc)
+          // Defense in depth for a failure between the probe and this
+          // open (e.g. quota hit in between): race whenSynced against
+          // the persistence's own open promise, which DOES reject.
+          // (Accessing the private _db is pinned to this y-indexeddb
+          // version; the race is skipped if the shape ever changes.)
+          const dbReady = (persistence as unknown as { _db?: Promise<unknown> })._db
+          if (dbReady && typeof dbReady.then === 'function') {
+            await Promise.race([
+              persistence.whenSynced,
+              dbReady.then(() => new Promise<never>(() => undefined)),
+            ])
+          } else {
+            await persistence.whenSynced
+          }
+        } catch (e) {
+          // Persistence failed — fall back to an in-memory doc (see the
+          // header comment). The bound doc is discarded with the failed
+          // persistence; the in-memory replacement is a fresh doc.
+          await persistence?.destroy().catch(() => undefined)
+          markPersistenceDegraded(e)
+          const memDoc = newInMemoryDoc(guid)
+          store.docs.set(guid, { doc: memDoc, persistence: null })
+          return memDoc
+        }
         // Stable clientID: without this, edits after a restart get clock 0
         // under a fresh random clientID and can lose conflicts against the
         // pre-restart item (same clock 0, higher old clientID).
@@ -167,9 +358,6 @@ export async function getOrCreateDoc(store: YjsStore, guid: string): Promise<Y.D
         doc.clientID = getDeviceClientId()
         store.docs.set(guid, { doc, persistence })
         return doc
-      } catch (e) {
-        await persistence.destroy().catch(() => undefined)
-        throw e
       } finally {
         store.pending.delete(guid)
       }

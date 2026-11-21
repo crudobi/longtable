@@ -42,6 +42,16 @@ class LocalApiPlugin : Plugin() {
         private const val MAX_HEADER_BYTES = 64 * 1024
         /** How long a connection waits for the JS layer to answer. */
         private const val RESPONSE_TIMEOUT_MS = 30_000L
+        /**
+         * S20: one thread per accepted connection, no cap, would let a
+         * local client exhaust threads by opening connections and
+         * holding them (the ServerSocket backlog is 50, but accept()
+         * has no limit of its own). 32 leaves ample headroom for
+         * scripts + the e2e proof while bounding the thread count;
+         * the API is a single-user loopback service, not a server.
+         * Past the cap the socket gets a 503 and is closed.
+         */
+        private const val MAX_CONNECTIONS = 32
     }
 
     /** A request waiting for its JS-computed response. */
@@ -61,6 +71,7 @@ class LocalApiPlugin : Plugin() {
 
     private val pending = ConcurrentHashMap<String, Pending>()
     private val ids = AtomicLong(0)
+    private val activeConnections = AtomicInteger(0)
 
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var boundPort: Int = 0
@@ -166,6 +177,23 @@ class LocalApiPlugin : Plugin() {
             } catch (e: Exception) {
                 break // socket closed by stop()
             }
+            // S20: refuse past the connection cap instead of
+            // spawning another thread for it.
+            if (activeConnections.get() >= MAX_CONNECTIONS) {
+                try {
+                    writeResponse(
+                        socket.getOutputStream(), 503,
+                        "{\"error\":\"Too many connections to the localhost API.\"}",
+                    )
+                } catch (_: Exception) {
+                }
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
+                continue
+            }
+            activeConnections.incrementAndGet()
             val t = Thread({ handleConnection(socket) }, "longtable-localapi-conn")
             t.isDaemon = true
             t.start()
@@ -219,6 +247,7 @@ class LocalApiPlugin : Plugin() {
             } catch (_: Exception) {
             }
         } finally {
+            activeConnections.decrementAndGet()
             try {
                 socket.close()
             } catch (_: Exception) {

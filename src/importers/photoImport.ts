@@ -18,6 +18,17 @@
  * that list. `filesToDataUrls` keeps the old fail-the-batch contract
  * for any caller that wants it; `filesToDataUrlsDetailed` is the
  * partial-success form the form uses.
+ *
+ * Cap enforcement (Sec L13): the byte cap is checked on the RESULT
+ * here, not the input file — a large photo that downscales under the
+ * cap is kept, but a photo still over MAX_PHOTO_BYTES after
+ * downscaling (small dimensions with huge bytes, an undecodable file
+ * kept whole on a platform without canvas, or the no-DOM fallback)
+ * is reported in `tooLarge` and never stored. Before this, the cap
+ * was only checked at publish time, so an oversized photo could sit
+ * in IndexedDB (and in the 16 MiB API body) until publish refused it.
+ * Publish still re-checks (defense in depth); the 5 MiB cap itself is
+ * the single limit shared with the importer contract and publish.
  */
 import { u8ToBase64 } from '../identity/codec'
 
@@ -31,6 +42,21 @@ export const MAX_PHOTO_BYTES = 5 * 1024 * 1024
 export interface PhotoAttachResult {
   urls: string[]
   failed: string[]
+  /** Names of files still over MAX_PHOTO_BYTES after downscaling. */
+  tooLarge: string[]
+}
+
+/**
+ * Decoded byte size of a `data:<mime>;base64,...` URL (the cap is on
+ * BYTES, not the base64 string, which is ~4/3 larger). Exported for
+ * unit tests. A non-data URL is measured by its string length.
+ */
+export function dataUrlByteSize(url: string): number {
+  const comma = url.indexOf(',')
+  if (!url.startsWith('data:') || comma < 0) return url.length
+  const b64 = url.slice(comma + 1).replace(/\s/g, '')
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding)
 }
 
 /**
@@ -176,22 +202,35 @@ export async function filesToDataUrlsDetailed(
 ): Promise<PhotoAttachResult> {
   const urls: string[] = []
   const failed: string[] = []
+  const tooLarge: string[] = []
   for (const file of files) {
     if (!file.type.startsWith('image/')) continue
     try {
-      urls.push(await imageFileToDataUrl(file))
+      const url = await imageFileToDataUrl(file)
+      // Sec L13: the downscale may not have shrunk the photo (see the
+      // module header) — refuse the result, not just the input.
+      if (dataUrlByteSize(url) > MAX_PHOTO_BYTES) {
+        tooLarge.push(file.name || 'an unnamed image')
+      } else {
+        urls.push(url)
+      }
     } catch {
       failed.push(file.name || 'an unnamed image')
     }
   }
-  return { urls, failed }
+  return { urls, failed, tooLarge }
 }
 
 export async function filesToDataUrls(files: Iterable<File>): Promise<string[]> {
-  const { urls, failed } = await filesToDataUrlsDetailed(files)
+  const { urls, failed, tooLarge } = await filesToDataUrlsDetailed(files)
   if (failed.length > 0) {
     throw new Error(
       `Could not read ${failed.length === 1 ? 'this photo' : 'these photos'} as images: ${failed.join(', ')}.`,
+    )
+  }
+  if (tooLarge.length > 0) {
+    throw new Error(
+      `${tooLarge.length === 1 ? 'This photo is' : 'These photos are'} still over the 5 MB photo limit after downscaling: ${tooLarge.join(', ')}.`
     )
   }
   return urls

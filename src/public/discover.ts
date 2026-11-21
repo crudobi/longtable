@@ -73,6 +73,7 @@ import {
   type RecipeRecord,
 } from './publish'
 import { blobMatchesCid } from './blobCid'
+import { assertSafeHttpUrl } from '../hubs/endpointUrls'
 import { MAX_PHOTO_BYTES } from '../importers/photoImport'
 import { resolveAuthorPdsUrl } from './binding'
 
@@ -145,11 +146,14 @@ function trimSlash(url: string): string {
   return url.replace(/\/+$/, '')
 }
 
+/** AppView fetch timeout: a hung AppView must not pin a search/open forever (Sec L13). */
+const APPVIEW_FETCH_TIMEOUT_MS = 30_000
+
 async function getJson(
   fetchFn: FetchFn,
   url: string,
 ): Promise<{ status: number; data: unknown }> {
-  const res = await fetchFn(url)
+  const res = await fetchFn(url, { signal: AbortSignal.timeout(APPVIEW_FETCH_TIMEOUT_MS) })
   let data: unknown = null
   try {
     data = await res.json()
@@ -241,6 +245,8 @@ export async function searchAppView(
   query: SearchQuery = {},
   fetchFn: FetchFn = (url, init) => fetch(url, init),
 ): Promise<PublicSearchResult[]> {
+  // Sec L14: refuse a plaintext AppView URL to a non-local host.
+  assertSafeHttpUrl(appViewUrl, 'Discovery (AppView) URL')
   const base = trimSlash(appViewUrl)
   const params = new URLSearchParams()
   if (query.q) params.set('q', query.q)
@@ -436,6 +442,8 @@ export async function fetchPublicRecipe(
   fetchFn: FetchFn = (url, init) => fetch(url, init),
   options: FetchPublicRecipeOptions = {},
 ): Promise<PublicRecipe> {
+  // Sec L14: refuse a plaintext AppView URL to a non-local host.
+  assertSafeHttpUrl(appViewUrl, 'Discovery (AppView) URL')
   const base = trimSlash(appViewUrl)
   const attempts = [
     `${base}/recipe/${encodeURIComponent(did)}/${encodeURIComponent(rkey)}`,

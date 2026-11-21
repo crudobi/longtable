@@ -133,8 +133,8 @@ const GOOD_HUB = {
   id: 'hub-b',
   name: 'Hub B',
   signalingUrl: 'wss://hub-b.example:4444',
-  appviewUrl: 'http://hub-b.example:3210',
-  pdsUrl: 'http://hub-b.example:2583',
+  appviewUrl: 'https://hub-b.example:3211',
+  pdsUrl: 'https://hub-b.example:2584',
 }
 
 /** Minimal fake Keystore backend (same shape as secrets.test.ts). */
