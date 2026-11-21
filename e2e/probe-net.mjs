@@ -27,7 +27,6 @@ if (!TURN_CREDENTIAL) {
   } catch { /* probe will fail its TURN check loudly if unprovisioned */ }
 }
 
-const APPIUM = 'http://127.0.0.1:4723'
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
 const udid = process.argv[2]
 if (!udid) { console.error('usage: probe-net.mjs <serial>'); process.exit(2) }

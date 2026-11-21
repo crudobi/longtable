@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // Timing probe: attach load listeners at various points, see which fire.
 const CDP_PORT = process.argv[2] || '9333'
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function main() {
   const targets = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json()

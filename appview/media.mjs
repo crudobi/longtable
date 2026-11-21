@@ -276,7 +276,7 @@ export function createMediaCache({
   function cacheEntries() {
     const entries = []
     let total = 0
-    let subs = []
+    let subs
     try {
       subs = fs.readdirSync(dir, { withFileTypes: true })
     } catch {
@@ -285,7 +285,7 @@ export function createMediaCache({
     for (const sub of subs) {
       if (!sub.isDirectory()) continue
       const subPath = path.join(dir, sub.name)
-      let files = []
+      let files
       try {
         files = fs.readdirSync(subPath)
       } catch {
@@ -330,7 +330,7 @@ export function createMediaCache({
    */
   function sweepStaleTmp({ all = false } = {}) {
     let removed = 0
-    let subs = []
+    let subs
     try {
       subs = fs.readdirSync(dir, { withFileTypes: true })
     } catch {
@@ -340,7 +340,7 @@ export function createMediaCache({
     for (const sub of subs) {
       if (!sub.isDirectory()) continue
       const subPath = path.join(dir, sub.name)
-      let files = []
+      let files
       try {
         files = fs.readdirSync(subPath)
       } catch {

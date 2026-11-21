@@ -41,7 +41,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src vite.config.ts capacitor.config.ts"
+    "lint": "eslint src vite.config.ts capacitor.config.ts appview hub signaling services e2e scripts examples tools"
   },
   "type": "module",
   "version": "0.1.0",

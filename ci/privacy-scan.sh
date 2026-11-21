@@ -3,11 +3,26 @@
 #
 # Usage:
 #   privacy-scan.sh [--secrets FILE] [--patterns FILE] [--allowlist FILE]
-#                   [--rev <rev>] <target>
-#   <target> is a directory (scans its tracked files via git ls-files,
-#   or all files if it is not a repo) or a single file (e.g. release
-#   notes). With --rev, <target> must be a git repo and the scan runs
-#   git grep at that revision instead of the worktree (history scan).
+#                   [--generic-only] [--rev <rev>] <target>
+#   <target> is a directory (scans its tracked + untracked non-ignored
+#   files via git ls-files, or all files if it is not a repo) or a
+#   single file (e.g. release notes). With --rev, <target> must be a git
+#   repo and the scan runs git grep at that revision instead of the
+#   worktree (history scan).
+#
+#   Directory mode (S26): tracked AND untracked files are scanned —
+#   a secret in a new untracked file used to pass a local scan.
+#   Gitignored files are deliberately NOT scanned: they are build
+#   outputs and local secret-adjacent files (dist/, *.jks, .env,
+#   turn-password.txt) that are never committed and never published
+#   as source; the artifact gates (release_turn_clean,
+#   forbidden_literals_clean_dir, release_artifacts_clean) cover the
+#   built/published artifacts those files can reach instead.
+#
+#   Without --secrets and without STATE (S29), the scan FAILS (exit 2):
+#   a generic-patterns-only scan is a reduced gate and must be asked
+#   for explicitly with --generic-only. The pipeline and the history
+#   scan always pass --secrets.
 #
 # Patterns come from two sources:
 #   * the checked-in generic pattern file (ERE classes: private-key
@@ -23,7 +38,8 @@
 # Matches are filtered through the allow-list (file glob + ERE against
 # the matched text). Output is file:line + pattern class ONLY — matched
 # content is never printed, so a secret value can never reach stdout or
-# a CI log.
+# a CI log. Binary blobs have no line: a secrets hit in one is reported
+# as file:0:secret-binary (S30).
 #
 # Exit 0 = clean, 1 = hits found, 2 = usage/config error.
 set -uo pipefail
@@ -31,6 +47,7 @@ set -uo pipefail
 PATTERNS=""
 ALLOWLIST=""
 SECRETS=""
+GENERIC_ONLY=0
 REV=""
 TARGET=""
 
@@ -39,9 +56,10 @@ while [ $# -gt 0 ]; do
     --secrets)   [ $# -ge 2 ] || { echo "privacy-scan: --secrets needs a value" >&2; exit 2; }; SECRETS=$2; shift 2 ;;
     --patterns)  [ $# -ge 2 ] || { echo "privacy-scan: --patterns needs a value" >&2; exit 2; }; PATTERNS=$2; shift 2 ;;
     --allowlist) [ $# -ge 2 ] || { echo "privacy-scan: --allowlist needs a value" >&2; exit 2; }; ALLOWLIST=$2; shift 2 ;;
+    --generic-only) GENERIC_ONLY=1; shift ;;
     --rev)       [ $# -ge 2 ] || { echo "privacy-scan: --rev needs a value" >&2; exit 2; }; REV=$2; shift 2 ;;
     -h|--help)
-      sed -n '2,25p' "${BASH_SOURCE[0]}"
+      sed -n '2,44p' "${BASH_SOURCE[0]}"
       exit 0 ;;
     --) shift; break ;;
     -*) echo "privacy-scan: unknown option $1" >&2; exit 2 ;;
@@ -61,8 +79,14 @@ if [ -z "$SECRETS" ]; then
       echo "privacy-scan: STATE is set but $STATE/privacy-secrets is missing; refusing to scan without the secrets patterns" >&2
       exit 2
     fi
+  elif [ "$GENERIC_ONLY" = 1 ]; then
+    echo "privacy-scan: --generic-only: scanning generic patterns only (no secrets file — reduced gate, acknowledged)" >&2
   else
-    echo "privacy-scan: no --secrets given and STATE unset; scanning generic patterns only" >&2
+    # S29: a generic-patterns-only scan must be asked for explicitly.
+    # Silently scanning without the secrets file used to exit 0 with a
+    # stderr warning — a caller that forgot --secrets looked clean.
+    echo "privacy-scan: no --secrets given and STATE unset; refusing to scan generic patterns only (pass --generic-only to acknowledge the reduced scan)" >&2
+    exit 2
   fi
 fi
 [ -f "$PATTERNS" ] || { echo "privacy-scan: pattern file missing: $PATTERNS" >&2; exit 2; }
@@ -87,12 +111,25 @@ FILE_COUNT=0
 
 # allow-listed? $1 = file path, $2 = matched text. True when some entry
 # matches both the file glob and the matched text.
+# S28: the glob is matched against the path AND each of its trailing
+# suffixes (stripping leading components one at a time), so a file
+# scanned by absolute path (single-file mode: /tmp/…/notes,
+# /abs/path/hub/hub.mjs) gets the same file-specific exemptions as the
+# same file scanned by repo-relative path (directory/--rev mode:
+# hub/hub.mjs). Single-file mode used to drop those exemptions —
+# fail-closed, but inconsistent. The suffix rule only widens matches
+# to paths ENDING in the listed path; the matched text must still
+# satisfy the anchored ERE exactly.
 allowlisted() {
-  local f=$1 m=$2 g r
+  local f=$1 m=$2 g r p
   while IFS=$'\t' read -r g r || [ -n "$g" ]; do
     case "$g" in ''|'#'*) continue ;; esac
     [ -n "${r:-}" ] || continue
-    case "$f" in $g) [[ "$m" =~ $r ]] && return 0 ;; esac
+    p="$f"
+    while :; do
+      case "$p" in $g) [[ "$m" =~ $r ]] && return 0 ;; esac
+      case "$p" in */*) p=${p#*/} ;; *) break ;; esac
+    done
   done < "$ALLOWLIST"
   return 1
 }
@@ -134,6 +171,24 @@ if [ -n "$REV" ]; then
     (cd "$TARGET" && git grep -I -n -o -i -F -f "$SECRETS" "$REV" -- 2>/dev/null || true) |
       cut -d: -f2- > "$TMP/secrets_raw"
     filter_secrets "$TMP/secrets_raw"
+    # S30: git grep -I skips binary blobs, so a secret inside a binary
+    # file (e.g. a keystore) in history was invisible. Second pass
+    # without -I, listing files only: -o on a binary blob prints
+    # "Binary file … matches", which is unparseable, while -l gives
+    # clean paths. Files the -I pass already reported are not
+    # re-reported; the rest become file:0:secret-binary hits (a binary
+    # blob has no line number). Generic patterns are NOT run here:
+    # EREs on binary bytes are noise-prone (random digit runs match
+    # phone-number classes), while fixed secrets literals cannot match
+    # by chance — the residual (generic classes in binary blobs) is
+    # documented in ci/README.md.
+    (cd "$TARGET" && git grep -l -i -F -f "$SECRETS" "$REV" -- 2>/dev/null || true) |
+      cut -d: -f2- | sort -u > "$TMP/secrets_binary_files"
+    cut -d: -f1 "$TMP/secrets_raw" | sort -u > "$TMP/secrets_text_files"
+    comm -23 "$TMP/secrets_binary_files" "$TMP/secrets_text_files" > "$TMP/secrets_binary_only" || true
+    while IFS= read -r bf || [ -n "$bf" ]; do
+      printf '%s:0:secret-binary\n' "$bf" >> "$HITS"
+    done < "$TMP/secrets_binary_only"
   fi
 elif [ -f "$TARGET" ]; then
   # --- single-file mode (e.g. release notes) ---
@@ -141,26 +196,37 @@ elif [ -f "$TARGET" ]; then
   grep -HInoE -f "$TMP/patterns" -- "$TARGET" > "$TMP/generic_raw" || true
   filter_generic "$TMP/generic_raw"
   if [ -n "$SECRETS" ]; then
-    grep -HInioF -f "$SECRETS" -- "$TARGET" > "$TMP/secrets_raw" || true
+    # -a: a binary single file (e.g. a keystore passed directly) must
+    # still be searched for secrets literals (S30, same blind spot as
+    # --rev mode; grep without -a reports no match on binary input).
+    grep -HInioaF -f "$SECRETS" -- "$TARGET" > "$TMP/secrets_raw" || true
     filter_secrets "$TMP/secrets_raw"
   fi
 elif [ -d "$TARGET" ]; then
   # --- directory mode: tracked files if a repo, else all files ---
   : > "$TMP/generic_raw"
   if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
-    (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HInoE -f "$TMP/patterns" -- > "$TMP/generic_raw" || true)
-    FILE_COUNT=$(cd "$TARGET" && git ls-files | wc -l)
+    # S26: tracked AND untracked (non-ignored) files, from one list
+    # shared by both passes. git ls-files alone skipped untracked
+    # files, so a secret in a new file passed a local scan.
+    # Gitignored files stay out deliberately (see the header comment).
+    (cd "$TARGET" && git ls-files --cached --others --exclude-standard -z > "$TMP/files0")
+    FILE_COUNT=$(tr -cd '\0' < "$TMP/files0" | wc -c)
+    (cd "$TARGET" && xargs -r -0 grep -HInoE -f "$TMP/patterns" -- < "$TMP/files0" > "$TMP/generic_raw" || true)
+    filter_generic "$TMP/generic_raw"
+    if [ -n "$SECRETS" ]; then
+      # -a: binary files in the tree must still be searched for secrets
+      # literals (S30; grep without -a reports no match on binary input).
+      (cd "$TARGET" && xargs -r -0 grep -HInioaF -f "$SECRETS" -- < "$TMP/files0" > "$TMP/secrets_raw" || true)
+      filter_secrets "$TMP/secrets_raw"
+    fi
   else
     (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HInoE -f "$TMP/patterns" -- > "$TMP/generic_raw" || true)
     FILE_COUNT=$(cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' | wc -l)
-  fi
-  filter_generic "$TMP/generic_raw"
-  if [ -n "$SECRETS" ]; then
-    if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
-      (cd "$TARGET" && git ls-files -z | xargs -r -0 grep -HInioF -f "$SECRETS" -- 2>/dev/null || true)  > "$TMP/secrets_raw"
-      filter_secrets "$TMP/secrets_raw"
-    else
-      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HInioF -f "$SECRETS" -- 2>/dev/null || true)  > "$TMP/secrets_raw"
+    filter_generic "$TMP/generic_raw"
+    if [ -n "$SECRETS" ]; then
+      # -a: binary files must still be searched for secrets literals (S30).
+      (cd "$TARGET" && find . -type f -not -path './.git/*' -not -path '*/node_modules/*' -printf '%P\0' | xargs -r -0 grep -HInioaF -f "$SECRETS" -- 2>/dev/null || true)  > "$TMP/secrets_raw"
       filter_secrets "$TMP/secrets_raw"
     fi
   fi

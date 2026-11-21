@@ -54,11 +54,23 @@ fi
 # runner, status/history logging, always-teardown, main loop. The
 # bootstrap above stays here — the lib cannot locate itself — and
 # LT_* operator overrides keep working via the CI_* mapping below.
+# Sec L21: the shared lib is sourced by path and unpinned, so verify
+# it against the repo-recorded pin (ci/ci-lib.sha256) BEFORE sourcing
+# it. A hash mismatch fails closed: the lib is shared infrastructure,
+# and a drifted lib must be reviewed + re-pinned, never silently
+# executed. The pin lives in the repo (reviewed, committed); the lib
+# itself lives outside the repo, so a commit cannot tamper with it —
+# the pin only guards against an unreviewed local change to the lib.
+CI_REPO=${CI_REPO:-${LT_REPO:-$ROOT/code/longtable}}
 CI_LIB=$ROOT/ops/shared/ci/ci-lib.sh
 [ -f "$CI_LIB" ] || { echo "[ci] shared CI lib missing at $CI_LIB" >&2; exit 1; }
+CI_LIB_PIN=$CI_REPO/ci/ci-lib.sha256
+[ -f "$CI_LIB_PIN" ] || { echo "[ci] shared CI lib pin missing at $CI_LIB_PIN" >&2; exit 1; }
+CI_LIB_PIN_HASH=$(grep -v '^[[:space:]]*#' "$CI_LIB_PIN" | awk '{print $1}' | head -1)
+[ -n "$CI_LIB_PIN_HASH" ] || { echo "[ci] shared CI lib pin empty at $CI_LIB_PIN" >&2; exit 1; }
+[ "$(sha256sum "$CI_LIB" | cut -d' ' -f1)" = "$CI_LIB_PIN_HASH" ] || { echo "[ci] shared CI lib hash mismatch: $CI_LIB differs from the pin in $CI_LIB_PIN — review the lib diff and re-pin" >&2; exit 1; }
 . "$CI_LIB"
 CI_ROOT=$ROOT
-CI_REPO=${CI_REPO:-${LT_REPO:-$ROOT/code/longtable}}
 CI_STATE_DIR=${CI_STATE_DIR:-${LT_CI_STATE:-$ROOT/ops/longtable-ci}}
 REPO=$CI_REPO
 STATE=$CI_STATE_DIR
@@ -98,6 +110,43 @@ BUNDLETOOL_JAR=${LT_BUNDLETOOL_JAR:-$ROOT/tools/bundletool/bundletool-all-1.18.1
 if [ -f "$STATE/ci.env" ]; then set -a; . "$STATE/ci.env"; set +a; fi
 
 mkdir -p "$LOGS" "$STATE/work"
+
+# --- drift check (Sec L21) ---------------------------------------------------
+# The installed pipeline must track the repo: a stale installed copy
+# silently runs old gates (the pre-H3 installed copy ran the worktree
+# scanner instead of the pinned one, skipped commit/tag message scans,
+# and used the shared lib's main loop that marked failed runs
+# processed). Fail closed on drift; the operator re-runs
+# ci/install-ci.sh after any ci/ change, before the next run can go
+# green. This check runs before the lock is taken, so a drifted run
+# fails fast without holding the fleet lock.
+for _drift_f in run-pipeline.sh history-scan.sh; do
+  if [ -f "$REPO/ci/$_drift_f" ]; then
+    cmp -s "$STATE/$_drift_f" "$REPO/ci/$_drift_f" || { ci_say "drift: installed $STATE/$_drift_f differs from $REPO/ci/$_drift_f — run ci/install-ci.sh"; exit 1; }
+  fi
+done
+
+# filter_mapped_hits <baseline-json> <mapped-hits-file>: print the
+# mapped hits (label:line:class, one per line) that are NOT in the
+# ops history-scan baseline's message_hits. Used by the commit/tag
+# message scan (S25) and the release-notes scan: a hit the operator
+# already reviewed and baselined is known-benign; anything else fails
+# the run. A missing/unreadable baseline filters NOTHING (fail closed
+# — the run then fails on any message hit, including known residue).
+filter_mapped_hits() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+try:
+    known = set(json.load(open(sys.argv[1])).get("message_hits", []))
+except Exception as e:
+    print(f"filter: baseline unreadable ({sys.argv[1]}): {e}; filtering nothing", file=sys.stderr)
+    known = set()
+for line in open(sys.argv[2]):
+    line = line.strip()
+    if line and line not in known:
+        print(line)
+PYEOF
+}
 
 # --- serialization (shared lib) ---------------------------------------------
 ci_acquire_lock "$LOCK_FILE"
@@ -142,26 +191,106 @@ pinned_scanner_check() {
 # pinned patterns file (EREs, no real values); specific values live
 # only in the ops-side $STATE/privacy-secrets (0600, read with
 # grep -f). A missing scanner/pin, a missing secrets file, or any hit
-# fails the run. Commit and tag messages are scanned too (M18): they
-# are not in the tree, so the tree scan cannot see them — a secret in
-# a commit subject is caught here, before any build or publish, which
-# also closes S25 (the release-notes scan used to be the first look
-# at subjects, and it ran after publish). Tag annotations are scanned
-# when HEAD carries an exact tag. See ci/README.md.
+# fails the run. Commit and tag messages are scanned too (M18/S25):
+# they are not in the tree, so the tree scan cannot see them. The
+# message scan covers every commit the release notes will quote
+# (previous-tag..HEAD — a batch push can land several commits in one
+# run, and scanning HEAD only would miss a secret in an intermediate
+# subject), plus the HEAD tag annotation, BEFORE any build or publish
+# — which closes S25: the release-notes scan in do_github_release is
+# defense in depth on the generated notes, not the first look at the
+# subjects. Hits already recorded in the ops history-scan baseline
+# (message_hits) are known-benign and filtered out by exact
+# (rev, line, class) match via filter_mapped_hits; anything else fails
+# the run. A missing/unreadable baseline filters nothing (fail closed).
+# See ci/README.md.
 do_secret_scan() {
   pinned_scanner_check || return 1
   "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$WT" || return 1
-  local msg_tmp tag rc
+  local msg_tmp prev revs tag rc
   msg_tmp=$(mktemp -d)
-  git -C "$WT" log -1 --format=%B "$TARGET_HASH" > "$msg_tmp/message.txt" || { rm -rf "$msg_tmp"; return 1; }
-  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
-  if [ -n "$tag" ]; then
-    git -C "$WT" for-each-ref --format='%(contents)' "refs/tags/$tag" >> "$msg_tmp/message.txt" || { rm -rf "$msg_tmp"; return 1; }
+  prev=$(git -C "$WT" describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+  if [ -n "$prev" ]; then
+    revs=$(git -C "$WT" rev-list "$prev..HEAD") || { rm -rf "$msg_tmp"; return 1; }
+  else
+    revs="$TARGET_HASH"
   fi
-  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$msg_tmp/message.txt"
-  rc=$?
+  : > "$msg_tmp/messages.txt"
+  for rev in $revs; do
+    {
+      echo "---msg $rev---"
+      git -C "$WT" show -s --format=%B "$rev"
+    } >> "$msg_tmp/messages.txt" || { rm -rf "$msg_tmp"; return 1; }
+  done
+  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  : > "$msg_tmp/tags.txt"
+  if [ -n "$tag" ]; then
+    {
+      echo "---tag $tag---"
+      git -C "$WT" for-each-ref --format='%(contents)' "refs/tags/$tag"
+    } >> "$msg_tmp/messages.txt" || { rm -rf "$msg_tmp"; return 1; }
+    printf '%s\n' "$tag" > "$msg_tmp/tags.txt"
+  fi
+  rc=0
+  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$msg_tmp/messages.txt" > "$msg_tmp/scan_out" 2>&1 || rc=$?
+  if [ "$rc" = 2 ]; then rm -rf "$msg_tmp"; return 1; fi
+  if [ "$rc" = 1 ]; then
+    # Map scanner hits back to their rev/tag by section header (same
+    # mapping as ci/history-scan.sh: a header is only trusted when it
+    # matches ---msg <40-hex>--- exactly, or ---tag <name>--- with
+    # <name> a real tag, so a message line that merely looks like a
+    # header cannot misattribute a hit), then filter known-baseline
+    # hits. Scanner output is file:line:class only — no content.
+    grep -F "$msg_tmp/messages.txt:" "$msg_tmp/scan_out" | sed "s|^$msg_tmp/messages.txt:||" > "$msg_tmp/rawhits" || true
+    if [ ! -s "$msg_tmp/rawhits" ]; then
+      ci_say "secret-scan: scanner reported hits but none could be mapped (unexpected output format); failing closed"
+      rm -rf "$msg_tmp"
+      return 1
+    fi
+    python3 - "$msg_tmp/messages.txt" "$msg_tmp/rawhits" "$msg_tmp/tags.txt" > "$msg_tmp/mapped" <<'PYEOF'
+import re, sys
+msg_path, rawhits_path, tags_path = sys.argv[1:4]
+tags = {l.strip() for l in open(tags_path) if l.strip()}
+sections = []
+with open(msg_path) as f:
+    for i, line in enumerate(f, start=1):
+        line = line.rstrip('\n')
+        m = re.fullmatch(r'---msg ([0-9a-f]{40})---', line)
+        if m:
+            sections.append((i, m.group(1)[:12]))
+            continue
+        m = re.fullmatch(r'---tag ([^ ]+)---', line)
+        if m and m.group(1) in tags:
+            sections.append((i, 'tag:' + m.group(1)))
+out = []
+for raw in open(rawhits_path):
+    raw = raw.strip()
+    if not raw:
+        continue
+    num, _, cls = raw.rpartition(':')
+    lineno = int(num)
+    label, start = None, None
+    for s_line, s_label in reversed(sections):
+        if s_line <= lineno:
+            label, start = s_label, s_line
+            break
+    if label is None:
+        continue
+    out.append(f'{label}:{lineno - start}:{cls}')
+if out:
+    print('\n'.join(sorted(set(out))))
+PYEOF
+    filter_mapped_hits "$STATE/history-scan-baseline.json" "$msg_tmp/mapped" > "$msg_tmp/unknown" || { rm -rf "$msg_tmp"; return 1; }
+    if [ -s "$msg_tmp/unknown" ]; then
+      ci_say "secret-scan: unknown commit/tag message hits (not in the history-scan baseline):"
+      sed 's/^/secret-scan:   /' "$msg_tmp/unknown"
+      rm -rf "$msg_tmp"
+      return 1
+    fi
+    ci_say "secret-scan: message hits all known (history-scan baseline)"
+  fi
   rm -rf "$msg_tmp"
-  return $rc
+  return 0
 }
 # Legacy-hub digest check (review C1): the migration in src/hubs/hubs.ts
 # matches the pre-scrub default hub by FNV-1a-64 digest, and the digests
@@ -175,6 +304,36 @@ do_secret_scan() {
 # mismatches. Runs right after secret-scan, before anything builds.
 do_legacy_digests() {
   "$WT/ci/check-legacy-hub-digests.py" "$WT"
+}
+# versionCode monotonicity guard: versionCode is `git rev-list --count
+# HEAD` (android/app/build.gradle), so it is monotonic by construction
+# — unless history is rewritten (rebase / force-push dropping commits),
+# in which case a new release would ship a LOWER versionCode than the
+# last tagged release and Play would refuse it (or worse, devices
+# would see a downgrade). Compare HEAD's count against the most recent
+# tag reachable from HEAD: in un-rewritten history the tag is an
+# ancestor, so its count can never exceed HEAD's. Fails closed when
+# either count cannot be derived. No tag reachable yet (before the
+# first release) skips cleanly — there is nothing to go backwards from.
+# The count is recorded as VERSION_CODE for status.json (run_one).
+VERSION_CODE=""
+do_version_guard() {
+  local current tag tag_count
+  current=$(git -C "$WT" rev-list --count HEAD) || return 1
+  case "$current" in ''|*[!0-9]*) ci_say "version-guard: could not derive versionCode (rev-list --count HEAD)"; return 1 ;; esac
+  VERSION_CODE="$current"
+  tag=$(git -C "$WT" describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+  if [ -z "$tag" ]; then
+    ci_say "version-guard: no reachable tag; versionCode $current has nothing to go backwards from"
+    return 0
+  fi
+  tag_count=$(git -C "$WT" rev-list --count "$tag") || return 1
+  case "$tag_count" in ''|*[!0-9]*) ci_say "version-guard: could not derive versionCode at $tag"; return 1 ;; esac
+  if [ "$current" -lt "$tag_count" ]; then
+    ci_say "version-guard: versionCode $current < $tag_count at tag $tag — history rewrite; refusing"
+    return 1
+  fi
+  ci_say "version-guard: versionCode $current >= $tag_count ($tag); monotonic"
 }
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
@@ -251,11 +410,16 @@ release_apk_hooks_clean() {
 }
 # The rotated dev TURN password must not ship either. The pattern is
 # read from the ops password file (grep -f), so the value itself never
-# appears on a command line or in a log.
+# appears on a command line or in a log. S27: a missing or empty
+# password file FAILS CLOSED — the old guard returned 0 when the file
+# was absent, silently skipping the only rotated-password check on
+# dist/assets. If the file is gone, nothing ships unverified.
 release_turn_clean() {
-  if [ -s "$STATE/dev-turn-password" ]; then
-    ! grep -rqF -f "$STATE/dev-turn-password" "$WT/dist/assets"
+  if [ ! -s "$STATE/dev-turn-password" ]; then
+    ci_say "release_turn_clean: dev-turn-password missing or empty at $STATE/dev-turn-password; refusing to ship an unverified bundle"
+    return 1
   fi
+  ! grep -rqF -f "$STATE/dev-turn-password" "$WT/dist/assets"
 }
 # Forbidden literals must never ship in the bundle or the release
 # archives. The patterns are the single ops-side file
@@ -445,17 +609,146 @@ do_github_release() {
   } >"$notes" || { rm -f "$notes"; return 1; }
   # Scan the generated release notes with the same privacy patterns
   # before publishing, with the PINNED scanner (H3). The secret-scan
-  # stage already scanned the commit subjects before any build, so
-  # this is defense in depth on the generated notes themselves. A hit
-  # (or a missing scanner/secrets file) fails the stage; nothing is
-  # published.
+  # stage already scanned the commit subjects before any build (S25),
+  # so this is defense in depth on the generated notes themselves. A
+  # hit (or a missing scanner/secrets file) fails the stage; nothing is
+  # published. Hits on lines quoting a commit whose message hit is
+  # already recorded in the ops history-scan baseline (message_hits)
+  # are known-benign and filtered out by exact (rev, line, class)
+  # match — without this, the next tagged run would fail here on the
+  # known e99e089 residue (its subject names the dev-box hostname and
+  # is quoted in every release-notes range since v0.2.2). A hit on any
+  # other line (headers, checksums, or a subject with no baselined
+  # hit) stays unknown and fails the stage (fail closed).
   pinned_scanner_check || { rm -f "$notes"; return 1; }
-  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$notes" || { rm -f "$notes"; return 1; }
+  local notes_rc=0 notes_scan_out="$notes.scan-out" notes_rawhits="$notes.rawhits" notes_unknown="$notes.unknown"
+  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$notes" > "$notes_scan_out" 2>&1 || notes_rc=$?
+  if [ "$notes_rc" = 2 ]; then rm -f "$notes" "$notes_scan_out" "$notes_rawhits" "$notes_unknown"; return 1; fi
+  if [ "$notes_rc" = 1 ]; then
+    grep -F "$notes:" "$notes_scan_out" | sed "s|^$notes:||" > "$notes_rawhits" || true
+    if [ ! -s "$notes_rawhits" ]; then
+      ci_say "github-release: scanner reported hits but none could be mapped (unexpected output format); failing closed"
+      rm -f "$notes" "$notes_scan_out" "$notes_rawhits" "$notes_unknown"
+      return 1
+    fi
+    python3 - "$STATE/history-scan-baseline.json" "$notes" "$notes_rawhits" "$WT" > "$notes_unknown" <<'PYEOF'
+import json, re, subprocess, sys
+baseline_path, notes_path, rawhits_path, repo = sys.argv[1:5]
+try:
+    known = set(json.load(open(baseline_path)).get("message_hits", []))
+except Exception as e:
+    print(f"filter: baseline unreadable ({baseline_path}): {e}; filtering nothing", file=sys.stderr)
+    known = set()
+lines = open(notes_path).read().split("\n")
+out = []
+for raw in open(rawhits_path):
+    raw = raw.strip()
+    if not raw:
+        continue
+    num, _, cls = raw.rpartition(":")
+    lineno = int(num)
+    line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+    # Notes lines quote commits as "- <subject> (<short-hash>)"; the
+    # subject is message line 1, so the candidate baseline key is
+    # "<rev12>:1:<class>". No trailing hash (headers, checksums) or an
+    # unresolvable hash stays unknown — fail closed.
+    m = re.search(r"\(([0-9a-f]{7,40})\)\s*$", line)
+    if not m:
+        out.append(f"notes:{lineno}:{cls}")
+        continue
+    try:
+        full = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", m.group(1) + "^{commit}"], text=True
+        ).strip()
+    except Exception:
+        out.append(f"notes:{lineno}:{cls}")
+        continue
+    if f"{full[:12]}:1:{cls}" not in known:
+        out.append(f"notes:{lineno}:{cls}")
+if out:
+    print("\n".join(sorted(set(out))))
+PYEOF
+    if [ -s "$notes_unknown" ]; then
+      ci_say "github-release: unknown release-notes hits (not in the history-scan baseline):"
+      sed 's/^/github-release:   /' "$notes_unknown"
+      rm -f "$notes" "$notes_scan_out" "$notes_rawhits" "$notes_unknown"
+      return 1
+    fi
+    ci_say "github-release: release-notes hits all known (history-scan baseline)"
+  fi
+  rm -f "$notes_scan_out" "$notes_rawhits" "$notes_unknown"
   gh release create "$tag" --repo "$repo" --title "Longtable $tag" --notes-file "$notes" \
     "$PUBLISH_RELEASE_APK" "$PUBLISH_AAB" "$PUBLISH_RELEASE_APK.sha256" "$PUBLISH_AAB.sha256" || { rm -f "$notes"; return 1; }
   rm -f "$notes"
   ci_say "github-release: published https://github.com/$repo/releases/tag/$tag"
   GITHUB_RELEASE=published
+}
+
+# Post-publish verification: re-download the GitHub Release assets and
+# check them against the sidecars. Nothing here re-proves the build —
+# the artifacts were already verified before publish — it proves the
+# PUBLISH: that what GitHub serves is byte-identical to what this run
+# published (no truncated upload, no swapped asset, no stale sidecar).
+# Runs ONLY when this run published a GitHub release; otherwise skips
+# cleanly. Each downloaded asset is checked twice (digests only in the
+# log): against its downloaded .sha256 sidecar, and against the local
+# published file. A download failure is retried (GitHub can lag the
+# create call by seconds); a checksum mismatch fails the stage loudly
+# — the release is already public at that point, so the failure is
+# recorded in status.json for the operator, not silently absorbed.
+do_post_publish_verify() {
+  local tag repo tmp attempt
+  if [ "$GITHUB_RELEASE" != published ]; then
+    ci_say "post-publish-verify: no GitHub release this run (github_release=$GITHUB_RELEASE); skipping"
+    return 0
+  fi
+  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  [ -n "$tag" ] || { ci_say "post-publish-verify: github_release=published but HEAD has no exact tag; refusing"; return 1; }
+  command -v gh >/dev/null 2>&1 || { ci_say "post-publish-verify: gh CLI not found"; return 1; }
+  repo=$(gh_repo_for "$WT")
+  [ -n "$repo" ] || { ci_say "post-publish-verify: could not derive owner/repo from origin"; return 1; }
+  tmp=$(mktemp -d)
+  for attempt in 1 2 3; do
+    if gh release download "$tag" --repo "$repo" --dir "$tmp" >"$tmp/download.log" 2>&1; then
+      break
+    fi
+    if [ "$attempt" = 3 ]; then
+      ci_say "post-publish-verify: download failed after 3 attempts (see $tmp/download.log)"
+      rm -rf "$tmp"; return 1
+    fi
+    ci_say "post-publish-verify: download attempt $attempt failed; retrying in 20s"
+    sleep 20
+  done
+  local asset sidecar local_file dl_sha side_sha local_sha
+  for asset in longtable-release.aab longtable-release.apk; do
+    sidecar="$asset.sha256"
+    [ -f "$tmp/$asset" ] || { ci_say "post-publish-verify: downloaded $asset missing"; rm -rf "$tmp"; return 1; }
+    [ -f "$tmp/$sidecar" ] || { ci_say "post-publish-verify: downloaded sidecar $sidecar missing"; rm -rf "$tmp"; return 1; }
+    dl_sha=$(sha256sum "$tmp/$asset" | cut -d' ' -f1)
+    side_sha=$(awk '{print $1}' "$tmp/$sidecar")
+    if [ "$dl_sha" != "$side_sha" ]; then
+      ci_say "post-publish-verify: downloaded $asset does not match its sidecar $sidecar"
+      rm -rf "$tmp"; return 1
+    fi
+    case "$asset" in
+      longtable-release.aab) local_file="$PUBLISH_AAB" ;;
+      longtable-release.apk) local_file="$PUBLISH_RELEASE_APK" ;;
+    esac
+    local_sha=$(sha256sum "$local_file" | cut -d' ' -f1)
+    if [ "$dl_sha" != "$local_sha" ]; then
+      ci_say "post-publish-verify: downloaded $asset differs from the published file"
+      rm -rf "$tmp"; return 1
+    fi
+    ci_say "post-publish-verify: $asset ok (sha256 $dl_sha)"
+  done
+  if [ -f "$tmp/longtable-release-mapping.txt" ]; then
+    dl_sha=$(sha256sum "$tmp/longtable-release-mapping.txt" | cut -d' ' -f1)
+    side_sha=$(awk '{print $1}' "$tmp/longtable-release-mapping.txt.sha256")
+    [ "$dl_sha" = "$side_sha" ] || { ci_say "post-publish-verify: downloaded mapping does not match its sidecar"; rm -rf "$tmp"; return 1; }
+    ci_say "post-publish-verify: longtable-release-mapping.txt ok (sha256 $dl_sha)"
+  fi
+  rm -rf "$tmp"
+  ci_say "post-publish-verify: GitHub assets match the published files + sidecars for $tag"
 }
 
 do_publish() {
@@ -488,7 +781,7 @@ run_one() {
   run_id="$(date +%Y%m%d-%H%M%S)-$short"
   log="$LOGS/$run_id.log"
   started=$(date -Iseconds)
-  ci_reset_run_state; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; GITHUB_RELEASE="none"; FLEET_UP=""; CI_EXTRA_JSON=""
+  ci_reset_run_state; APK_MD5=""; AAB_MD5=""; RELEASE_APK_MD5=""; SIGNED_RELEASE="none"; GITHUB_RELEASE="none"; FLEET_UP=""; CI_EXTRA_JSON=""; VERSION_CODE=""
   local t0=$SECONDS
   ci_say "run $run_id commit $TARGET_HASH"
   {
@@ -496,6 +789,7 @@ run_one() {
     ci_stage checkout        do_checkout  &&
     ci_stage secret-scan     do_secret_scan &&
     ci_stage legacy-hub-digests do_legacy_digests &&
+    ci_stage version-guard   do_version_guard &&
     ci_stage npm-ci          do_npm_ci    &&
     ci_stage typecheck       do_typecheck &&
     ci_stage lint            do_lint      &&
@@ -517,7 +811,8 @@ run_one() {
     ci_stage release-build   do_release_build &&
     ci_stage signed-release  do_signed_release &&
     ci_stage publish         do_publish &&
-    ci_stage github-release  do_github_release
+    ci_stage github-release  do_github_release &&
+    ci_stage post-publish-verify do_post_publish_verify
     true
   } >>"$log" 2>&1
   if [ -n "$FLEET_UP" ]; then
@@ -525,7 +820,7 @@ run_one() {
   fi
   finished=$(date -Iseconds)
   if [ -n "$CI_FAILED_STAGE" ]; then result=failed; else result=success; fi
-  CI_EXTRA_JSON=$(printf '{"apk_md5": %s, "aab_md5": %s, "release_apk_md5": %s, "signed_release": %s, "github_release": %s}' "$(ci_json_str "$APK_MD5")" "$(ci_json_str "$AAB_MD5")" "$(ci_json_str "$RELEASE_APK_MD5")" "$(ci_json_str "$SIGNED_RELEASE")" "$(ci_json_str "$GITHUB_RELEASE")")
+  CI_EXTRA_JSON=$(printf '{"apk_md5": %s, "aab_md5": %s, "release_apk_md5": %s, "signed_release": %s, "github_release": %s, "version_code": %s}' "$(ci_json_str "$APK_MD5")" "$(ci_json_str "$AAB_MD5")" "$(ci_json_str "$RELEASE_APK_MD5")" "$(ci_json_str "$SIGNED_RELEASE")" "$(ci_json_str "$GITHUB_RELEASE")" "$(ci_json_str "$VERSION_CODE")")
   ci_write_status "$result" "$started" "$finished" "$((SECONDS-t0))" "$log"
   ci_say "run $run_id result=$result failed_stage=${CI_FAILED_STAGE:-none} duration=$((SECONDS-t0))s log=$log"
   if [ "$result" = success ]; then

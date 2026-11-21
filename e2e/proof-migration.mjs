@@ -56,7 +56,7 @@ const el = async (sel, timeout = 20000) => {
 };
 
 async function newSession() {
-  if (driver) { try { await driver.deleteSession(); } catch (_) { /* gone */ } }
+  if (driver) { try { await driver.deleteSession(); } catch { /* gone */ } }
   driver = await remote({
     protocol: 'http', hostname: '127.0.0.1', port: 4723, path: '/',
     capabilities: {
@@ -77,7 +77,7 @@ async function newSession() {
     const ctxs = await driver.getContexts();
     const web = ctxs.find((c) => String(c).toLowerCase().startsWith('webview'));
     if (web) {
-      try { await driver.switchContext(web); return; } catch (_) { /* retry */ }
+      try { await driver.switchContext(web); return; } catch { /* retry */ }
     }
     await sleep(1500);
   }
@@ -117,7 +117,7 @@ async function main() {
   adb('logcat', '-c');
 
   await step('clean install Phase 0 (Automerge) APK', async () => {
-    try { adb('uninstall', PKG); } catch (_) { /* not installed */ }
+    try { adb('uninstall', PKG); } catch { /* not installed */ }
     adb('install', P0_APK);
     return P0_APK;
   });
@@ -149,7 +149,7 @@ async function main() {
   });
 
   await step('upgrade: adb install -r Phase 1 build over Phase 0 data', async () => {
-    if (driver) { try { await driver.deleteSession(); } catch (_) { /* gone */ } driver = undefined; }
+    if (driver) { try { await driver.deleteSession(); } catch { /* gone */ } driver = undefined; }
     adb('shell', 'am', 'force-stop', PKG);
     const out = adb('install', '-r', NEW_APK);
     assert(/Success/.test(out), `install -r failed: ${out.trim()}`);
@@ -180,7 +180,7 @@ async function main() {
     assert(text.includes('Chop finely.'), 'step "Chop finely." missing from detail');
     assert(text.includes('5 min'), 'prep time missing from detail');
     assert(text.includes('15 min'), 'cook time missing from detail');
-    const img = await el('img[alt="Recipe photo 1"]');
+    await el('img[alt="Recipe photo 1"]');
     const w = await driver.executeScript(
       'var img = document.querySelector(\'img[alt="Recipe photo 1"]\');' +
       'return img ? img.naturalWidth : -1;', []
@@ -200,7 +200,7 @@ async function main() {
   });
 
   await step('Phase 1: relaunch does not duplicate the migrated recipe', async () => {
-    if (driver) { try { await driver.deleteSession(); } catch (_) { /* gone */ } driver = undefined; }
+    if (driver) { try { await driver.deleteSession(); } catch { /* gone */ } driver = undefined; }
     adb('shell', 'am', 'force-stop', PKG);
     await sleep(1000);
     await newSession();
@@ -227,7 +227,7 @@ async function main() {
     console.log('FAILED STEPS:');
     for (const f of failed) console.log(`  - ${f.name}: ${f.detail}`);
   }
-  if (driver) { try { await driver.deleteSession(); } catch (_) { /* gone */ } }
+  if (driver) { try { await driver.deleteSession(); } catch { /* gone */ } }
   process.exit(failed.length ? 1 : 0);
 }
 

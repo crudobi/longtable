@@ -40,11 +40,17 @@ leaks into a build — and runs, in order:
    `grep -f`). Benign matches are allow-listed in the pinned
    `privacy-allowlist` (file-glob + ERE, matched against the
    matched literal, anchored `^...$` — never the whole line). It
-   also scans the target commit's message and the tag annotation
-   when HEAD carries an exact tag (M18) — messages are not in the
-   tree, so the tree scan cannot see them. Fails closed: a missing
-   scanner/pin, a missing secrets file, or any hit fails the run
-   before anything builds.
+   also scans commit messages and tag annotations (M18/S25): the
+   message scan covers every commit the release notes will quote
+   (previous-tag..HEAD — a batch push can land several commits in
+   one run, and scanning HEAD only would miss a secret in an
+   intermediate subject), plus the HEAD tag annotation, all BEFORE
+   any build or publish. Message hits already recorded in the ops
+   history-scan baseline (`message_hits`) are known-benign and
+   filtered out by exact (rev, line, class) match; anything else
+   fails the run, and a missing/unreadable baseline filters nothing
+   (fail closed). Fails closed: a missing scanner/pin, a missing
+   secrets file, or any hit fails the run before anything builds.
 3. `legacy-hub-digests` — (`ci/check-legacy-hub-digests.py`): re-derives
    the expected FNV-1a-64 digests of the pre-scrub legacy hub values
    from git history (`git show d725e40:src/hubs/hubs.ts`, the scrub
@@ -57,48 +63,57 @@ leaks into a build — and runs, in order:
    unavailable revision — this is the check whose absence let the
    440c8ac digests (which hash strings that never shipped) pass the
    bundle gate (review C1, 2026-11-15).
-4. `npm-ci` — `npm ci`
-5. `typecheck` — `tsc --noEmit`
-6. `lint` — `npm run lint`
-7. `unit-tests` — `vitest run`
-8. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
+4. `version-guard` — versionCode monotonicity: versionCode is
+   `git rev-list --count HEAD`, so it is monotonic by construction
+   unless history is rewritten. Compares HEAD's count against the
+   most recent reachable tag; fails if HEAD's count is lower (a
+   rewrite would ship a versionCode below the last tagged release,
+   which Play refuses). Skips cleanly when no tag is reachable yet.
+   Records the count as `version_code` in status.json.
+5. `npm-ci` — `npm ci`
+6. `typecheck` — `tsc --noEmit`
+7. `lint` — `npm run lint`
+8. `unit-tests` — `vitest run`
+9. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
    its own vitest suite (ingest filtering, verify-then-index rejection,
    FTS5 search, HTTP API + CORS). The service-dependent proofs
    (`e2e/proof-public.mjs`, `appview` e2e) run against the standing local
    testnet instead — they need live PLC/PDS/AppView processes and fixed
    ports, which a pristine-worktree stage cannot own.
-9. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
-10. `cap-sync` — `npx cap sync android`
-11. `apk` — `gradlew assembleDebug` (JDK 21)
-12. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
+10. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
+11. `cap-sync` — `npx cap sync android`
+12. `apk` — `gradlew assembleDebug` (JDK 21)
+13. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
    boots all three emulator AVDs from bare state if needed (AVD
    creation + fixture-CA trust, verified), ensures the support
    services (Appium, HTTPS fixture, signaling, TURN, ATProto testnet
    + seed, AppView, TLS proxies), and installs the new APK on every
    device.
-13. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
-14. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
+14. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
+15. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
    recipe, the new APK upgrades over it, data must survive. Runs on
    **every** commit — this is the test whose absence let the Phase 1
    storage swap orphan user data, and it does not get tiered away.
-15. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
+16. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
     `proof-importer`, `proof-localapi`, `proof-hubfail` — the
     multi-device oath proofs, one stage each via
     `e2e/run-fleet.sh run <proof>`, in dependency order, each with an
     app-data reset on its devices first. (`proof-thirdparty` consumes
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
-16. `release-build` — rebuilds the web bundle hooks-off (no debug
+17. `release-build` — rebuilds the web bundle hooks-off (no debug
     hooks, no dev TURN password), asserts the hook strings
     (`__ltFriends`/`__ltPublic`/`__ltSecrets`) and the rotated dev
-    TURN password are absent from the bundle, and the literals from
+    TURN password are absent from the bundle — the password check
+    fails closed if `dev-turn-password` is missing (S27: a missing
+    file used to silently skip the check) — and the literals from
     the shared ops-side `privacy-secrets` file are absent from all
     of `dist/` (not just `dist/assets`), asserts the CSP survives
     into the built `index.html` (`assert_csp`, L5), re-syncs and
     rebuilds the debug APK, and asserts the hooks are absent from
     the APK itself (`release_apk_hooks_clean`, L6). That artifact
     is what `publish` ships.
-17. `signed-release` — builds `bundleRelease` + `assembleRelease`
+18. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
     verify`, `bundletool dump manifest` (package + git-derived
@@ -109,24 +124,37 @@ leaks into a build — and runs, in order:
     commits — the A3 fail-closed rule (release builds refuse untagged
     or dirty HEADs) is never relaxed. Tag a commit (e.g. `v0.1.0`)
     and push commit + tag together to cut a signed release.
-18. `publish` — copies the debug APK to the published location in the
+19. `publish` — copies the debug APK to the published location in the
     builds dir (`longtable-debug.apk`); when the signed-release stage
     published, also copies `longtable-release.aab` +
     `longtable-release.apk` (+ `longtable-release-mapping.txt` when
     produced — currently not, `minifyEnabled false`) with `.sha256`
     sidecars. Copies are atomic (`.tmp` + rename).
-19. `github-release` — creates a GitHub Release for the tag (A5)
+20. `github-release` — creates a GitHub Release for the tag (A5)
     with the signed `longtable-release.aab` +
     `longtable-release.apk` and their `.sha256` sidecars,
     changelog from `git log` since the previous tag. The generated
     release notes are scanned with the pinned scanner before
     `gh release create` (defense in depth: the `secret-scan` stage
-    already scanned the commit subjects before any build). Runs ONLY
+    already scanned the commit subjects before any build). Notes hits
+    on lines quoting a commit whose message hit is already in the
+    history-scan baseline are filtered out by exact (rev, line, class)
+    match — without this the next tagged run would fail here on the
+    known e99e089 residue (its subject names the dev-box hostname and
+    is quoted in every notes range since v0.2.2); a hit on any other
+    line fails the stage. Runs ONLY
     when the signed-release stage published this run and SKIPS
     cleanly (recorded as `github_release: "skipped"`) on
     untagged commits — same gate as signed-release. Fails
     closed if a release for the tag already exists; never
     overwrites or deletes one.
+21. `post-publish-verify` — re-downloads the GitHub Release assets
+    (`gh release download`, retried 3x) and checks each downloaded
+    file against its downloaded `.sha256` sidecar AND against the
+    local published file. Runs ONLY when this run published a GitHub
+    release; skips cleanly otherwise. A mismatch fails the stage —
+    the release is already public at that point, so the failure is
+    recorded in status.json for the operator, not absorbed.
 
 ## Hash-pinned scanner (H3)
 
@@ -147,6 +175,36 @@ missing pin or a hash mismatch fails the run closed.
   the merged scanner (hash check) and re-pins if it differs.
 - The repo's `ci/` copy is only the source the operator pins FROM;
   it is never executed by the pipeline.
+
+Scanner modes (Wave 5D): repo mode scans tracked AND untracked
+non-ignored files (`git ls-files --cached --others
+--exclude-standard`) — gitignored files are deliberately excluded
+(they are build outputs and local secret-adjacent files: `dist/`,
+`*.jks`, `.env`, `turn-password.txt`; built/published artifacts are
+covered by the artifact gates instead). Single-file mode matches
+file-specific allowlist entries by suffix, so an absolute target
+path gets the same exemptions as a repo-relative one. A scan
+without `--secrets` and without `STATE` set exits 2 (fail closed)
+unless `--generic-only` is passed explicitly — a generic-patterns-only
+scan is a deliberate, acknowledged reduction, not a silent default.
+
+## Drift check + shared-lib pin (Sec L21)
+
+The installed pipeline must track the repo: a stale installed copy
+silently runs old gates (the pre-H3 installed copy ran the worktree
+scanner, skipped message scans, and used the shared lib's main loop
+that marked failed runs processed). `run-pipeline.sh` and
+`history-scan.sh` therefore compare the installed copy against
+`$REPO/ci/` (`cmp -s`) at run start — before the lock is taken —
+and fail closed on drift; the operator re-runs `ci/install-ci.sh`
+after any `ci/` change, before the next run can go green.
+
+The shared CI lib (`ops/shared/ci/ci-lib.sh`) is likewise pinned:
+`ci/ci-lib.sha256` holds its SHA-256, and both `run-pipeline.sh`
+and `install-ci.sh` verify the hash BEFORE sourcing the lib. Update
+the pin ONLY when the shared lib changes deliberately: review the
+lib diff, recompute the hash, commit the new pin. A stale pin blocks
+every run until updated.
 
 ## Ops-side files the pipeline reads
 
@@ -217,7 +275,8 @@ All under the ops CI dir (`<host root>/ops/longtable-ci/`):
   durations, whether it published, the published APK md5, the signed
   AAB / release APK md5s and `signed_release` state (`none` /
   `skipped` / `published`), plus `github_release` state (`none` /
-  `skipped` / `published`), log path.
+  `skipped` / `published`) and the `version_code` recorded by the
+  version-guard stage, log path.
 - `history.jsonl` — one JSON line per run, append-only.
 - `history-scan.json` — the latest nightly all-history scan (see
   above); `history-scan-baseline.json` — the recorded known-hit set
@@ -243,7 +302,15 @@ closes that case: every night at 03:17
 it fetches origin into a mirror under `ops/longtable-ci/work/` and
 scans every rev in `git rev-list --all` with the hash-pinned
 scanner (`$STATE/scanner/`, H3 — never the repo's own `ci/` copy),
-plus every commit message and tag annotation (M18).
+plus every commit message and tag annotation (M18). The tree scan
+runs the fixed-literal secrets pass over binary blobs too
+(`git grep -l -F`, no `-I`): a secret literal embedded in a binary
+file is reported as `file:0:secret-binary`. Generic ERE patterns are
+NOT run on binary blobs — they are noise-prone on binary bytes, and
+a fixed secrets literal cannot match by chance — so a binary blob
+could still hide a generic-pattern-shaped value (a private-key
+header, a token prefix); that residual is accepted and documented
+here, not silently assumed away.
 
 The published history still contains pre-scrub residue (internal
 paths in revs before the Oct-15 rewrite) that the rewrite did not

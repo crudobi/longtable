@@ -303,18 +303,21 @@ ensure_turn() {
 
 TESTNET_STARTED=0
 ensure_testnet() {
+  # The testnet is a standalone subpackage (depends on @atproto/dev-env).
+  # Install its deps whenever the dir lacks them, REGARDLESS of testnet
+  # state: seed.mjs runs on every ensure (below) via `npm run seed`,
+  # which needs this worktree's own node_modules even when the testnet
+  # is already up (shared since Nov 13). The old code only installed
+  # on cold start, so a warm testnet + a fresh worktree died in seed
+  # with ERR_MODULE_NOT_FOUND. Same shape as ensure_signaling.
+  if [ ! -d "$TESTNET_DIR/node_modules/@atproto/dev-env" ]; then
+    say "testnet: installing deps (npm ci in services/atproto-testnet)"
+    (cd "$TESTNET_DIR" && npm ci --no-audit --no-fund) || { say "ERROR: testnet npm ci failed" >&2; return 1; }
+  fi
   if curl -sf --max-time 3 http://localhost:2583/xrpc/com.atproto.server.describeServer > /dev/null 2>&1; then
     say "testnet: already up"
   else
     say "testnet: starting (tmux lt-atproto)"
-    # The testnet is a standalone subpackage (depends on @atproto/dev-env).
-    # Same cold-start gap as signaling: a checkout without node_modules
-    # makes node die with Cannot find module, surfacing only as the opaque
-    # "testnet PDS did not come up". Install the deps when missing.
-    if [ ! -d "$TESTNET_DIR/node_modules/@atproto/dev-env" ]; then
-      say "testnet: installing deps (npm ci in services/atproto-testnet)"
-      (cd "$TESTNET_DIR" && npm ci --no-audit --no-fund) || { say "ERROR: testnet npm ci failed" >&2; return 1; }
-    fi
     tmux kill-session -t lt-atproto 2>/dev/null || true
     tmux new -s lt-atproto -d "cd $TESTNET_DIR && node start.mjs"
     if ! wait_http http://localhost:2583/xrpc/com.atproto.server.describeServer 60; then

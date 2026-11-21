@@ -19,7 +19,6 @@
 import { remote } from 'webdriverio'
 import { execFileSync } from 'node:child_process'
 
-const APPIUM = 'http://127.0.0.1:4723'
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'

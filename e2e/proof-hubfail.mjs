@@ -54,7 +54,7 @@ function readTurnPass(hubDir, hubName) {
   try {
     conf = JSON.parse(fs.readFileSync(confPath, 'utf8'))
   } catch (e) {
-    throw new Error(`${hubName}: cannot read ${confPath}: ${e.message}`)
+    throw new Error(`${hubName}: cannot read ${confPath}: ${e.message}`, { cause: e })
   }
   const dataDir = conf.dataDir
     ? (path.isAbsolute(conf.dataDir) ? conf.dataDir : path.resolve(hubDir, conf.dataDir))
@@ -64,7 +64,7 @@ function readTurnPass(hubDir, hubName) {
   try {
     pw = fs.readFileSync(pwPath, 'utf8').trim()
   } catch (e) {
-    throw new Error(`${hubName}: cannot read generated TURN password at ${pwPath} (start the hub once so hub.mjs generates it): ${e.message}`)
+    throw new Error(`${hubName}: cannot read generated TURN password at ${pwPath} (start the hub once so hub.mjs generates it): ${e.message}`, { cause: e })
   }
   if (!pw) throw new Error(`${hubName}: empty TURN password in ${pwPath}`)
   return pw
@@ -416,19 +416,21 @@ async function joinWith(driver, code) {
   const hasFriend = async () =>
     (await driver.$$('[data-testid="friend-item"]')).length >= 1 ? true : null
   await (await driver.$('[data-testid="friend-join-confirm"]')).click().catch(() => {})
-  // Poll WITHOUT re-clicking first: on a loaded fleet the pairing
-  // handshake (signaling rendezvous + TURN relay + hello) can take
-  // ~45s, and re-clicking join-confirm at 20s restarted the guest join
-  // mid-handshake — the restarted attempt then overran the invite's
-  // 90s TTL and pairing failed deterministically (observed 2026-10-15
-  // with the box under cross-workstream build load; a single-click run
-  // of this same proof passed 17/17). The re-click remains, but only
-  // after 100s, as a guard against a genuinely missed first click.
-  let ok = await waitFor(driver, hasFriend, 100000)
-  if (!ok) {
-    await evalJs(driver, 'document.querySelector(\'[data-testid="friend-join-confirm"]\')?.click()')
-    ok = await waitFor(driver, hasFriend, 60000)
-  }
+  // Poll WITHOUT re-clicking: on a loaded fleet the pairing handshake
+  // (signaling rendezvous + TURN relay + hello) can take ~45s, and
+  // re-clicking join-confirm at 20s restarted the guest join
+  // mid-handshake — the restarted attempt then overran the pairing
+  // window and failed deterministically (observed 2026-10-15 with the
+  // box under cross-workstream build load; a single-click run of this
+  // same proof passed 17/17). Do NOT re-click here: each side runs
+  // its own 90s runPairing clock (src/friends/friends.ts), and once
+  // the inviter's 90s expires it destroys its provider and stops
+  // listening — a second guest-side click starts a fresh pairing with
+  // nobody on the other end, so it cannot succeed. A failed join is
+  // retried by main() with a FRESH invite, which restarts BOTH sides
+  // with fresh 90s budgets. (The invite TTL is 24h, not 90s — the
+  // 90s figure in the old comment was the runPairing timeout.)
+  const ok = await waitFor(driver, hasFriend, 100000)
   if (!ok) throw new Error('pairing did not complete on the guest side')
 }
 
@@ -557,7 +559,7 @@ async function main() {
     // ---- Pair A<->B via hub A -----------------------------------------
     await openFriends(A)
     await setName(A, 'Olga')
-    const invite = await createInvite(A)
+    let invite = await createInvite(A)
     const inviteObj = JSON.parse(invite)
     step(
       'pairing: invite payload carries hub A signaling',
@@ -566,7 +568,35 @@ async function main() {
     )
     await openFriends(B)
     await setName(B, 'Fay')
-    await joinWith(B, invite)
+    // A failed first join is retried with a FRESH invite, not a
+    // re-click: each side runs its own 90s runPairing clock, and once
+    // A's 90s expires it destroys its provider and stops listening —
+    // a second guest-side join against the same invite can never
+    // succeed, which is why attempt 1 failed at ~215s in three
+    // consecutive runs (Wave 2 run 2, Wave 3 keystore run, Wave 4
+    // b0ff535) and always passed on the pipeline retry after the
+    // guest reboot. A fresh invite (showInvite mints a new one when
+    // no pairing is running) restarts BOTH sides with fresh budgets.
+    // One retry only; a second failure is a real failure, not a flake.
+    try {
+      await joinWith(B, invite)
+    } catch (e) {
+      // Diagnostic only: booleans, never panel text — the panel can
+      // display the invite code itself (a pairing secret), which must
+      // never reach a log.
+      const panelText = await evalJs(A, 'document.querySelector(\'[data-testid="friends-panel"]\')?.textContent ?? ""')
+      const panelHints = { hasTimeout: panelText.includes('timed out'), hasPairing: panelText.toLowerCase().includes('pairing'), len: panelText.length }
+      console.log(`pairing: first join failed (${e.message}); A panel hints: ${JSON.stringify(panelHints)}; A friends=${await friendCount(A)}`)
+      // Leave the stale invite screen first (close + reopen the panel)
+      // so friend-show-invite renders again and createInvite mints a
+      // FRESH invite — re-reading the code element while the old
+      // invite is still displayed would return the dead invite.
+      await closeFriends(A)
+      await openFriends(A)
+      invite = await createInvite(A)
+      console.log('pairing: retrying with a fresh invite')
+      await joinWith(B, invite)
+    }
     const aFriends = await waitFor(A, async () => (await friendCount(A)) >= 1, 60000)
     step('pairing: A and B are friends (via hub A)', !!aFriends && (await friendCount(B)) >= 1)
     await closeFriends(A)
@@ -587,7 +617,7 @@ async function main() {
     await detailTitle.waitForExist({ timeout: 20000 })
     step('setup: A created “Hubfail Stew”', (await detailTitle.getText()) === 'Hubfail Stew')
 
-    const modal = await clickAndWait(A, '[data-testid="share-friends"]', '[data-testid="friend-share-modal"]')
+    await clickAndWait(A, '[data-testid="share-friends"]', '[data-testid="friend-share-modal"]')
     const boxes = await A.$$('[data-testid="friend-check"]')
     if (boxes.length !== 1) throw new Error(`expected 1 friend checkbox, got ${boxes.length}`)
     await boxes[0].click().catch(() => {})
@@ -671,7 +701,6 @@ async function main() {
     step('FAILOVER: B received v2 via hub B with hub A dead', !!shelf2, `kill→sync ${failoverSecs}s`)
     if (shelf2) {
       await clickShelfItem(B, 'Hubfail Stew v2')
-      const t = await B.$('[data-testid="recipe-title"]')
       const bodyB = await (await B.$('[data-testid="recipe-detail"]')).getText()
       const bodyA = await openRecipeByTitle(A, 'Hubfail Stew v2')
       step(
