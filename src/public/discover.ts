@@ -552,7 +552,42 @@ export async function publicRecordToInput(
     ...(record.description ? { description: record.description } : {}),
     ...(record.recipeYield ? { recipeYield: record.recipeYield } : {}),
     ...(record.tags && record.tags.length > 0 ? { tags: [...record.tags] } : {}),
+    // Save-a-copy authorship: the copy keeps the author's account DID,
+    // so it stays attributable instead of looking home-grown. A bare
+    // RecipeRecord carries no DID (e.g. a local record being re-shaped),
+    // so it keeps no author. The copy is private on this device —
+    // visibility is deliberately NOT carried over.
+    ...('did' in record && typeof record.did === 'string' && record.did
+      ? { author: record.did }
+      : {}),
   }
+}
+
+/**
+ * The timestamps a save-a-copy preserves (production gap: the copy
+ * used to be stamped "now", losing the original's history). Returns
+ * the record's createdAt/updatedAt when both are well-formed ISO
+ * strings, else undefined (the store then stamps "now").
+ *
+ * Timestamps are NOT covered by the recipe signature (Int L5), so a
+ * tampered or malformed pair must never break the save — fall back
+ * instead of failing or storing junk.
+ */
+export function publicRecordTimestamps(
+  record: PublicRecipe | RecipeRecord,
+): { createdAt: string; updatedAt: string } | undefined {
+  const { createdAt, updatedAt } = record
+  if (
+    typeof createdAt === 'string' &&
+    createdAt &&
+    typeof updatedAt === 'string' &&
+    updatedAt &&
+    !Number.isNaN(Date.parse(createdAt)) &&
+    !Number.isNaN(Date.parse(updatedAt))
+  ) {
+    return { createdAt, updatedAt }
+  }
+  return undefined
 }
 
 /** Options for fetchAuthorPhotoBytes. */

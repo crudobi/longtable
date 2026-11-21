@@ -10,13 +10,16 @@
  *  - Error classes whose messages are written for users (ImporterError,
  *    UrlImportError, AtprotoError handled above, pairing/invite errors)
  *    pass through — but anything that looks like a stack trace, a JSON
- *    blob, or a raw "HTTP 500" style string is replaced with a generic
- *    plain sentence.
+ *    blob, or an over-long dump is replaced with a generic plain
+ *    sentence. (A bare HTTP status inside a short plain sentence is
+ *    NOT raw — Int L13: "The page returned HTTP 404." is a message,
+ *    not a dump.)
  *  - `what` names the thing being talked to for network failures
  *    (e.g. "the discovery service"), so the sentence stays specific.
  */
 import { AtprotoError } from './public/atproto'
 import { ImporterError } from './importers/contract'
+import { UrlImportError } from './importers/urlImport'
 import { BackupError } from './backup/backup'
 
 const GENERIC = "Something went wrong, and that didn't finish. Nothing was changed — try again."
@@ -26,8 +29,14 @@ function looksRaw(message: string): boolean {
     message.length > 200 ||
     /^\s*[{[]/.test(message) ||
     /\n\s*at\s+\S+/.test(message) || // stack frames
-    /HTTP \d{3}\b/.test(message) ||
     /^(TypeError|ReferenceError|SyntaxError|RangeError)\b/.test(message)
+    // NOTE (Int L13): a bare "HTTP 404" used to be treated as raw here,
+    // which replaced short user-written sentences — e.g. the URL
+    // importer's "The page returned HTTP 404." — with the generic
+    // sentence. A status code inside an otherwise plain short message
+    // is information, not a dump: real dumps are caught by the length,
+    // JSON, and stack-frame rules above. So no HTTP-status rule lives
+    // here anymore.
   )
 }
 
@@ -61,6 +70,13 @@ export function friendlyError(e: unknown, what = 'the server'): string {
   }
 
   if (e instanceof ImporterError) return e.message
+
+  // UrlImportError is a user-written domain error like ImporterError
+  // (Int L13): its messages — including "The page returned HTTP 404."
+  // — are written for the UI and pass through verbatim. (The header
+  // always said so; the branch was missing, so the HTTP-status rule
+  // in looksRaw ate the message instead.)
+  if (e instanceof UrlImportError) return e.message
 
   // Backup errors are written for users too (wrong passphrase, damaged
   // file, short passphrase) — pass them through verbatim.
