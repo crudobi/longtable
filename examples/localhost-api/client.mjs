@@ -21,8 +21,10 @@
 //   node client.mjs get <recipe-id>
 //   node client.mjs create <recipe.json>
 //   node client.mjs update <recipe-id> <recipe.json>
+//   node client.mjs patch <recipe-id> <patch.json>
 //   node client.mjs delete <recipe-id>   (sends {"confirm": true}: deleting is permanent)
 //   node client.mjs import <importer-id> <text-file>
+//   node client.mjs import-url <importer-id> <url>
 //
 // Every command prints the API's JSON response. On an API error it
 // prints the error and exits 1.
@@ -92,6 +94,11 @@ switch (cmd) {
   case 'update':
     out = await api('PUT', `/v1/recipes/${args[0]}`, readJson(args[1]));
     break;
+  case 'patch':
+    // Partial update: only the fields in the file change. Add
+    // "expectedUpdatedAt" (from a get) to refuse a stale write with 412.
+    out = await api('PATCH', `/v1/recipes/${args[0]}`, readJson(args[1]));
+    break;
   case 'delete':
     // Deleting is permanent: the API requires an explicit confirm,
     // the equivalent of the app's delete dialog.
@@ -103,9 +110,15 @@ switch (cmd) {
       text: readFileSync(args[1], 'utf8'),
     });
     break;
+  case 'import-url':
+    out = await api('POST', '/v1/import', {
+      importerId: args[0],
+      url: args[1],
+    });
+    break;
   default:
     console.error(
-      'usage: node client.mjs <health|identity|friends|list|search|get|create|update|delete|import> ...',
+      'usage: node client.mjs <health|identity|friends|list|search|get|create|update|patch|delete|import|import-url> ...',
     );
     process.exit(2);
 }

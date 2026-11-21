@@ -17,6 +17,10 @@
  * file carries no author DID to fetch blobs from, so the Import panel
  * cannot resolve them; the CIDs are never silently dropped.
  *
+ * Source timestamps (M24): `createdAt`/`updatedAt` on a recipe object
+ * are carried through and validated by `runImporter`, so an export
+ * restored through this importer keeps its original times.
+ *
  * Format documentation: docs/importers.md.
  */
 import {
@@ -120,6 +124,15 @@ function mapOne(raw: unknown, index: number): ImportedRecipe {
     ...(asAuthor(o.author) ? { author: asAuthor(o.author)! } : {}),
     ...(typeof o.sourceUrl === 'string' && o.sourceUrl.trim()
       ? { sourceUrl: o.sourceUrl }
+      : {}),
+    // Source timestamps (M24): carried as import-time fields, validated
+    // by runImporter — a longtable-json export round-trips with its
+    // original times instead of being re-stamped "now".
+    ...(typeof o.createdAt === 'string' && o.createdAt.trim()
+      ? { createdAt: o.createdAt.trim() }
+      : {}),
+    ...(typeof o.updatedAt === 'string' && o.updatedAt.trim()
+      ? { updatedAt: o.updatedAt.trim() }
       : {}),
     ...(imageCids.length > 0 ? { imageCids } : {}),
     // NB: invalid field types are caught by the app's validator, which

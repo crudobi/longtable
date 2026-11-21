@@ -141,6 +141,7 @@ let importedId = '';
 
 const RECIPE_JSON = '/tmp/lt-proof-recipe.json';
 const RECIPE_V2_JSON = '/tmp/lt-proof-recipe-v2.json';
+const RECIPE_PATCH_JSON = '/tmp/lt-proof-recipe-patch.json';
 const RECIPE_MD = '/tmp/lt-proof-recipe.md';
 
 async function main() {
@@ -311,6 +312,29 @@ async function main() {
     const r = runClient(['get', createdId], token);
     assert(r.ingredients.length === 4, 'update did not stick');
     return 'v2 title in UI; 4 ingredients via API';
+  });
+
+  await step('patch via client changes only the fields sent; stale precondition is 412', async () => {
+    const before = runClient(['get', createdId], token);
+    writeFileSync(RECIPE_PATCH_JSON, JSON.stringify({
+      title: 'Proof Miso Noodles v3',
+      prepMinutes: null,
+      expectedUpdatedAt: before.updatedAt,
+    }, null, 2));
+    const out = runClient(['patch', createdId, RECIPE_PATCH_JSON], token);
+    assert(out.id === createdId, `patch answered a different id: ${JSON.stringify(out)}`);
+    assert(out.updatedAt && out.updatedAt !== before.updatedAt, 'patch should refresh updatedAt');
+    const r = runClient(['get', createdId], token);
+    assert(r.title === 'Proof Miso Noodles v3', `patched title: ${r.title}`);
+    assert(r.ingredients.length === 4, 'patch must leave untouched fields alone');
+    assert(r.prepMinutes === undefined, 'null prepMinutes should clear the field');
+    // A second patch reusing the pre-patch updatedAt is a lost update:
+    // 412, and the title stays the patched one.
+    const stale = await raw('PATCH', `/v1/recipes/${createdId}`, { token, body: { title: 'Stale Write', expectedUpdatedAt: before.updatedAt } });
+    assert(stale.status === 412, `stale patch got ${stale.status}: ${stale.text}`);
+    const r2 = runClient(['get', createdId], token);
+    assert(r2.title === 'Proof Miso Noodles v3', 'stale patch overwrote the title');
+    return 'title-only patch; null clears; stale 412, nothing overwritten';
   });
 
   await step('import via client (Markdown importer) lands in the cookbook', async () => {

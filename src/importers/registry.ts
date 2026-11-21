@@ -13,12 +13,13 @@
  * contract validator. One bad recipe fails the whole run (nothing is
  * imported) with a plain-language message.
  */
-import type { RecipeInput } from '../types'
+import type { RecipeInput, SourceTimestamps } from '../types'
 import {
   ImporterError,
   MAX_IMPORT_PHOTOS,
   MAX_IMPORT_RECIPES,
   assertImporterShape,
+  isValidIsoTimestamp,
   validateImportedRecipe,
   type ImporterInput,
   type RecipeImporter,
@@ -150,11 +151,23 @@ export function sanitizePluginMessage(raw: string): string | null {
  * appended to the recipe's photos (within the photo cap); CIDs that
  * cannot be resolved — or a run with no resolver at all — produce a
  * warning naming the recipe and the count, never a silent drop.
+ *
+ * Source timestamps (M24): a recipe may carry `createdAt` /
+ * `updatedAt`. They are validated here (an unparseable timestamp
+ * fails the whole run, like any other bad recipe) and returned
+ * parallel to `recipes` as `timestamps`, so the caller can create
+ * each recipe with its original times instead of "now".
  */
 export async function runImporter(
   id: string,
   input: ImporterInput,
-): Promise<{ importer: RecipeImporter; recipes: RecipeInput[]; warnings: string[] }> {
+): Promise<{
+  importer: RecipeImporter
+  recipes: RecipeInput[]
+  warnings: string[]
+  /** Per-recipe source timestamps (M24), parallel to `recipes`. */
+  timestamps: (SourceTimestamps | undefined)[]
+}> {
   const importer = registry.get(id)
   if (!importer) throw new ImporterError('That importer is not available.')
   if (!importer.accepts.includes(input.kind)) {
@@ -196,6 +209,7 @@ export async function runImporter(
   // collected before it runs.
   const warnings: string[] = []
   const imageCidsByIndex = new Map<number, string[]>()
+  const timestampsByIndex = new Map<number, SourceTimestamps>()
   raw.forEach((r, i) => {
     if (typeof r !== 'object' || r === null || Array.isArray(r)) return
     const rec = r as Record<string, unknown>
@@ -209,6 +223,25 @@ export async function runImporter(
         (c): c is string => typeof c === 'string' && c.trim() !== '',
       )
       if (cids.length > 0) imageCidsByIndex.set(i, cids)
+    }
+    // Source timestamps (M24): validated now, so a bad date fails the
+    // run before anything is saved — never stored unvalidated.
+    if (rec.createdAt !== undefined || rec.updatedAt !== undefined) {
+      const label = `${importer.name}, recipe ${i + 1}`
+      if (rec.createdAt !== undefined && !isValidIsoTimestamp(rec.createdAt)) {
+        throw new ImporterError(`${label}: "createdAt" is not a valid date.`)
+      }
+      if (rec.updatedAt !== undefined && !isValidIsoTimestamp(rec.updatedAt)) {
+        throw new ImporterError(`${label}: "updatedAt" is not a valid date.`)
+      }
+      timestampsByIndex.set(i, {
+        ...(rec.createdAt !== undefined
+          ? { createdAt: rec.createdAt as string }
+          : {}),
+        ...(rec.updatedAt !== undefined
+          ? { updatedAt: rec.updatedAt as string }
+          : {}),
+      })
     }
   })
   const recipes = raw.map((r, i) => validateImportedRecipe(r, importer.name, i))
@@ -241,5 +274,6 @@ export async function runImporter(
       )
     }
   }
-  return { importer, recipes, warnings }
+  const timestamps = recipes.map((_, i) => timestampsByIndex.get(i))
+  return { importer, recipes, warnings, timestamps }
 }

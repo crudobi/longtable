@@ -44,6 +44,12 @@ export type VisibilityTier = NonNullable<Recipe['visibility']>
 /** Fields the user supplies; timestamps are assigned by the store. */
 export type RecipeInput = Omit<Recipe, 'createdAt' | 'updatedAt'>
 
+/** Optional source timestamps carried through an import (M24). */
+export interface SourceTimestamps {
+  createdAt?: string
+  updatedAt?: string
+}
+
 /** Partial update — every field optional. */
 export interface RecipePatch {
   title?: string
