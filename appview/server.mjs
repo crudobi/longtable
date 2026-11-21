@@ -33,6 +33,18 @@ function sendJson(res, status, obj) {
   res.end(body)
 }
 
+/**
+ * Serving rule (S2): a row is served only if it carries all three
+ * device-signature fields. Rows indexed before C2 carry NULLs until a
+ * verified reconcile re-upserts them; they stay in the store (so the
+ * startup/periodic sweep can find their DID and re-verify them) but
+ * are never served on /search, /recipe/ or /author/ in the meantime.
+ * An unverified /recipe/ is a 404, indistinguishable from absent.
+ */
+function isVerifiedRow(row) {
+  return Boolean(row?.deviceDid && row?.deviceSignature && row?.deviceKey)
+}
+
 export function createAppView({
   dbPath = './appview.db',
   pdsUrl = 'http://localhost:2583',
@@ -76,6 +88,7 @@ export function createAppView({
         return sendJson(res, 200, {
           ...ingestor.stats,
           total: index.count(),
+          unverified: index.countUnverified(),
           fts5: index.ftsEnabled,
           media: media ? media.stats : null,
         })
@@ -105,7 +118,7 @@ export function createAppView({
         const ingredients = ingParam
           ? ingParam.split(',').map((s) => s.trim()).filter(Boolean)
           : []
-        return sendJson(res, 200, { results: index.search({ q, ingredients }) })
+        return sendJson(res, 200, { results: index.search({ q, ingredients }).filter(isVerifiedRow) })
       }
       if (req.method === 'GET' && path.startsWith('/recipe/')) {
         const parts = path.split('/').filter(Boolean) // ['recipe', did, rkey]
@@ -113,13 +126,13 @@ export function createAppView({
           const did = decodeURIComponent(parts[1])
           const rkey = decodeURIComponent(parts[2])
           const recipe = index.getRecipe(did, rkey)
-          if (recipe) return sendJson(res, 200, recipe)
+          if (recipe && isVerifiedRow(recipe)) return sendJson(res, 200, recipe)
         }
         return sendJson(res, 404, { error: 'recipe not found' })
       }
       if (req.method === 'GET' && path.startsWith('/author/')) {
         const did = decodeURIComponent(path.slice('/author/'.length))
-        if (did) return sendJson(res, 200, { did, results: index.byAuthor(did) })
+        if (did) return sendJson(res, 200, { did, results: index.byAuthor(did).filter(isVerifiedRow) })
         return sendJson(res, 404, { error: 'author not found' })
       }
       return sendJson(res, 404, { error: 'not found' })

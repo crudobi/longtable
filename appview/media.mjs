@@ -26,6 +26,11 @@ export const MAX_BLOB_BYTES = 32 * 1024 * 1024
 /** Total cache bound (512 MiB): before a new blob is stored, the oldest
  * entries (by mtime) are evicted until the cache fits again. */
 export const MAX_CACHE_BYTES = 512 * 1024 * 1024
+/** Per-fetch timeout for the PDS blob fetch (30 s, same as verify.mjs's
+ * fetch timeout): a hung PDS must abort the fetch, never pin the
+ * inflight key forever (S11). The `.finally(() => inflight.delete(key))`
+ * cleanup in get() then frees the (did, cid) for a later retry. */
+export const MEDIA_FETCH_TIMEOUT_MS = 30_000
 
 // --- CIDv1 / sha2-256 verification ---------------------------------------
 // Blob CIDs are CIDv1 strings (multibase base32 'b…' or base58btc 'z…')
@@ -182,6 +187,7 @@ export function createMediaCache({
   log = console,
   maxBlobBytes = MAX_BLOB_BYTES,
   maxCacheBytes = MAX_CACHE_BYTES,
+  fetchTimeoutMs = MEDIA_FETCH_TIMEOUT_MS,
 } = {}) {
   if (!dir) throw new Error('media cache requires a directory')
   const stats = { hits: 0, misses: 0, fetches: 0, errors: 0 }
@@ -268,7 +274,11 @@ export function createMediaCache({
   async function fetchAndStore(did, cid) {
     const url = `${pdsUrl}/xrpc/com.atproto.sync.getBlob?did=${encodeURIComponent(did)}&cid=${encodeURIComponent(cid)}`
     stats.fetches++
-    const res = await fetchImpl(url)
+    // S11: abort a hung PDS fetch — a bare fetch with no signal would
+    // leave the shared inflight promise pending forever, making that
+    // (did, cid) unservable for the process lifetime. The abort rejects
+    // here, get()'s .catch counts it, and .finally frees the key.
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(fetchTimeoutMs) })
     if (!res.ok) return null
     const buf = await readBodyWithCap(res, maxBlobBytes)
     if (buf === null) {

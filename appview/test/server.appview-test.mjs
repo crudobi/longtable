@@ -99,3 +99,37 @@ describe('appview HTTP API', () => {
     expect(res.headers.get('access-control-allow-origin')).toBe('*')
   })
 })
+
+describe('appview HTTP API: NULL-signature (pre-C2) rows are never served (S2)', () => {
+  it('GET /search, /recipe/ and /author/ exclude rows with NULL signature fields', async () => {
+    // A row indexed before C2: no device fields at all. It stays in the
+    // store (so the reconcile sweep can find its DID and re-verify it)
+    // but must never be served until then.
+    app.index.upsert({
+      uri: 'at://did:plc:testauthor/kitchen.longtable.recipe/legacy',
+      did: 'did:plc:testauthor',
+      rkey: 'legacy',
+      cid: 'cid-legacy-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'Legacy Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        longtableId: 'lt-legacy',
+        createdAt: '2026-10-12T00:00:00.000Z',
+      },
+    })
+    const search = await (await fetch(`${base}/search?q=Legacy`)).json()
+    expect(search.results.filter((r) => r.rkey === 'legacy')).toHaveLength(0)
+    const full = await fetch(`${base}/recipe/did:plc:testauthor/legacy`)
+    expect(full.status).toBe(404)
+    const author = await (await fetch(`${base}/author/did:plc:testauthor`)).json()
+    expect(author.results.filter((r) => r.rkey === 'legacy')).toHaveLength(0)
+    // ...while the verified row from the earlier test is still served,
+    // and /stats reports the unverified remainder.
+    const signed = await (await fetch(`${base}/search?q=Signed`)).json()
+    expect(signed.results).toHaveLength(1)
+    const stats = await (await fetch(`${base}/stats`)).json()
+    expect(stats.unverified).toBeGreaterThanOrEqual(1)
+  })
+})

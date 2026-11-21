@@ -61,9 +61,10 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     throw new Error('createIngestor: repoStateProvider function is required')
   }
 
-  const stats = { indexed: 0, rejected: 0, signatureRejected: 0, lastReconcileAt: null }
+  const stats = { indexed: 0, rejected: 0, signatureRejected: 0, sweepSkipped: 0, lastReconcileAt: null }
   let ws = null
   let reconnectTimer = null
+  let reconcileTimer = null
   let closed = false
   let queue = Promise.resolve()
 
@@ -71,6 +72,15 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
    * Fetch the verified repo state for `did` and diff the index against it:
    * upsert new/changed recipes, delete recipes that vanished from the repo.
    * On any verification failure: index nothing, stats.rejected++, {ok:false}.
+   *
+   * Binding-failure sweep rule (N1 / M-N5): a *missing* binding is
+   * ambiguous — the binding commit may simply not have arrived yet — so
+   * new records are rejected but the sweep is skipped and
+   * previously-verified rows stay until re-verified. Any other binding
+   * failure is positive evidence the binding is wrong, so the sweep runs.
+   * The one exception is a verified-EMPTY repo state: with no recipe
+   * records at all there is nothing ambiguous left, so the sweep runs
+   * as the author's deletion.
    */
   async function reconcileRepo(did) {
     let state
@@ -110,6 +120,17 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
         reject(entry, binding.reason)
       }
     }
+    // N1 sweep-skip: missing binding + recipe records present in the
+    // verified state means the evidence is ambiguous (transient gap),
+    // so keep previously-verified rows. Missing binding with zero
+    // recipe records is a verified-empty repo — the sweep is the
+    // author's deletion, so it runs. Any other binding failure
+    // (invalid key / bad binding signature / key mismatch) is positive
+    // evidence the binding is wrong — e.g. a rebind — so the sweep
+    // runs as before and old-device rows leave.
+    const recipeCount = records.filter((r) => r.collection === RECIPE_COLLECTION).length
+    const skipSweep =
+      !binding.ok && binding.reason === 'missing-binding' && recipeCount > 0
     const seen = new Set()
     let changed = 0
     if (binding.ok) {
@@ -138,14 +159,21 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
       }
     }
     let deleted = 0
-    for (const uri of index.listUrisByDid(did)) {
-      if (!seen.has(uri)) {
-        index.deleteByUri(uri)
-        deleted++
+    if (skipSweep) {
+      stats.sweepSkipped++
+      log.warn?.(
+        `[appview] reconcile ${did}: binding missing, sweep skipped — ${index.listUrisByDid(did).length} previously-indexed rows kept until re-verified`,
+      )
+    } else {
+      for (const uri of index.listUrisByDid(did)) {
+        if (!seen.has(uri)) {
+          index.deleteByUri(uri)
+          deleted++
+        }
       }
     }
     stats.lastReconcileAt = new Date().toISOString()
-    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected, signatureRejected }
+    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected, signatureRejected, sweepSkipped: skipSweep, bindingReason: binding.ok ? null : binding.reason }
   }
 
   /**
@@ -162,6 +190,14 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
    * signature (see reconcileRepo): a record present in the repo but
    * failing device verification is dropped there, so ingestClaim reports
    * indexed:false with reason 'device-signature-rejected'.
+   *
+   * Sweep-skip + periodic sweep (N1 / M-N5, S2): a *missing* pubkey
+   * binding is ambiguous (the binding commit may not have arrived yet),
+   * so reconcile rejects new records but skips the sweep-delete and keeps
+   * previously-verified rows; a periodic sweep (reconcileAllDids, hourly
+   * by default, plus a startup reconcile in index.mjs) re-verifies every
+   * DID in the index, so a healed binding re-indexes the author without
+   * waiting for their next repo commit.
    */
   async function ingestClaim({ did, collection, rkey, record } = {}) {
     let claimedCid
@@ -185,7 +221,16 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
       stats.rejected++
       return { indexed: false, reason: 'not-in-verified-repo', claimedCid }
     }
-    const reconciled = await reconcileRepo(did)
+    // S12: route the reconcile through the same serialized queue as the
+    // firehose path. Two concurrent reconciles for one DID used to
+    // interleave upsert/delete sweeps, so a stale-state reconcile
+    // finishing last could delete a record the fresh one just indexed.
+    // `queue` takes the caught copy so a throwing reconcile never
+    // poisons the chain; `run` itself is awaited, so its error still
+    // propagates to this caller exactly as before.
+    const run = queue.then(() => reconcileRepo(did))
+    queue = run.catch(() => {})
+    const reconciled = await run
     const uri = `at://${did}/${collection}/${rkey}`
     const indexed = collection === RECIPE_COLLECTION && index.hasUri(uri)
     if (!reconciled.ok) {
@@ -251,8 +296,61 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     })
   }
 
+  /**
+   * Reconcile every DID present in the index, serialized through the
+   * same queue as firehose reconciles. This is the healing path for
+   * N1/S2 (and the reconcile half of prior H3): a DID whose binding
+   * was missing (sweep skipped, rows kept) or whose rows predate
+   * device verification (NULL signature fields) is re-verified here
+   * without waiting for the author's next repo commit — which, for a
+   * dormant author, may never come. The startup reconcile in index.mjs
+   * and the periodic timer both call this. One DID's failure never
+   * aborts the rest. (The firehose cursor itself is Wave 4, not this
+   * sweep: the sweep only revisits DIDs already in the index.)
+   */
+  async function reconcileAllDids() {
+    const run = queue.then(async () => {
+      const results = []
+      for (const did of index.listDids()) {
+        try {
+          results.push(await reconcileRepo(did))
+        } catch (err) {
+          stats.rejected++
+          log.warn?.(`[appview] reconcile-all ${did} failed: ${err?.message ?? err}`)
+          results.push({ ok: false, did, error: String(err?.message ?? err) })
+        }
+      }
+      return results
+    })
+    queue = run.catch(() => {})
+    return run
+  }
+
+  /**
+   * Start the periodic reconcile sweep (default hourly). The timer is
+   * unref'd so it never keeps the process alive on its own, and a
+   * sweep already in flight is never overlapped — the next one chains
+   * behind it on the queue.
+   */
+  function startPeriodicReconcile(intervalMs = 3600000) {
+    if (reconcileTimer) return reconcileTimer
+    reconcileTimer = setInterval(() => {
+      reconcileAllDids().catch(() => {})
+    }, intervalMs)
+    reconcileTimer.unref?.()
+    return reconcileTimer
+  }
+
+  function stopPeriodicReconcile() {
+    if (reconcileTimer) {
+      clearInterval(reconcileTimer)
+      reconcileTimer = null
+    }
+  }
+
   function close() {
     closed = true
+    stopPeriodicReconcile()
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (ws) {
       try {
@@ -267,6 +365,9 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
   return {
     stats,
     reconcileRepo,
+    reconcileAllDids,
+    startPeriodicReconcile,
+    stopPeriodicReconcile,
     ingestClaim,
     handleFrame,
     handleMessage,

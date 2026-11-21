@@ -347,3 +347,279 @@ describe('firehose filtering', () => {
     index.close()
   })
 })
+
+describe('binding-failure sweep rule (N1 / M-N5)', () => {
+  let index, state, ingestor, device
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+    state = { records: [] }
+    device = makeDevice()
+    ingestor = createIngestor({
+      index,
+      repoStateProvider: fakeProvider(state),
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+  })
+  afterEach(() => index.close())
+
+  function bindingEntryFor(d) {
+    return { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bindingRecord(d, DID) }
+  }
+
+  function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
+    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+  }
+
+  async function indexVerified() {
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      bindingEntryFor(device),
+    ]
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(1)
+  }
+
+  it('missing binding keeps previously-indexed rows (sweep skipped) but rejects new records', async () => {
+    await indexVerified()
+    // The binding vanishes while the recipe is still in the repo state
+    // (e.g. its commit has not arrived yet): the gap is ambiguous.
+    state.records = [recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']))]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.sweepSkipped).toBe(true)
+    expect(res.bindingReason).toBe('missing-binding')
+    expect(res.deleted).toBe(0)
+    expect(index.count()).toBe(1)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(1)
+    expect(ingestor.stats.signatureRejected).toBe(1)
+    expect(ingestor.stats.sweepSkipped).toBe(1)
+  })
+
+  it('invalid binding signature still sweeps previously-indexed rows', async () => {
+    await indexVerified()
+    const bad = bindingRecord(device, DID)
+    const attacker = makeDevice()
+    bad.signature = signMsg(attacker, pubkeyBindingMessage(DID, device.deviceDid, device.devicePublicKey))
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bad },
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.sweepSkipped).toBe(false)
+    expect(res.bindingReason).toBe('binding-signature-invalid')
+    expect(index.count()).toBe(0)
+  })
+
+  it('verified-empty repo still sweeps even with no binding (author deletion)', async () => {
+    await indexVerified()
+    state.records = []
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.sweepSkipped).toBe(false)
+    expect(res.bindingReason).toBe('missing-binding')
+    expect(res.deleted).toBe(1)
+    expect(index.count()).toBe(0)
+  })
+})
+
+describe('periodic reconcile sweep (N1 / S2)', () => {
+  let index, state, ingestor, device
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+    state = { records: [] }
+    device = makeDevice()
+    ingestor = createIngestor({
+      index,
+      repoStateProvider: fakeProvider(state),
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+  })
+  afterEach(() => index.close())
+
+  function bindingEntryFor(d) {
+    return { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bindingRecord(d, DID) }
+  }
+
+  function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
+    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+  }
+
+  it('reconcileAllDids re-indexes a DID whose binding healed, without a new author commit', async () => {
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      bindingEntryFor(device),
+    ]
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(1)
+    // Binding goes missing: A is rejected but kept (sweep skipped).
+    state.records = [recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']))]
+    const missing = await ingestor.reconcileRepo(DID)
+    expect(missing.sweepSkipped).toBe(true)
+    expect(index.count()).toBe(1)
+    // Binding heals AND a new recipe B appears — no firehose event fires.
+    // The sweep alone must pick both up.
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      recipeEntry('b', signedRecipeRecord(device, DID, 'Beta Stew', ['2 potatoes'])),
+      bindingEntryFor(device),
+    ]
+    const results = await ingestor.reconcileAllDids()
+    expect(results).toHaveLength(1)
+    expect(results[0].did).toBe(DID)
+    expect(results[0].ok).toBe(true)
+    expect(index.count()).toBe(2)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(1)
+  })
+
+  it('reconcileAllDids backfills a pre-C2 NULL-signature row once its DID re-verifies (S2)', async () => {
+    // A row indexed before C2: no device fields at all.
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/a`,
+      did: DID,
+      rkey: 'a',
+      cid: 'cid-a',
+      record: record('Alpha Soup', ['1 egg']),
+    })
+    expect(index.getRecipe(DID, 'a').deviceKey).toBeNull()
+    expect(index.countUnverified()).toBe(1)
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      bindingEntryFor(device),
+    ]
+    await ingestor.reconcileAllDids()
+    const row = index.getRecipe(DID, 'a')
+    expect(row.deviceKey).toBe(device.devicePublicKey)
+    expect(row.deviceDid).toBe(device.deviceDid)
+    expect(row.deviceSignature).toBeTruthy()
+    expect(index.countUnverified()).toBe(0)
+  })
+
+  it('reconcileAllDids isolates one failing DID and never throws', async () => {
+    const throwing = createIngestor({
+      index,
+      repoStateProvider: async (did) => {
+        if (did === OTHER) throw new Error('PDS down')
+        return { did, commitCid: 'bafyfakecommit', records: state.records }
+      },
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+    index.upsert({
+      uri: `at://${OTHER}/kitchen.longtable.recipe/x`,
+      did: OTHER,
+      rkey: 'x',
+      cid: 'cid-x',
+      record: record('Other Dish', ['rice']),
+    })
+    // DID must already have a row for the sweep to visit it.
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/a`,
+      did: DID,
+      rkey: 'a',
+      cid: 'cid-a',
+      record: record('Alpha Soup', ['1 egg']),
+    })
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      bindingEntryFor(device),
+    ]
+    const results = await throwing.reconcileAllDids()
+    expect(results).toHaveLength(2)
+    const byDid = Object.fromEntries(results.map((r) => [r.did, r]))
+    expect(byDid[DID].ok).toBe(true)
+    expect(byDid[OTHER].ok).toBe(false)
+    // Neither DID's rows were swept by the other's failure.
+    expect(index.count()).toBe(2)
+  })
+
+  it('startPeriodicReconcile runs the sweep on a timer; stopPeriodicReconcile ends it', async () => {
+    let calls = 0
+    const timerIngestor = createIngestor({
+      index,
+      repoStateProvider: async (did) => {
+        calls++
+        return { did, records: [] }
+      },
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/a`,
+      did: DID,
+      rkey: 'a',
+      cid: 'cid-a',
+      record: record('Alpha Soup', ['1 egg']),
+    })
+    timerIngestor.startPeriodicReconcile(10)
+    await new Promise((r) => setTimeout(r, 50))
+    timerIngestor.stopPeriodicReconcile()
+    const callsAfterStop = calls
+    await new Promise((r) => setTimeout(r, 40))
+    expect(calls).toBeGreaterThan(0)
+    expect(calls).toBe(callsAfterStop)
+  })
+})
+
+describe('ingestClaim queue routing (S12)', () => {
+  let index, device, ingestor
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+    device = makeDevice()
+  })
+  afterEach(() => index.close())
+
+  it('a slow stale reconcile queued ahead of a fast fresh one cannot delete the fresh record', async () => {
+    const binding = { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bindingRecord(device, DID) }
+    const recA = signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])
+    const recB = signedRecipeRecord(device, DID, 'Beta Stew', ['2 potatoes'])
+    const cidB = (await cidForRecord(recB)).toString()
+    const v1 = [
+      { collection: 'kitchen.longtable.recipe', rkey: 'a', cid: 'cid-a', record: recA },
+      binding,
+    ]
+    const v2 = [
+      ...v1,
+      { collection: 'kitchen.longtable.recipe', rkey: 'b', cid: cidB, record: recB },
+    ]
+    let version = 'v1'
+    const provider = async (did) => {
+      // Snapshot the state at call time; a v1 fetch is slow (30 ms),
+      // a v2 fetch is fast — without queueing, the slow v1 reconcile
+      // finishes last and its sweep deletes B.
+      const snap = version === 'v1' ? v1 : v2
+      if (version === 'v1') await new Promise((r) => setTimeout(r, 30))
+      return { did, commitCid: 'bafyfakecommit', records: snap }
+    }
+    ingestor = createIngestor({
+      index,
+      repoStateProvider: provider,
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+    // A firehose commit for A queues a (slow, stale) v1 reconcile...
+    expect(
+      ingestor.handleFrame(
+        { op: 1, t: '#commit' },
+        { repo: DID, ops: [{ action: 'create', path: 'kitchen.longtable.recipe/a', cid: null }] },
+      ),
+    ).toBe(true)
+    // ...let it start (snapshot v1) before the repo moves on...
+    await new Promise((r) => setTimeout(r, 0))
+    version = 'v2'
+    // ...then a claim for B arrives. Its reconcile must queue behind
+    // the v1 one, not run alongside it.
+    const claimed = await ingestor.ingestClaim({
+      did: DID,
+      collection: 'kitchen.longtable.recipe',
+      rkey: 'b',
+      record: recB,
+    })
+    await ingestor.pending
+    expect(claimed.indexed).toBe(true)
+    expect(index.count()).toBe(2)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(1)
+  })
+})

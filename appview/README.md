@@ -80,8 +80,27 @@ Reconcile then diffs: upsert verified recipes present in the repo state,
 delete indexed recipes for that DID that are no longer in it — including
 recipes whose device signature stopped verifying (e.g. the author
 rebound to a new device key). Stats keep
-`{indexed, rejected, signatureRejected, lastReconcileAt}`; any
+`{indexed, rejected, signatureRejected, sweepSkipped, lastReconcileAt}`; any
 verification failure increments `rejected` and indexes nothing.
+
+Two exceptions to the sweep, both fail-closed the other way. First, a
+*missing* pubkey binding (`missing-binding`: the binding record is simply
+absent from the fetched CAR) is ambiguous — the binding commit may not
+have arrived yet, the CAR may be partial, or the publisher may have no
+binding at all — so reconcile rejects the DID's new records but SKIPS
+the sweep-delete and keeps previously-verified rows until they are
+re-verified (N1 / M-N5). Any other binding failure (invalid key, bad
+binding signature, key mismatch) is positive evidence the binding is
+wrong, so the sweep runs as before. A verified-EMPTY repo state (no
+binding and no recipe records) is the author's deletion, so its sweep
+runs too. Second, reconcile fires on firehose events only by default,
+which never heals a dormant author — so a **startup reconcile** plus an
+**hourly periodic sweep** (`reconcileAllDids`, interval
+`APPVIEW_RECONCILE_INTERVAL_MS`, default 3600000) re-verifies every
+distinct DID in the index through the same serialized queue. The sweep
+is the healing path for a missing binding that later appears and for
+pre-C2 rows (S2, below); the firehose cursor itself is a later step,
+not this sweep — the sweep only revisits DIDs already in the index.
 
 ### What a hostile hub / ingest source can and cannot do
 
@@ -131,7 +150,11 @@ JSON, images JSON, longtable_id, created_at, updated_at, device_did,
 device_signature, device_key)` — the last three are the served signature
 fields (pre-C2 index DBs gain them by migration; rows carry NULLs until
 their next verified reconcile). Only device-verified rows are ever
-diffed in. FTS5 virtual table `recipes_fts(uri UNINDEXED,
+diffed in by reconcile — and only device-verified rows are ever SERVED:
+`/search`, `/recipe/` and `/author/` exclude rows with any NULL
+signature field until a verified reconcile re-upserts them (S2; the
+startup + periodic sweep is what re-verifies them, and `/stats` reports
+the remaining count as `unverified`). FTS5 virtual table `recipes_fts(uri UNINDEXED,
 name, ingredients_text, tags_text)` is kept in sync on every upsert/delete.
 **FTS5 is available** in this box's Node v24 `node:sqlite` (verified). If it
 ever weren't, `RecipeIndex` falls back to LIKE-based search with identical
@@ -148,11 +171,11 @@ listed ingredient must match (token-prefix per ingredient token, so
 | --- | --- |
 | `GET /health` | `{ok: true}` |
 | `GET /stats` | `{indexed, rejected, signatureRejected, lastReconcileAt, total, fts5}` |
-| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt, deviceDid, deviceSignature, deviceKey}]}` ranked by FTS rank |
+| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt, longtableId, deviceDid, deviceSignature, deviceKey}]}` ranked by FTS rank — device-verified rows only (S2); list items are unverified by the client until opened (S10) |
 | `GET /search?ingredients=egg,flour` | recipes containing **all** listed ingredients (AND) |
 | `GET /search?q=...&ingredients=...` | both filters combined |
-| `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs, `deviceDid`, `deviceSignature`, `deviceKey`) or 404 |
-| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same three signature fields |
+| `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs, `deviceDid`, `deviceSignature`, `deviceKey`) or 404 — a row with NULL signature fields is a 404, not served (S2) |
+| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same fields as `/search` (incl. `longtableId`), device-verified rows only (S2) |
 
 Response contract (for clients verifying at read time): every per-recipe
 object carries `deviceDid` (the author's Longtable device DID, a
@@ -179,6 +202,11 @@ DIDs in paths may be sent raw (`did:plc:...`) or URL-encoded.
 | `APPVIEW_DB` | `./appview.db` | SQLite index path |
 | `PDS_URL` | `http://localhost:2583` | PDS base URL (firehose + `getRepo`) |
 | `PLC_URL` | `http://localhost:2582` | PLC directory base URL (DID docs) |
+| `APPVIEW_RECONCILE_INTERVAL_MS` | `3600000` | Periodic reconcile-sweep interval in ms (N1/S2 healing sweep) |
+
+Media fetches from the PDS abort after 30 s (`MEDIA_FETCH_TIMEOUT_MS`
+in `media.mjs`, same as `verify.mjs`'s fetch timeout) so a hung PDS
+cannot pin a media cache key forever (S11).
 
 ## Run
 

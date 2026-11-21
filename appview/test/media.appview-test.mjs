@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createAppView } from '../server.mjs'
-import { createMediaCache, isCacheableMediaId, rawCidForBytes } from '../media.mjs'
+import { createMediaCache, isCacheableMediaId, rawCidForBytes, MEDIA_FETCH_TIMEOUT_MS } from '../media.mjs'
 
 // Phase 4: the hub AppView caches public media (recipe photos) from the
 // PDS, content-addressed by (did, cid). First fetch goes to the PDS;
@@ -100,7 +100,7 @@ describe('media cache integrity + bounds (direct)', () => {
 
   function tmpCache(opts, handler) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-media-direct-'))
-    const fetchImpl = async (url) => handler(new URL(url))
+    const fetchImpl = async (url, init) => handler(new URL(url), init)
     const cache = createMediaCache({
       dir,
       pdsUrl: 'http://pds.test',
@@ -154,6 +154,54 @@ describe('media cache integrity + bounds (direct)', () => {
     let total = 0
     for (const f of fs.readdirSync(sub)) total += fs.statSync(path.join(sub, f)).size
     expect(total).toBeLessThanOrEqual(300)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('media fetch timeout (S11)', () => {
+  const DID2 = 'did:plc:directtest'
+  const quietLog = { log() {}, info() {}, warn() {}, error() {} }
+
+  it('the default fetch timeout is 30 s', () => {
+    expect(MEDIA_FETCH_TIMEOUT_MS).toBe(30_000)
+  })
+
+  it('a hung PDS fetch aborts at the timeout and frees the inflight key', async () => {
+    const cid = rawCidForBytes(PNG)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-media-timeout-'))
+    let calls = 0
+    const cache = createMediaCache({
+      dir,
+      pdsUrl: 'http://pds.test',
+      fetchImpl: async (url, init) => {
+        calls++
+        if (calls === 1) {
+          // Hang until the abort signal fires, then reject the way
+          // fetch does on abort — never resolve on our own.
+          await new Promise((_, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('The operation was aborted', 'AbortError'))
+            })
+          })
+        }
+        return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } })
+      },
+      log: quietLog,
+      fetchTimeoutMs: 50,
+    })
+    const started = Date.now()
+    const hung = await cache.get(DID2, cid)
+    const elapsedMs = Date.now() - started
+    expect(hung).toBeNull()
+    expect(elapsedMs).toBeLessThan(2000)
+    expect(calls).toBe(1)
+    expect(cache.stats.errors).toBeGreaterThanOrEqual(1)
+    // The inflight key was freed: a second get re-fetches and succeeds
+    // instead of awaiting the dead first attempt forever.
+    const fresh = await cache.get(DID2, cid)
+    expect(calls).toBe(2)
+    expect(fresh).not.toBeNull()
+    expect(Buffer.from(fresh.bytes).equals(PNG)).toBe(true)
     fs.rmSync(dir, { recursive: true, force: true })
   })
 })

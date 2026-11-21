@@ -7,6 +7,9 @@
  *   APPVIEW_MEDIA media cache dir        (default: <db dir>/media)
  *   PDS_URL       local PDS base URL     (default http://localhost:2583)
  *   PLC_URL       local PLC base URL     (default http://localhost:2582)
+ *   APPVIEW_RECONCILE_INTERVAL_MS
+ *                 periodic reconcile sweep interval in ms (default 3600000,
+ *                 one hour; N1/S2 healing sweep — see ingest.mjs)
  *
  * Run it in tmux:  tmux new -s lt-appview -d 'cd appview && npm start'
  */
@@ -22,6 +25,28 @@ const app = createAppView({
 
 await app.listen(port)
 console.info(`[appview] listening on :${port} (db=${process.env.APPVIEW_DB ?? './appview.db'})`)
+
+// Startup reconcile (S2): re-verify every DID already in the index, so
+// pre-C2 rows with NULL signature fields are backfilled (or swept, when
+// the binding verifies-invalid / the record is gone) instead of being
+// served unverified forever. Then the periodic sweep (N1) keeps healing
+// bindings that were missing at startup without waiting for the
+// author's next commit. Both run through the ingestor's serialized
+// queue; the firehose stays the fast path for new commits.
+const reconcileIntervalMs = Number(process.env.APPVIEW_RECONCILE_INTERVAL_MS ?? 3600000)
+try {
+  const results = await app.ingestor.reconcileAllDids()
+  const swept = results.reduce(
+    (acc, r) => ({ indexed: acc.indexed + (r.indexed ?? 0), deleted: acc.deleted + (r.deleted ?? 0) }),
+    { indexed: 0, deleted: 0 },
+  )
+  console.info(
+    `[appview] startup reconcile: ${results.length} DIDs, ${swept.indexed} indexed, ${swept.deleted} deleted`,
+  )
+} catch (err) {
+  console.warn(`[appview] startup reconcile failed: ${err?.message ?? err}`)
+}
+app.ingestor.startPeriodicReconcile(reconcileIntervalMs)
 app.ingestor.startFirehose()
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
