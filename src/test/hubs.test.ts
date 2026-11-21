@@ -12,7 +12,6 @@ import {
   DEFAULT_HUB,
   HUBS_KEY,
   LEGACY_HUB_HASHES,
-  LEGACY_HUB_HASHES_V0,
   addHub,
   getActiveHub,
   getIceServers,
@@ -153,38 +152,53 @@ describe('hub registry', () => {
     expect(reg.activeId).toBe('hub-something-else')
   })
 
-  it('legacy migration matches a second digest set for one release (V0)', () => {
-    // Production matches both the corrected digests and the 440c8ac
-    // set for one release; synthetic values stand in for both. The
-    // name/credential checks use the set the id matched, so a mixed
-    // entry keeps the fields the matched set does not recognize.
-    const oldId = 'old-v0-hub'
-    const oldName = 'Old V0 Hub'
-    const oldCred = 'old-v0-credential'
-    const v0Hashes = {
+  it('committed legacy digests are the corrected (V1) set', () => {
+    // Review C1 partial (b): no unit test asserted the real digests —
+    // the CI check was the sole catcher. These are FNV-1a-64 digests of
+    // the values that actually shipped (re-derived by
+    // ci/check-legacy-hub-digests.py from d725e40), not secrets, so
+    // pinning the literals here is safe and makes a wrong digest fail
+    // in the unit suite as well as in the pipeline.
+    expect(LEGACY_HUB_HASHES).toEqual({
+      id: '5e9a8751d9a03b3f',
+      name: '7eca6bcb61324caf',
+      credential: '7d1624db0754b5f6',
+    })
+  })
+
+  it('legacy migration accepts a list of digest sets', () => {
+    // The `hashes` parameter still accepts a list: production passes
+    // the single corrected set, and a caller may pass more. Synthetic
+    // values stand in for both sets. The name/credential checks use
+    // the set the id matched, so a mixed entry keeps the fields the
+    // matched set does not recognize.
+    const oldId = 'old-second-set-hub'
+    const oldName = 'Old Second-Set Hub'
+    const oldCred = 'old-second-set-credential'
+    const secondHashes = {
       id: legacyMatchHash(oldId),
       name: legacyMatchHash(oldName),
       credential: legacyMatchHash(oldCred),
     }
-    const correctedHashes = {
-      id: legacyMatchHash('old-corrected-hub'),
-      name: legacyMatchHash('Old Corrected Hub'),
-      credential: legacyMatchHash('old-corrected-credential'),
+    const firstHashes = {
+      id: legacyMatchHash('old-first-set-hub'),
+      name: legacyMatchHash('Old First-Set Hub'),
+      credential: legacyMatchHash('old-first-set-credential'),
     }
     const reg: HubRegistry = {
       hubs: [{ ...DEFAULT_HUB, id: oldId, name: oldName, turnCredential: oldCred }],
       activeId: oldId,
     }
-    expect(migrateLegacyDefaultHub(reg, [correctedHashes, v0Hashes])).toBe(true)
+    expect(migrateLegacyDefaultHub(reg, [firstHashes, secondHashes])).toBe(true)
     expect(reg.hubs[0].id).toBe(DEFAULT_HUB.id)
     expect(reg.hubs[0].name).toBe(DEFAULT_HUB.name)
     expect(reg.hubs[0].turnCredential).toBeUndefined()
     expect(reg.activeId).toBe(DEFAULT_HUB.id)
-    // The two committed sets are distinct: the V0 id digest must not
-    // equal the corrected one.
-    expect(LEGACY_HUB_HASHES_V0.id).not.toBe(LEGACY_HUB_HASHES.id)
-    expect(LEGACY_HUB_HASHES_V0.name).not.toBe(LEGACY_HUB_HASHES.name)
-    expect(LEGACY_HUB_HASHES_V0.credential).not.toBe(LEGACY_HUB_HASHES.credential)
+    // The two synthetic sets are distinct, so the match is
+    // unambiguous: the second set is the one that fired.
+    expect(secondHashes.id).not.toBe(firstHashes.id)
+    expect(secondHashes.name).not.toBe(firstHashes.name)
+    expect(secondHashes.credential).not.toBe(firstHashes.credential)
   })
 
   it('falls back to the default hub on corrupt storage', () => {

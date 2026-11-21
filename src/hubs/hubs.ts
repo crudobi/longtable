@@ -117,20 +117,6 @@ export const LEGACY_HUB_HASHES: LegacyHubHashes = {
   credential: '7d1624db0754b5f6',
 }
 
-/**
- * The 440c8ac digests (fragment-joined strings; never shipped), matched
- * defensively for ONE release only, in case any device carries
- * fragment-valued entries. Remove after that release: the fragment
- * strings never shipped, so no real device should need this past one
- * release. ci/check-legacy-hub-digests.py pins this set to the digests
- * committed by 440c8ac.
- */
-export const LEGACY_HUB_HASHES_V0: LegacyHubHashes = {
-  id: 'aa3d84ecc2a466dc',
-  name: '7dadf2009a1fa830',
-  credential: '7572d0be55d53e4f',
-}
-
 /** The built-in hub: Phase 1–3 dev endpoints (emulator view of the dev rig). */
 export const DEFAULT_HUB: HubConfig = {
   id: DEFAULT_HUB_ID,
@@ -154,21 +140,20 @@ export const DEFAULT_HUB: HubConfig = {
  * duplication. Returns true when anything changed.
  *
  * Matching is by digest (see legacyMatchHash): the stored id, name,
- * and credential are hashed and compared against the digest sets, so
+ * and credential are hashed and compared against the digest set, so
  * the old values never appear in this file or the shipped bundle.
  * `hashes` is injectable so unit tests can exercise the same code path
  * with synthetic values; it accepts one set or a list of sets.
- * Production matches both LEGACY_HUB_HASHES and LEGACY_HUB_HASHES_V0
- * (the corrected digests first); the name/credential checks use the
- * same set the id matched, so a mixed entry keeps the fields it does
- * not recognize. See LEGACY_HUB_HASHES_V0 for the one-release scope.
+ * Production matches LEGACY_HUB_HASHES only (the corrected digests);
+ * the name/credential checks use the same set the id matched, so a
+ * mixed entry keeps the fields it does not recognize. The defensive
+ * second set (LEGACY_HUB_HASHES_V0, fragment-joined strings that never
+ * shipped) was matched for one release only (v0.2.2) and removed after
+ * it — no real device can carry fragment-valued entries.
  */
 export function migrateLegacyDefaultHub(
   reg: HubRegistry,
-  hashes: LegacyHubHashes | LegacyHubHashes[] = [
-    LEGACY_HUB_HASHES,
-    LEGACY_HUB_HASHES_V0,
-  ],
+  hashes: LegacyHubHashes | LegacyHubHashes[] = LEGACY_HUB_HASHES,
 ): boolean {
   const sets = Array.isArray(hashes) ? hashes : [hashes]
   const legacy = reg.hubs.find((h) =>
