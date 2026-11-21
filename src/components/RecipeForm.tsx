@@ -4,6 +4,7 @@ import type { UrlImportResult } from '../importers/urlImport'
 import { UrlImportDialog } from './UrlImportDialog'
 import { friendlyError } from '../friendlyError'
 import type { RecipeInput } from '../types'
+import { MAX_RECIPE_MINUTES } from '../types'
 
 interface Props {
   initial: RecipeInput
@@ -19,7 +20,13 @@ export function parseMinutes(raw: string): number | undefined {
   // served truncated by the AppView (asIntOrNull), so the served record
   // never verifies and the published recipe is unopenable forever.
   // Matches the validator's rounding (importers/contract.ts cleanMinutes).
-  return raw.trim() !== '' && Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined
+  // Int L12 (bounds half): above MAX_RECIPE_MINUTES (7 days) the value
+  // is dropped, like a negative or non-numeric one — no absurd minute
+  // count ever reaches the store. A dropped value saves as "no time",
+  // which the store already treats as harmless.
+  if (raw.trim() === '' || !Number.isFinite(n) || n < 0) return undefined
+  const rounded = Math.round(n)
+  return rounded > MAX_RECIPE_MINUTES ? undefined : rounded
 }
 
 export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {

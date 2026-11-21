@@ -7,7 +7,9 @@ import type {
   RecipeInput,
   RecipePatch,
   RecipeSummary,
+  VisibilityTier,
 } from '../types'
+import { MAX_RECIPE_MINUTES } from '../types'
 
 const INDEX_URL_KEY = 'longtable:recipe-index-url'
 export const RECIPE_MAP = 'recipe'
@@ -44,6 +46,14 @@ interface IndexEntry {
   title: string
   url: string
   updatedAt: string
+  /**
+   * Sharing tier, when known (Int L10 part (b): the list no longer
+   * needs a full doc read per row just to learn it — see
+   * host.listRecipes). Absent means private (or a pre-fix entry the
+   * startup reconcile has not backfilled yet). Only 'public' /
+   * 'friends-only' are ever written; 'private' is the absence.
+   */
+  visibility?: VisibilityTier
 }
 
 function nowIso(): string {
@@ -81,17 +91,20 @@ export const SCHEMA_VERSION = 1
 export const INDEX_META_MAP = 'meta'
 
 
-/** Whole, non-negative minutes or undefined. Non-numeric, negative, or
- * non-finite values are dropped (a missing minute is harmless; a NaN
- * minute is poison). Fractional values round (H-N3): the AppView serves
- * minutes truncated, so a stored fraction would make a published recipe
+/** Whole, non-negative minutes or undefined. Non-numeric, negative,
+ * non-finite, or above MAX_RECIPE_MINUTES values are dropped (a missing
+ * minute is harmless; a NaN minute is poison; a 1e9 minute is absurd).
+ * Fractional values round (H-N3): the AppView serves minutes
+ * truncated, so a stored fraction would make a published recipe
  * permanently unverifiable — no fractional minute ever reaches the store.
  */
 function cleanMinutesValue(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
     return undefined
   }
-  return Math.round(value)
+  const rounded = Math.round(value)
+  if (rounded > MAX_RECIPE_MINUTES) return undefined
+  return rounded
 }
 
 function cleanStringList(items: unknown): string[] {
@@ -252,7 +265,62 @@ function entryMap(entry: IndexEntry): Y.Map<unknown> {
   m.set('title', entry.title)
   m.set('url', entry.url)
   m.set('updatedAt', entry.updatedAt)
+  if (entry.visibility === 'public' || entry.visibility === 'friends-only') {
+    m.set('visibility', entry.visibility)
+  }
   return m
+}
+
+/**
+ * Per-field index-entry update (Rel L2): touch ONLY the fields the
+ * caller names, on the LIVE entry map — never rebuild the whole entry
+ * from a possibly-stale snapshot. The old wholesale
+ * `set(id, entryMap({...}))` re-wrote the title from a snapshot taken
+ * at the start of updateRecipe, so a concurrent rename by a peer
+ * (applied to the live map after the snapshot) was silently lost from
+ * the list. `title` changes only when the patch renames; `updatedAt`
+ * always moves; `visibility` changes only when the patch carries it
+ * (an explicit 'private'/undefined clears the field). A missing or
+ * malformed live entry falls back to a fresh whole entry — the only
+ * case where a rebuild is unavoidable.
+ */
+function updateIndexEntry(
+  indexDoc: Y.Doc,
+  id: string,
+  update: { title?: string; visibility?: VisibilityTier | null; updatedAt: string },
+  fallback: IndexEntry,
+): void {
+  indexDoc.transact(() => {
+    const map = indexDoc.getMap(INDEX_MAP)
+    const raw = map.get(id)
+    if (raw instanceof Y.Map) {
+      if (update.title !== undefined && raw.get('title') !== update.title) {
+        raw.set('title', update.title)
+      }
+      if (update.visibility !== undefined) {
+        if (update.visibility === null) {
+          raw.delete('visibility')
+        } else if (raw.get('visibility') !== update.visibility) {
+          raw.set('visibility', update.visibility)
+        }
+      }
+      if (raw.get('updatedAt') !== update.updatedAt) {
+        raw.set('updatedAt', update.updatedAt)
+      }
+      return
+    }
+    map.set(
+      id,
+      entryMap({
+        title: update.title !== undefined ? update.title : fallback.title,
+        url: fallback.url,
+        updatedAt: update.updatedAt,
+        ...(update.visibility !== undefined && update.visibility !== null
+          ? { visibility: update.visibility }
+          : {}),
+      }),
+    )
+  })
 }
 
 function toStringArray(value: unknown): string[] {
@@ -292,7 +360,14 @@ function snapshotIndex(doc: Y.Doc): RecipeIndexDoc {
         typeof e.url === 'string' &&
         typeof e.updatedAt === 'string'
       ) {
-        recipes[id] = { title: e.title, url: e.url, updatedAt: e.updatedAt }
+        recipes[id] = {
+          title: e.title,
+          url: e.url,
+          updatedAt: e.updatedAt,
+          ...(e.visibility === 'public' || e.visibility === 'friends-only'
+            ? { visibility: e.visibility }
+            : {}),
+        }
         return
       }
     }
@@ -371,9 +446,17 @@ export async function createRecipe(
   const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
   indexDoc.transact(() => {
-    indexDoc
-      .getMap(INDEX_MAP)
-      .set(id, entryMap({ title: input.title, url, updatedAt }))
+    indexDoc.getMap(INDEX_MAP).set(
+      id,
+      entryMap({
+        title: input.title,
+        url,
+        updatedAt,
+        ...(input.visibility === 'public' || input.visibility === 'friends-only'
+          ? { visibility: input.visibility }
+          : {}),
+      }),
+    )
   })
   try {
     // Fresh UUID: the document cannot already exist in IndexedDB.
@@ -535,7 +618,17 @@ export async function restoreRecipe(
   const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
   indexDoc.transact(() => {
-    indexDoc.getMap(INDEX_MAP).set(id, entryMap({ title: input.title, url, updatedAt }))
+    indexDoc.getMap(INDEX_MAP).set(
+      id,
+      entryMap({
+        title: input.title,
+        url,
+        updatedAt,
+        ...(input.visibility === 'public' || input.visibility === 'friends-only'
+          ? { visibility: input.visibility }
+          : {}),
+      }),
+    )
   })
   await flushQuietly(repo)
   return summary
@@ -554,6 +647,10 @@ export async function registerSharedRecipe(
   const url = docUrl(id)
   const updatedAt = new Date().toISOString()
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  // No visibility is stamped here: the guest does not read the doc,
+  // and the tier arrives with the sync. The startup reconcile pass
+  // backfills it from the doc on the next launch (see
+  // reconcileIndexOrphans); until then the entry reads as private.
   indexDoc.transact(() => {
     const map = indexDoc.getMap(INDEX_MAP)
     if (!map.has(id)) {
@@ -573,8 +670,22 @@ export async function listRecipes(index: IndexHandle): Promise<RecipeSummary[]> 
       title: entry.title,
       url: entry.url,
       updatedAt: entry.updatedAt,
+      ...(entry.visibility ? { visibility: entry.visibility } : {}),
     }))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+}
+
+/**
+ * Filter already-loaded list summaries by a free-text query (Int L10
+ * part (b): the UI list search). Matches the title only — summaries
+ * carry no ingredients or steps, and loading every full doc to match
+ * them would reintroduce the N+1 this wave removes. Case-insensitive
+ * substring; an empty query returns the list unchanged.
+ */
+export function filterSummaries(summaries: RecipeSummary[], query: string): RecipeSummary[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return summaries
+  return summaries.filter((s) => s.title.toLowerCase().includes(q))
 }
 
 /** Load a full recipe document by its `yjs:` URL. Returns a plain object. */
@@ -613,8 +724,21 @@ export async function getRecipe(repo: YjsStore, url: string): Promise<Recipe | n
       : map.get('visibility') === 'public'
         ? { visibility: 'public' as const }
         : {}),
-    ...(map.has('prepMinutes') ? { prepMinutes: map.get('prepMinutes') as number } : {}),
-    ...(map.has('cookMinutes') ? { cookMinutes: map.get('cookMinutes') as number } : {}),
+    ...(map.has('prepMinutes')
+      ? (() => {
+          // Rel L4: never cast a stored value to number unchecked — a
+          // mistyped or out-of-bounds minute (e.g. written by a pre-fix
+          // build, or a corrupt doc) reads as absent, never as NaN/1e9.
+          const prep = cleanMinutesValue(map.get('prepMinutes'))
+          return prep !== undefined ? { prepMinutes: prep } : {}
+        })()
+      : {}),
+    ...(map.has('cookMinutes')
+      ? (() => {
+          const cook = cleanMinutesValue(map.get('cookMinutes'))
+          return cook !== undefined ? { cookMinutes: cook } : {}
+        })()
+      : {}),
   }
 }
 
@@ -703,16 +827,27 @@ export async function updateRecipe(
     map.set('updatedAt', updatedAt)
   })
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
-  indexDoc.transact(() => {
-    indexDoc.getMap(INDEX_MAP).set(
-      id,
-      entryMap({
-        title: patch.title !== undefined ? patch.title : entry.title,
-        url: entry.url,
-        updatedAt,
-      }),
-    )
-  })
+  // Rel L2: per-field index update — only the title (when renamed),
+  // the visibility (when the patch carries it), and updatedAt move.
+  // The entry's other fields (notably a peer's concurrent rename)
+  // are never rebuilt from this call's snapshot.
+  updateIndexEntry(
+    indexDoc,
+    id,
+    {
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...('visibility' in patch
+        ? {
+            visibility:
+              patch.visibility === undefined || patch.visibility === 'private'
+                ? null
+                : patch.visibility,
+          }
+        : {}),
+      updatedAt,
+    },
+    entry,
+  )
   await flushQuietly(repo)
 }
 
@@ -760,6 +895,7 @@ export async function reconcileIndexOrphans(
 ): Promise<{ checked: number; removed: string[] }> {
   const removed: string[] = []
   let checked = 0
+  let touched = false
   try {
     const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
     const map = indexDoc.getMap(INDEX_MAP)
@@ -793,6 +929,25 @@ export async function reconcileIndexOrphans(
             map.delete(id)
           })
           removed.push(id)
+          continue
+        }
+        // Int L10 part (b): backfill the index visibility from the doc
+        // this pass already reads. Entries written before the tier was
+        // stamped in the index (and guest-joined shares, registered
+        // without reading the doc) carry no tier, so the API list
+        // would otherwise report them private until their next edit.
+        // Only touch the field when it disagrees — no churn.
+        const docTier = recipe.visibility ?? 'private'
+        const entryTier = entry.visibility ?? 'private'
+        if (docTier !== entryTier) {
+          touched = true
+          indexDoc.transact(() => {
+            const live = map.get(id)
+            if (live instanceof Y.Map) {
+              if (docTier === 'private') live.delete('visibility')
+              else live.set('visibility', docTier)
+            }
+          })
         }
       } catch (e) {
         // Read failure, not an empty document — leave the entry alone.
@@ -809,6 +964,8 @@ export async function reconcileIndexOrphans(
     console.warn(
       `[longtable] startup index cleanup removed ${removed.length} orphaned ${removed.length === 1 ? 'entry' : 'entries'}: ${removed.join(', ')}`,
     )
+  }
+  if (removed.length > 0 || touched) {
     await flushQuietly(repo)
   }
   return { checked, removed }
