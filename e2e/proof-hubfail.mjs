@@ -24,6 +24,7 @@
  */
 import { remote } from 'webdriverio'
 import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
 import net from 'node:net'
 
 const ACTIVITY = 'kitchen.longtable.app.MainActivity'
@@ -38,12 +39,43 @@ const ADB = LT_ADB
 const HUB_A_DIR = process.env.HUB_A_DIR ?? path.join(LT_ROOT, 'hubs/hub-a')
 const HUB_B_DIR = process.env.HUB_B_DIR ?? path.join(LT_ROOT, 'hubs/hub-b')
 
+
+// The fleet hubs run with a GENERATED TURN password (hub.mjs writes it to
+// <dataDir>/turn-password.txt the first time a hub starts with an unset
+// turn password, and reuses it across restarts). Read it from the hub's
+// own data dir at runtime - dataDir comes from the hub's hub.conf.json
+// (absolute, or relative to the hub dir) - and fail loudly if it is
+// absent. There is deliberately no fallback to any fixture value: a
+// stale password fails the proof instead of silently testing the wrong
+// credential.
+function readTurnPass(hubDir, hubName) {
+  const confPath = path.join(hubDir, 'hub.conf.json')
+  let conf
+  try {
+    conf = JSON.parse(fs.readFileSync(confPath, 'utf8'))
+  } catch (e) {
+    throw new Error(`${hubName}: cannot read ${confPath}: ${e.message}`)
+  }
+  const dataDir = conf.dataDir
+    ? (path.isAbsolute(conf.dataDir) ? conf.dataDir : path.resolve(hubDir, conf.dataDir))
+    : path.join(hubDir, 'data')
+  const pwPath = path.join(dataDir, 'turn-password.txt')
+  let pw
+  try {
+    pw = fs.readFileSync(pwPath, 'utf8').trim()
+  } catch (e) {
+    throw new Error(`${hubName}: cannot read generated TURN password at ${pwPath} (start the hub once so hub.mjs generates it): ${e.message}`)
+  }
+  if (!pw) throw new Error(`${hubName}: empty TURN password in ${pwPath}`)
+  return pw
+}
+
 const HUB_A = {
   name: 'Hub A',
   signaling: 'wss://10.0.2.2:4445',
   turn: 'turn:10.0.2.2:3479',
   turnUser: 'longtable',
-  turnPass: 'lt-turn-a-password',
+  turnPass: readTurnPass(HUB_A_DIR, 'Hub A'),
   appview: 'https://10.0.2.2:3221',
   pds: 'https://10.0.2.2:2594',
   signalingPort: 4445,
@@ -53,7 +85,7 @@ const HUB_B = {
   signaling: 'wss://10.0.2.2:4446',
   turn: 'turn:10.0.2.2:3480',
   turnUser: 'longtable',
-  turnPass: 'lt-turn-b-password',
+  turnPass: readTurnPass(HUB_B_DIR, 'Hub B'),
   appview: 'https://10.0.2.2:3222',
   pds: 'https://10.0.2.2:2597',
   signalingPort: 4446,
