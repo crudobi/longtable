@@ -59,6 +59,24 @@ export const SECRET_KEYS: ReadonlySet<string> = new Set([
 /** Non-secret observability flag: a fully successful migration ran. */
 export const MIGRATION_MARKER_KEY = 'longtable:secrets-migrated-v1'
 
+/**
+ * Whether a key holds secret material and must route to the Keystore
+ * (H9): the crown-jewel keys themselves, plus their quarantine copies
+ * (`<secret-key>.corrupt-<fnv-hex>`, see src/store/corrupt.ts). A
+ * quarantine copy preserves a damaged secret's bytes — routing it to
+ * plaintext localStorage would put the very material the Keystore
+ * move protects back where it was. Quarantine keys are never
+ * migrated (they are written after init, straight through kv) and
+ * never appear in the migration report.
+ */
+export function isSecretKey(key: string): boolean {
+  if (SECRET_KEYS.has(key)) return true
+  for (const secret of SECRET_KEYS) {
+    if (key.startsWith(`${secret}.corrupt-`)) return true
+  }
+  return false
+}
+
 /** Async Keystore backend. The Capacitor implementation is below; tests inject a fake. */
 export interface SecretBackend {
   isAvailable(): Promise<boolean>
@@ -241,14 +259,14 @@ export function createSecretStore(
 
   const kv: SecretKeyValueStore = {
     getItem(key: string): string | null {
-      if (!SECRET_KEYS.has(key)) return safeLocalGet(key)
+      if (!isSecretKey(key)) return safeLocalGet(key)
       if (mirror.has(key)) return mirror.get(key)!
       // Legacy / pre-init / direct-localStorage-write fallback: a secret
       // still in localStorage is readable until migration clears it.
       return safeLocalGet(key)
     },
     setItem(key: string, value: string): void {
-      if (!SECRET_KEYS.has(key)) {
+      if (!isSecretKey(key)) {
         safeLocalSet(key, value)
         return
       }
@@ -269,13 +287,18 @@ export function createSecretStore(
       })
     },
     removeItem(key: string): void {
-      if (!SECRET_KEYS.has(key)) {
+      if (!isSecretKey(key)) {
         safeLocalRemove(key)
         return
       }
       mirror.delete(key)
+      // Removing a secret removes EVERY copy of it: the Keystore entry
+      // and any legacy localStorage copy (degraded mode, or a value
+      // written before migration). Otherwise the localStorage fallback
+      // in getItem would resurrect the "removed" value on the next read
+      // — which is exactly what discarding a corrupt store must not do.
+      safeLocalRemove(key)
       if (availability === false) {
-        safeLocalRemove(key)
         return
       }
       if (availability === true) {

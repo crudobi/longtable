@@ -19,6 +19,11 @@
 import sodium from 'libsodium-wrappers'
 import { base58btcDecode, base58btcEncode, base64ToU8, u8ToBase64 } from './codec'
 import { flushSecrets, secretKv } from '../secrets/secretStore'
+import {
+  clearCorruptStore,
+  noteCorruptStore,
+  type CorruptStoreEntry,
+} from '../store/corrupt'
 
 /** Minimal key/value store (localStorage in the app, in-memory in tests). */
 export interface KeyValueStore {
@@ -26,7 +31,8 @@ export interface KeyValueStore {
   setItem(key: string, value: string): void
 }
 
-const SECRET_KEY = 'longtable:identity-secret'
+/** The stored Ed25519 secret key (base64, 64 bytes). */
+export const IDENTITY_SECRET_KEY = 'longtable:identity-secret'
 /** multicodec varint for ed25519-pub (0xed) — the did:key prefix bytes. */
 const ED25519_MULTICODEC = new Uint8Array([0xed, 0x01])
 const DID_PREFIX = 'did:key:z'
@@ -76,26 +82,82 @@ export async function generateIdentity(): Promise<Identity> {
 }
 
 /**
+ * Thrown when the stored identity secret is present but unreadable
+ * (H8). The app must NEVER silently mint a fresh DID in that case:
+ * friends address the old DID, sealed envelopes are undecryptable
+ * under a new key, and public records fail their binding — so a
+ * corrupt secret enters a blocking "identity damaged" state instead,
+ * and the only way out is restoring the identity from an encrypted
+ * backup. Carries the quarantine key holding the preserved corrupt
+ * bytes (a key NAME, never key material).
+ */
+export class IdentityDamagedError extends Error {
+  /** Quarantine key holding the preserved corrupt bytes. */
+  readonly quarantineKey: string
+  /** Why the stored secret was judged corrupt (no key material). */
+  readonly reason: string
+  constructor(quarantineKey: string, reason: string) {
+    super(
+      'This device’s identity key is damaged. No new identity was created — ' +
+        'that would orphan your friends and published recipes. ' +
+        'Restore from an encrypted backup to recover it.',
+    )
+    this.name = 'IdentityDamagedError'
+    this.quarantineKey = quarantineKey
+    this.reason = reason
+  }
+}
+
+/**
  * Load this device's identity, generating and persisting one on first run.
- * The secret is stored base64-encoded under SECRET_KEY in `kv`.
+ * The secret is stored base64-encoded under IDENTITY_SECRET_KEY in `kv`.
+ *
+ * A stored value that is present but unreadable (not valid base64, or
+ * the wrong length) is CORRUPT, not absent: it is quarantined (see
+ * src/store/corrupt.ts — the bytes are preserved, never overwritten)
+ * and this throws IdentityDamagedError. No fresh identity is minted
+ * and the corrupt value is left in place, so a later restore can still
+ * replace it — and so a read path (including the localhost API's
+ * getIdentityDid) can never rotate the DID by merely asking for it.
  */
 export async function getOrCreateIdentity(
   kv: KeyValueStore = secretKv,
 ): Promise<Identity> {
   await cryptoReady()
-  const raw = kv.getItem(SECRET_KEY)
+  const raw = kv.getItem(IDENTITY_SECRET_KEY)
   if (raw) {
+    let secretKey: Uint8Array | null = null
+    let reason: string | null = null
     try {
-      const secretKey = base64ToU8(raw)
-      if (secretKey.length === sodium.crypto_sign_SECRETKEYBYTES) {
-        return identityFromEdSecret(secretKey)
+      secretKey = base64ToU8(raw)
+      if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
+        reason =
+          `identity secret is ${secretKey.length} bytes, ` +
+          `expected ${sodium.crypto_sign_SECRETKEYBYTES}`
+        secretKey = null
       }
     } catch {
-      /* corrupted entry — fall through and regenerate */
+      reason = 'identity secret is not valid base64'
     }
+    if (secretKey) {
+      // A good value supersedes any earlier damage report for the key.
+      clearCorruptStore(IDENTITY_SECRET_KEY)
+      return identityFromEdSecret(secretKey)
+    }
+    const entry: CorruptStoreEntry = noteCorruptStore(
+      kv,
+      IDENTITY_SECRET_KEY,
+      raw,
+      reason as string,
+    )
+    // Make the quarantine copy durable before reporting the damage:
+    // a restore later overwrites the live key, and the quarantine copy
+    // is then the only copy of the corrupt bytes.
+    await flushSecrets()
+    throw new IdentityDamagedError(entry.quarantineKey, reason as string)
   }
   const identity = await generateIdentity()
-  kv.setItem(SECRET_KEY, u8ToBase64(identity.secretKey))
+  kv.setItem(IDENTITY_SECRET_KEY, u8ToBase64(identity.secretKey))
   // First launch mints the device identity: await the Keystore flush so
   // the key is durable before anything else proceeds. (With an explicit
   // test kv this flushes an empty queue - a no-op.)
@@ -116,10 +178,18 @@ export async function identityFromSeed(seed: Uint8Array): Promise<Identity> {
  * given) and store it under the same key getOrCreateIdentity reads.
  * Added for the encrypted backup (Wave 3 C3); the storage itself —
  * key, encoding, location — is unchanged.
+ *
+ * The default store is secretKv (Keystore on native): a restored
+ * identity secret is a crown-jewel secret and must land in the
+ * Keystore like every other identity write, never in plaintext
+ * localStorage. Callers that pass an explicit kv (the backup restore
+ * flow, which writes through raw localStorage and relies on the next
+ * launch's migration) keep their own routing. A successful restore
+ * clears any identity-damage record: the stored value is good again.
  */
 export async function restoreIdentitySecret(
   secretKeyB64: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   expectedDid?: string,
 ): Promise<string> {
   await cryptoReady()
@@ -131,7 +201,8 @@ export async function restoreIdentitySecret(
   if (expectedDid !== undefined && identity.did !== expectedDid) {
     throw new Error('identity secret key does not match its DID')
   }
-  kv.setItem(SECRET_KEY, u8ToBase64(identity.secretKey))
+  kv.setItem(IDENTITY_SECRET_KEY, u8ToBase64(identity.secretKey))
+  clearCorruptStore(IDENTITY_SECRET_KEY)
   return identity.did
 }
 
