@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { cidForRecord } from '@atproto/repo'
+import { CID } from 'multiformats'
 import { RecipeIndex } from '../db.mjs'
 import { createIngestor, validateRecipeRecord, MAX_RECONCILE_RECORDS, MAX_RECONCILE_MS } from '../ingest.mjs'
 import { createAppView } from '../server.mjs'
@@ -262,6 +263,17 @@ describe('Int M1: lexicon/per-record validation on ingest', () => {
     expect(validateRecipeRecord(ok)).toBeNull()
   })
 
+  it('validateRecipeRecord accepts a CID-object image ref (live CAR shape)', () => {
+    // Live ingest decodes the repo CAR with dag-cbor, so a blob ref
+    // arrives as a multiformats CID object, not {$link}. Regression
+    // test for the Wave 5 CI proof-public failure.
+    const link = 'bafkreib45quisearf42v6bv4ipigdwjtcurflsf3wjqt7tc7a6nob3orqu'
+    const ok = record('Photo Soup', ['1 egg'], {
+      images: [{ ref: CID.parse(link), $type: 'blob', mimeType: 'image/jpeg', size: 16440 }],
+    })
+    expect(validateRecipeRecord(ok)).toBeNull()
+  })
+
   it.each([
     ['not an object', null, 'invalid-record:not-an-object'],
     ['array', [], 'invalid-record:not-an-object'],
@@ -288,6 +300,7 @@ describe('Int M1: lexicon/per-record validation on ingest', () => {
     ['tag over 64', record('X', [], { tags: ['x'.repeat(65)] }), 'invalid-record:bad-tags'],
     ['11 images', record('X', [], { images: Array(11).fill({ ref: 'bafy' }) }), 'invalid-record:bad-images'],
     ['image with no ref', record('X', [], { images: [{ nope: 1 }] }), 'invalid-record:bad-images'],
+    ['image ref that looks like a CID but is not one', record('X', [], { images: [{ ref: { code: 0x55, version: 1 } }] }), 'invalid-record:bad-images'],
     ['deviceSignature over 256', record('X', [], { deviceSignature: 'x'.repeat(257) }), 'invalid-record:bad-deviceSignature'],
     ['bad updatedAt', record('X', [], { updatedAt: 'garbage' }), 'invalid-record:bad-updatedAt'],
   ])('%s -> %s', (_label, rec, reason) => {
@@ -323,6 +336,36 @@ describe('Int M1: lexicon/per-record validation on ingest', () => {
       expect(index.count()).toBe(1)
       expect(index.getRecipe(DID, 'lt-beta-stew')).not.toBeNull()
       expect(index.getRecipe(DID, 'lt-bad-soup')).toBeNull()
+    } finally {
+      index.close()
+    }
+  })
+
+  it('reconcile indexes a photo recipe whose ref is a CID object (live CAR shape)', async () => {
+    const index = new RecipeIndex(':memory:')
+    const state = { records: [] }
+    const device = makeDevice()
+    const ingestor = createIngestor({
+      index,
+      repoStateProvider: fakeProvider(state),
+      pdsUrl: 'http://localhost:2583',
+      log: quietLog,
+    })
+    try {
+      const link = 'bafkreib45quisearf42v6bv4ipigdwjtcurflsf3wjqt7tc7a6nob3orqu'
+      const rec = signedRecipeRecord(device, DID, 'Photo Soup', ['1 egg'], {
+        images: [{ ref: { $link: link }, $type: 'blob', mimeType: 'image/jpeg', size: 16440 }],
+      })
+      // The live provider hands reconcile a dag-cbor-decoded record:
+      // the ref is a CID object, not {$link}.
+      rec.images = [{ ...rec.images[0], ref: CID.parse(link) }]
+      state.records = [perDeviceBindingEntry(device, DID), recipeEntry(rec)]
+      const res = await ingestor.reconcileRepo(DID)
+      expect(res.ok).toBe(true)
+      expect(res.validationRejected).toBe(0)
+      expect(res.signatureRejected).toBe(0)
+      expect(index.count()).toBe(1)
+      expect(index.getRecipe(DID, 'lt-photo-soup')).not.toBeNull()
     } finally {
       index.close()
     }

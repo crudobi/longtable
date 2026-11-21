@@ -58,12 +58,37 @@ async function ready() {
 /* ---------------- canonical hash (== publish.ts / verify-public) -------- */
 
 /**
+ * The CID string for a live CAR-decoded blob ref, or null when `ref`
+ * is not one.
+ *
+ * Records the AppView verifies come from getAndParseRecord (dag-cbor
+ * decode of the author's repo CAR), where a blob ref is a multiformats
+ * CID object — numeric `code`/`version`, a `multihash`, and a
+ * `toString()` that yields the CID string — NOT the `{$link}` JSON
+ * shape the client signs with. The signer hashed the $link CID string,
+ * so the CID object's toString() is the identical hash input. A bare
+ * string ref, a missing ref, or any other shape is NOT a CID object
+ * and returns null. A forged CID-shaped object still fails closed at
+ * the signature gate: the signer hashed the real CID string.
+ */
+export function cidObjectToString(ref) {
+  if (ref === null || typeof ref !== 'object') return null
+  if (typeof ref.code !== 'number' || typeof ref.version !== 'number') return null
+  if (ref.multihash == null || typeof ref.toString !== 'function') return null
+  const s = ref.toString()
+  if (typeof s !== 'string' || s.length === 0) return null
+  if (!/^b[a-z2-7]+$/.test(s) && !/^z[1-9A-HJ-NP-Za-km-z]+$/.test(s)) return null
+  return s
+}
+
+/**
  * The image $link strings of a record, in order (canonical-hash input).
  *
  * L-N4: every image ref must be a `{$link}` blob reference carrying a
- * string CID. Anything else THROWS (a bare string ref, a missing ref,
- * a non-string $link) — the signer never emits that shape, so the hash
- * of such a record is undefined by construction. verifyRecipeDeviceSignature
+ * string CID, or a live CAR-decoded CID object (see cidObjectToString).
+ * Anything else THROWS (a bare string ref, a missing ref, a non-string
+ * $link) — the signer never emits that shape, so the hash of such a
+ * record is undefined by construction. verifyRecipeDeviceSignature
  * catches the throw and rejects the record as unhashable, which is the
  * ingest rejection the finding asks for: the record never indexes.
  * (The old `String(ref)` fallback hashed a bare-string ref AS its own
@@ -74,6 +99,8 @@ function imageCid(img) {
   const ref = img?.ref
   if (!ref) throw new Error('image ref is not a {$link} blob reference')
   if (typeof ref.$link === 'string' && ref.$link) return ref.$link
+  const cid = cidObjectToString(ref)
+  if (cid) return cid
   throw new Error('image ref is not a {$link} blob reference')
 }
 

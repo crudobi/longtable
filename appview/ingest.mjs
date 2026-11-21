@@ -28,7 +28,7 @@ import WebSocket from 'ws'
 import { cborDecodeMulti } from '@atproto/common'
 import { cidForRecord } from '@atproto/repo'
 import { RECIPE_COLLECTION, PUBKEY_COLLECTION } from './db.mjs'
-import { verifyPubkeyBindings, verifyRecipeDeviceSignature } from './device-signature.mjs'
+import { verifyPubkeyBindings, verifyRecipeDeviceSignature, cidObjectToString } from './device-signature.mjs'
 
 export const WANTED_COLLECTIONS = [RECIPE_COLLECTION, PUBKEY_COLLECTION]
 
@@ -212,10 +212,16 @@ export function validateRecipeRecord(record) {
     }
     for (const img of record.images) {
       const ref = img?.ref
+      // Image refs accept the live CAR-decoded CID-object shape as well
+      // as the JSON string / {$link} shapes: reconcile verifies records
+      // from getAndParseRecord (dag-cbor), where a blob ref is a
+      // multiformats CID object, not {$link}. See cidObjectToString.
       const ok =
         img !== null &&
         typeof img === 'object' &&
-        (typeof ref === 'string' || typeof ref?.$link === 'string')
+        (typeof ref === 'string' ||
+          typeof ref?.$link === 'string' ||
+          cidObjectToString(ref) !== null)
       if (!ok) return 'invalid-record:bad-images'
     }
   }

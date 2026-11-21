@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import crypto from 'node:crypto'
+import { CID } from 'multiformats'
+import { sha256 } from 'multiformats/hashes/sha2'
 import {
   canonicalRecipeHashHex,
   recipeSignatureMessage,
@@ -356,6 +358,38 @@ describe('recipe device-signature verification', () => {
     const res = await verifyRecipeDeviceSignature(DID, record, binding)
     expect(res.ok).toBe(false)
     expect(res.reason).toBe('unhashable-record')
+  })
+
+  it('accepts a CID-object image ref identical to the signed $link (live CAR shape)', async () => {
+    // Live ingest decodes the repo CAR with dag-cbor, so a blob ref
+    // arrives as a multiformats CID object, not {$link}. The signer
+    // hashed the $link CID string; the CID object stringifies to the
+    // identical string, so the same signature must verify. Regression
+    // test for the Wave 5 CI proof-public failure (every photo recipe
+    // rejected as unhashable / bad-images).
+    const device = makeDevice()
+    const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
+    const link = 'bafkreib45quisearf42v6bv4ipigdwjtcurflsf3wjqt7tc7a6nob3orqu'
+    const record = recipeRecord(device, {
+      images: [{ ref: { $link: link }, $type: 'blob', mimeType: 'image/jpeg', size: 16440 }],
+    })
+    record.images = [{ ...record.images[0], ref: CID.parse(link) }]
+    const res = await verifyRecipeDeviceSignature(DID, record, binding)
+    expect(res.ok).toBe(true)
+  })
+
+  it('rejects a CID-object image ref for a different CID than signed', async () => {
+    const device = makeDevice()
+    const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
+    const link = 'bafkreib45quisearf42v6bv4ipigdwjtcurflsf3wjqt7tc7a6nob3orqu'
+    const record = recipeRecord(device, {
+      images: [{ ref: { $link: link }, $type: 'blob', mimeType: 'image/jpeg', size: 16440 }],
+    })
+    const other = CID.create(1, 0x55, await sha256.digest(new TextEncoder().encode('a different image')))
+    record.images = [{ ...record.images[0], ref: other }]
+    const res = await verifyRecipeDeviceSignature(DID, record, binding)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('recipe-signature-invalid')
   })
 
   it('rejects a recipe whose deviceDid is not the bound device', async () => {
