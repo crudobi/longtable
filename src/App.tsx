@@ -24,6 +24,7 @@ import {
 import {
   applyVisibilityFlow,
   performDeleteFlow,
+  PublicCopyLiveError,
   TOMBSTONE_NOTICE,
   VisibilitySessionError,
 } from './recipeFlows'
@@ -430,7 +431,18 @@ export default function App() {
         )
       )
         return
-      await performDelete(id)
+      try {
+        await performDelete(id)
+      } catch (e) {
+        if (e instanceof PublicCopyLiveError) {
+          // H5: the delete was refused before anything changed — the
+          // public copy is still listed. Say so and stay on the
+          // recipe; do not navigate away as if it were deleted.
+          setError(e.message)
+          return
+        }
+        throw e
+      }
       await refresh()
       setView({ name: 'list' })
     },
@@ -490,6 +502,14 @@ export default function App() {
         }
         if (tier === 'friends-only') setFriendShareId(id)
       } catch (e) {
+        if (e instanceof PublicCopyLiveError) {
+          // H5: the flip was refused — the tier stays public and the
+          // public copy is still listed. Name it, and open Publishing
+          // so the user can sign in and retry.
+          setError(e.message)
+          setPublishSettingsOpen(true)
+          return
+        }
         if (e instanceof VisibilitySessionError) {
           setPublishSettingsOpen(true)
           return
@@ -590,11 +610,23 @@ export default function App() {
     setLocalApiHost(
       createLocalApiHost({
         applyUpdate: (id, input) => applyRecipeUpdateRef.current(id, input),
-        applyDelete: (id) => performDeleteRef.current(id),
+        applyDelete: async (id) => {
+          try {
+            return await performDeleteRef.current(id)
+          } catch (e) {
+            if (e instanceof PublicCopyLiveError) {
+              throw new LocalApiError(422, e.message)
+            }
+            throw e
+          }
+        },
         applyVisibility: async (id, recipe, tier) => {
           try {
             return await applyVisibilityRef.current(id, recipe, tier)
           } catch (e) {
+            if (e instanceof PublicCopyLiveError) {
+              throw new LocalApiError(422, e.message)
+            }
             if (e instanceof VisibilitySessionError) {
               throw new LocalApiError(
                 422,

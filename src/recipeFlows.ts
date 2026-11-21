@@ -44,6 +44,33 @@ export class VisibilitySessionError extends Error {
   }
 }
 
+/**
+ * Thrown by applyVisibilityFlow / performDeleteFlow when a recipe with a
+ * live public record is narrowed or deleted while no publishing account
+ * is signed in (H5, Wave 6B). The unpublish cannot even be attempted,
+ * so the call is REFUSED before any mutation — the tier stays public,
+ * the local copy stays, friends shares and the P2P room are untouched —
+ * instead of landing a "now private / deleted" state with the public
+ * copy still listed. The message names the lingering copy and says
+ * what to do (sign in under Publishing, then retry). The UI catches
+ * it and opens the publishing settings; the localhost API maps it to
+ * a plain 422. Distinct from an ATTEMPTED unpublish that fails
+ * (session present, PDS doesn't answer): that still throws from
+ * unpublishRecipe on a flip, and on delete still deletes locally
+ * with an H13 warning.
+ */
+export class PublicCopyLiveError extends Error {
+  constructor() {
+    super(
+      'The public copy is still listed publicly — no publishing account ' +
+        'is signed in on this device, so it can\'t be removed. Sign in ' +
+        'under Publishing and try again; nothing was changed and the public ' +
+        'copy stays live until then.',
+    )
+    this.name = 'PublicCopyLiveError'
+  }
+}
+
 export interface FlowContext {
   identity: Identity | null
   /**
@@ -71,10 +98,8 @@ export const TOMBSTONE_NOTICE =
   'removed when their device next syncs; a copy on a device that never ' +
   'syncs again stays.'
 
-/** The signed-out public notice (H5 behavior, H13 surfacing): the record stays live. */
-export const PUBLIC_LIVE_NOTICE =
-  'The public copy could not be removed because no publishing account ' +
-  'is signed in on this device — it may still be listed publicly.'
+// H5 (Wave 6B): the signed-out case no longer warns-and-proceeds —
+// see PublicCopyLiveError above; there is no notice constant anymore.
 
 /**
  * Int L14 — the friends-only → public notice. Going public does NOT
@@ -111,15 +136,24 @@ function publicationOf(id: string, ctx: FlowContext) {
 /**
  * The delete flow itself, without the confirmation prompt or UI
  * navigation: strip friends-only shares, remove the public record, leave
- * the P2P room, then delete locally. The local delete always proceeds —
- * deleting here is the user's act — but the flow RETURNS every warning
- * in plain sentences (H13): remote copies that could not be taken down,
- * and the best-effort limits of the tombstone recall. Nothing about a
- * remote copy is ever swallowed quietly.
+ * the P2P room, then delete locally. The local delete proceeds —
+ * deleting here is the user's act — EXCEPT when the recipe has a live
+ * public record and no publishing account is signed in (H5, Wave 6B):
+ * then the delete is refused outright (PublicCopyLiveError) before
+ * anything is touched, because the public copy could not be taken down
+ * and the user must not be left believing it is gone. Otherwise the
+ * flow RETURNS every warning in plain sentences (H13): remote copies
+ * that could not be taken down, and the best-effort limits of the
+ * tombstone recall. Nothing about a remote copy is ever swallowed
+ * quietly.
  */
 export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<string[]> {
   const problems: string[] = []
   const warnings: string[] = []
+  // H5 (Wave 6B): refuse before ANY mutation — unsharing friends or
+  // leaving the P2P room first would leave a half-deleted recipe
+  // behind a refused delete.
+  if (publicationOf(id, ctx) && !loadSession()) throw new PublicCopyLiveError()
   // Strip friends-only shares of this recipe from friends' channels.
   // A successful unshare writes a signed tombstone per channel (H6);
   // the recall lands when each friend next syncs — that limit is itself
@@ -135,7 +169,8 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
       ctx.onRemoteProblem?.('the copies shared with friends')
     }
   }
-  // If it was published publicly, remove the ATProto record first.
+  // If it was published publicly, remove the ATProto record first. A
+  // session is guaranteed here: the signed-out case threw above.
   if (publicationOf(id, ctx)) {
     const session = loadSession()
     if (session) {
@@ -146,10 +181,6 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
           ctx.onRemoteProblem?.('the public copy')
         },
       )
-    } else {
-      // H5 owns fixing the signed-out delete (Wave 6); until then the
-      // caller is told plainly the public record is still live.
-      warnings.push(PUBLIC_LIVE_NOTICE)
     }
   }
   // P2P (H1/H7): leave the room BEFORE the doc is wiped, so the provider
@@ -188,16 +219,20 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
  *                  warning saying so when any are live.
  *   → private:     unpublish the ATProto record first (if any); strip
  *                  friends-only shares everywhere (if friends-only);
- *                  leave the P2P room; then mark 'private'.
+ *                  leave the P2P room; then mark 'private'. With a live
+ *                  public record and no session the flip is REFUSED
+ *                  (PublicCopyLiveError, H5) — the tier stays public.
  *   → friends-only: unpublish the ATProto record first (if any); leave
- *                  the P2P room; mark 'friends-only'. (Choosing friends
- *                  and publishing the encrypted shares is the friend
- *                  picker's job — the UI wrapper opens it after this
- *                  runs.)
- * Returns the plain-language warnings (H13) — a public copy left live
- * for lack of a session, the tombstone recall limit on a private flip.
- * An unpublish that is ATTEMPTED and fails still throws (the caller
- * maps it to a 502), so a warning here never means "failed silently".
+ *                  the P2P room; mark 'friends-only'. Same refusal when
+ *                  the public copy cannot be taken down for lack of a
+ *                  session. (Choosing friends and publishing the
+ *                  encrypted shares is the friend picker's job — the UI
+ *                  wrapper opens it after this runs.)
+ * Returns the plain-language warnings (H13) — the tombstone recall
+ * limit on a private flip, the friends-shares-live notice on a public
+ * flip. An unpublish that is ATTEMPTED and fails still throws (the
+ * caller maps it to a 502), so a warning here never means "failed
+ * silently".
  */
 export async function applyVisibilityFlow(
   id: string,
@@ -214,10 +249,10 @@ export async function applyVisibilityFlow(
     if (!publication) return
     const session = loadSession()
     if (!session) {
-      // H5 owns fixing the signed-out flip (Wave 6); until then the
-      // caller is told plainly the public record is still live.
-      warnings.push(PUBLIC_LIVE_NOTICE)
-      return
+      // H5 (Wave 6B): refuse — the tier must not change while the
+      // public copy stays live. Thrown before any mutation in the
+      // caller, so nothing has moved when this lands.
+      throw new PublicCopyLiveError()
     }
     const client = new AtprotoClient(session.pdsUrl, {
       onSessionRefresh: (s) => saveSession(s),

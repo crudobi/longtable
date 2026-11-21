@@ -27,6 +27,7 @@ import { getOrCreateIdentity } from '../identity/identity'
 import { listFriends } from '../friends/friends'
 import { friendlyError } from '../friendlyError'
 import { getPublication } from '../public/publish'
+import { PublicCopyLiveError } from '../recipeFlows'
 import type {
   Recipe,
   RecipeInput,
@@ -331,7 +332,15 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
     async deleteRecipe(id) {
       let warnings: string[] = []
       if (hooks.applyDelete) {
-        warnings = await hooks.applyDelete(id)
+        try {
+          warnings = await hooks.applyDelete(id)
+        } catch (e) {
+          // H5 (Wave 6B): the UI flow refused the delete — a live
+          // public record and no session to take it down. A refusal,
+          // not a server failure: 422, nothing deleted.
+          if (e instanceof PublicCopyLiveError) throw new LocalApiError(422, e.message)
+          throw e
+        }
       } else {
         const idx = await index()
         await storeDeleteRecipe(repo(), idx, id)
@@ -363,6 +372,28 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
         return { warnings, publicRecord: readPublicRecord(id) }
       } catch (e) {
         if (e instanceof LocalApiError) throw e
+        if (e instanceof PublicCopyLiveError) {
+          // H5 (Wave 6B): the UI flow refused the flip — a live public
+          // record and no session to take it down. A refusal, not a
+          // server failure: 422 with the recipe as it stands (still
+          // public, public copy still listed), so the caller can sign
+          // in and retry the same call idempotently.
+          const current = await host.getRecipe(id).catch(() => null)
+          const publicRecord = readPublicRecord(id)
+          const changed = current
+            ? {
+                id,
+                visibility: current.visibility,
+                updatedAt: current.updatedAt,
+                publicRecord,
+              }
+            : undefined
+          throw new LocalApiError(
+            422,
+            e.message,
+            changed ? { changed } : undefined,
+          )
+        }
         // M23: the flip may have moved some bytes before failing — a
         // publish can land while the local tier-mark fails, or an
         // unpublish can land while the tier-mark fails. Report the
