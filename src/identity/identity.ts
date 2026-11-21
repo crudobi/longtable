@@ -106,6 +106,31 @@ export async function identityFromSeed(seed: Uint8Array): Promise<Identity> {
   return identityFromEdSecret(kp.privateKey)
 }
 
+/**
+ * Restore an identity from a backup: validate a base64 Ed25519 secret
+ * key (64 bytes, and the DID it derives must match `expectedDid` when
+ * given) and store it under the same key getOrCreateIdentity reads.
+ * Added for the encrypted backup (Wave 3 C3); the storage itself —
+ * key, encoding, location — is unchanged.
+ */
+export async function restoreIdentitySecret(
+  secretKeyB64: string,
+  kv: KeyValueStore = localStorage,
+  expectedDid?: string,
+): Promise<string> {
+  await cryptoReady()
+  const secretKey = base64ToU8(secretKeyB64)
+  if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
+    throw new Error('identity secret key has the wrong length')
+  }
+  const identity = await identityFromEdSecret(secretKey)
+  if (expectedDid !== undefined && identity.did !== expectedDid) {
+    throw new Error('identity secret key does not match its DID')
+  }
+  kv.setItem(SECRET_KEY, u8ToBase64(identity.secretKey))
+  return identity.did
+}
+
 /** Encode an Ed25519 public key as a did:key DID. */
 export function didFromPublicKey(publicKey: Uint8Array): string {
   const payload = new Uint8Array(ED25519_MULTICODEC.length + publicKey.length)

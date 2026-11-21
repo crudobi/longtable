@@ -14,6 +14,8 @@ interface Props {
   onHubs?: () => void
   /** Open the developer settings (localhost API, E9). */
   onDeveloper?: () => void
+  /** Open backup & restore (Wave 3 C3: export + encrypted backup). */
+  onBackup?: () => void
 }
 
 function formatDate(iso: string): string {
@@ -21,7 +23,7 @@ function formatDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
 }
 
-export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs, onDeveloper }: Props) {
+export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs, onDeveloper, onBackup }: Props) {
   return (
     <div className="view" data-testid="recipe-list">
       <header className="app-header">
@@ -35,6 +37,11 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport
         {onImport && (
           <button data-testid="open-import" onClick={onImport}>
             Import
+          </button>
+        )}
+        {onBackup && (
+          <button data-testid="open-backup" onClick={onBackup}>
+            Backup
           </button>
         )}
         <button data-testid="friends-open" onClick={onFriends}>
