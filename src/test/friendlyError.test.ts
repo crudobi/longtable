@@ -55,3 +55,23 @@ describe('friendlyError', () => {
     expect(friendlyError(new Error('QuotaExceededError: IndexedDB quota'))).toMatch(/storage/)
   })
 })
+
+describe('friendlyError HTTP status in user-written messages (Int L13)', () => {
+  it('passes the URL importer HTTP message through verbatim', () => {
+    expect(friendlyError(new UrlImportError('http', 'The page returned HTTP 404.'))).toBe(
+      'The page returned HTTP 404.',
+    )
+  })
+
+  it('passes a plain short sentence containing an HTTP status through', () => {
+    expect(friendlyError(new Error('The page returned HTTP 404.'))).toBe(
+      'The page returned HTTP 404.',
+    )
+  })
+
+  it('still replaces a real raw dump that happens to mention HTTP', () => {
+    const stacky = new Error('HTTP 500 at foo (http://x) \n    at Object.<anonymous> (a.mjs:1:1)')
+    expect(friendlyError(stacky)).toMatch(/Nothing was changed/)
+    expect(friendlyError(stacky)).not.toMatch(/HTTP 500/)
+  })
+})
