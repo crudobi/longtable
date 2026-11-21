@@ -12,8 +12,9 @@
  * - H11: createRecipesAtomic — a mid-loop store failure rolls back what
  *   was already created and says what failed; nothing is left behind.
  * - H12/H13 (router-level): see localapi.test.ts — the confirm gate and
- *   warnings arrays. The flow-level warnings (tombstone recall limit,
- *   signed-out public copy still live) are covered here.
+ *   warnings arrays. The flow-level warnings (tombstone recall limit)
+ *   are covered here; the signed-out public-copy refusal (H5, Wave 6B)
+ *   is covered here and in wave6b-h5.test.ts.
  * - M-N2: save-a-copy fetches from the AUTHOR's PDS (hint first, PLC
  *   only on a miss) and hash-checks bytes against the CID.
  * - M2(int): client CID check on uploadBlob, the 5 MiB photo cap, and
@@ -125,7 +126,7 @@ import {
   type PublishableRecipe,
 } from '../public/publish'
 import {
-  PUBLIC_LIVE_NOTICE,
+  PublicCopyLiveError,
   TOMBSTONE_NOTICE,
   applyVisibilityFlow,
   performDeleteFlow,
@@ -863,7 +864,7 @@ describe('publish photo safety (M2(int))', () => {
 // ---------------------------------------------------------------------------
 
 describe('flow warnings (H13)', () => {
-  it('delete with a live public record and no session warns it stays live', async () => {
+  it('delete with a live public record and no session is refused, local copy stays', async () => {
     const repo = getRepo()
     const index = await getOrCreateIndex(repo, memoryStore())
     const { id } = await createRecipe(repo, index, {
@@ -887,12 +888,20 @@ describe('flow warnings (H13)', () => {
         },
       }),
     )
-    const warnings = await performDeleteFlow(id, { identity: null, publicationsKv: pubKv })
-    expect(warnings).toContain(PUBLIC_LIVE_NOTICE)
-    expect((await listRecipes(index)).some((r) => r.id === id)).toBe(false)
+    // H5 (Wave 6B): refused before any mutation — the message
+    // names the public copy still listed, and the local copy stays.
+    let refusal: unknown
+    try {
+      await performDeleteFlow(id, { identity: null, publicationsKv: pubKv })
+    } catch (e) {
+      refusal = e
+    }
+    expect(refusal).toBeInstanceOf(PublicCopyLiveError)
+    expect((refusal as Error).message).toMatch(/public copy is still listed/)
+    expect((await listRecipes(index)).some((r) => r.id === id)).toBe(true)
   })
 
-  it('a private flip with a live public record and no session warns it stays live', async () => {
+  it('a private flip with a live public record and no session is refused, tier stays public', async () => {
     const repo = getRepo()
     const index = await getOrCreateIndex(repo, memoryStore())
     const { id } = await createRecipe(repo, index, {
@@ -925,16 +934,22 @@ describe('flow warnings (H13)', () => {
       updatedAt: '2026-01-01T10:00:00.000Z',
       visibility: 'public',
     }
-    const warnings = await applyVisibilityFlow(id, recipe, 'private', {
-      identity: null,
-      publicationsKv: pubKv,
-    })
-    expect(warnings).toContain(PUBLIC_LIVE_NOTICE)
+    // H5 (Wave 6B): refused before any mutation — the tier stays public.
+    let refusal: unknown
+    try {
+      await applyVisibilityFlow(id, recipe, 'private', {
+        identity: null,
+        publicationsKv: pubKv,
+      })
+    } catch (e) {
+      refusal = e
+    }
+    expect(refusal).toBeInstanceOf(PublicCopyLiveError)
+    expect((refusal as Error).message).toMatch(/public copy is still listed/)
     // listRecipes summaries carry no visibility — read the doc itself.
     const summary = (await listRecipes(index)).find((r) => r.id === id)
     expect(summary).toBeDefined()
     const after = await getRecipe(repo, summary!.url)
-    // getRecipe omits visibility when it is 'private' (the default).
-    expect(after?.visibility ?? 'private').toBe('private')
+    expect(after?.visibility).toBe('public')
   })
 })

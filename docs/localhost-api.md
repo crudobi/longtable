@@ -275,9 +275,12 @@ refused with **422** and nothing is deleted. (Send the body as JSON,
 `{ "confirm": true }`.) Answers **200**
 `{ "id": "…", "deleted": true, "warnings": [] }`. Unknown id → 404.
 The `warnings` array says in plain language what the delete could
-not take down — a public copy left live because no publishing account
-is signed in, or friends' copies that are only recalled when their
-devices next sync.
+not take down — friends' copies that are only recalled when their
+devices next sync, or a public copy the publishing server did not
+answer for. A public copy is never left live silently: if no
+publishing account is signed in, the delete is refused with **422**
+and nothing is deleted — sign in under Publishing in the app and
+retry.
 
 #### `POST /v1/import`
 
@@ -363,6 +366,12 @@ present change — see [`PATCH`](#patch-v1recipesid).
   recipe is published through the same signed flow the app uses
   (pubkey binding + device signature; see
   [public-protocol.md](public-protocol.md)).
+- Narrowing a public recipe to **`private`** (or `friends-only` via
+  the app) removes the public record first. If no publishing account
+  is signed in, the change is refused with **422** *before anything
+  is written* — the recipe stays public and the public copy stays
+  listed, so a "now private" label never hides a live public copy.
+  Sign in under Publishing in the app and retry.
 - **`friends-only`** is refused with **422**. Friends-only means
   "encrypted for specific friends", and choosing those friends is an
   in-app act (the encrypted shares are created there). Save the recipe
@@ -380,7 +389,7 @@ present change — see [`PATCH`](#patch-v1recipesid).
 | 405 | That method isn't supported for that path. |
 | 413 | Request body over 16 MB. |
 | 412 | The recipe changed since you read it: `expectedUpdatedAt` no longer matches. Nothing was written; re-read and retry. |
-| 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in), a destructive call arrived without `"confirm": true`, or an import found nothing valid. |
+| 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in; narrowing or deleting a public recipe without sign-in, so the public copy would stay live), a destructive call arrived without `"confirm": true`, or an import found nothing valid. |
 | 500 | Something went wrong on the device while handling that request. Some changes may already have been applied — check the recipe list before trying again. |
 | 502 | A visibility change failed at the publishing server. The message says what the server said, in plain language. The body also carries a `changed` object — `{ "id": "…", "visibility": "…", "updatedAt": "…", "publicRecord": "listed" \| "not listed" \| "unknown" }` — the recipe as it actually stands now, so you can see what moved before the failure (a publish that landed while the local tier did not change, or an unpublish that landed while the tier did not). |
 | 503 | The app is still starting up, or has no device identity yet. Try again in a moment. |
