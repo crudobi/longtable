@@ -3,6 +3,12 @@
 # MATCHED TEXT of a hit (not the whole line), and the glob against the
 # file path (shell-style: * matches any run of characters, ? one).
 # A hit is dropped only when BOTH match. Everything else fails the scan.
+# Every ERE is anchored (^...$): it must match the ENTIRE matched text.
+# An unanchored entry would exempt longer values that merely contain it
+# (2026-11-20 S24: an allowlisted address exempted a longer address
+# sharing its prefix). The two reserved-domain
+# entries use ^.+@...$ so a complete address at that domain is exempt,
+# never a bare domain substring.
 # Lines starting with # and blank lines are ignored.
 #
 # Each entry names the audit finding that justifies it (2026-11-14
@@ -10,26 +16,24 @@
 #
 # 10.0.2.2 — Android emulator host-loopback alias (audit b3). Same on
 # every machine; carries no information about the dev network.
-*	10\.0\.2\.2
+*	^10\.0\.2\.2$
 # TURN deny-list ranges in hub/hub.mjs (audit b2). IETF-reserved
 # ranges, identical on every network; not the dev LAN. Each range is
 # written start-end, so both endpoint addresses need an entry.
-hub/hub.mjs	10\.0\.0\.0
-hub/hub.mjs	10\.255\.255\.255
-hub/hub.mjs	172\.16\.0\.0
-hub/hub.mjs	172\.31\.255\.255
-hub/hub.mjs	192\.168\.0\.0
-hub/hub.mjs	192\.168\.255\.255
+hub/hub.mjs	^10\.0\.0\.0$
+hub/hub.mjs	^10\.255\.255\.255$
+hub/hub.mjs	^172\.16\.0\.0$
+hub/hub.mjs	^172\.31\.255\.255$
+hub/hub.mjs	^192\.168\.0\.0$
+hub/hub.mjs	^192\.168\.255\.255$
 # GitHub SSH remote user@host. Public service endpoint, not a personal
 # email; appears in origin-URL handling.
-*	git@github\.com
+*	^git@github\.com$
 # Reserved example domain in the contribution template (audit c5).
-*	@example\.org
+*	^.+@example\.org$
 # Upstream maintainer contact in lockfiles, not the user (audit c4).
-*package-lock.json	i@izs\.me
+*package-lock.json	^i@izs\.me$
 # Reserved test domain; seed fixtures are fake by construction (audit b9).
-*	@test\.local
-# Build-host hostname in a test comment, not a secret (2026-11-17 watchdog: device-signature.appview-test.mjs:76 names the waflurgiooh build host; no secret value involved).
-appview/test/device-signature.appview-test.mjs	waflurgiooh
+*	^.+@test\.local$
 # The allow-list itself names the waflurgiooh hostname in its entries and comments; exempt its own mentions so the file does not trip the scan.
-ci/privacy-allowlist	waflurgiooh
+ci/privacy-allowlist	^waflurgiooh$

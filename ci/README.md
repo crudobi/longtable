@@ -35,7 +35,7 @@ leaks into a build — and runs, in order:
    only in the ops-side `privacy-secrets` file (0600, read with
    `grep -f`). Benign matches are allow-listed in
    `ci/privacy-allowlist` (file-glob + ERE, matched against the
-   matched text). Fails closed: a missing scanner, a missing secrets
+   matched literal, anchored `^...$` — never the whole line). Fails closed: a missing scanner, a missing secrets
    file, or any hit fails the run before anything builds.
 3. `legacy-hub-digests` — (`ci/check-legacy-hub-digests.py`): re-derives
    the expected FNV-1a-64 digests of the pre-scrub legacy hub values
