@@ -127,12 +127,19 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
 
   // Show my invite and start listening for whoever scans it.
   const showInvite = useCallback(async () => {
-    setError(null)
-    const inv = await createFriendInvite(identity, myName)
-    setInvite(inv)
+    // Sec L9: never mint a second invite while a pairing is already
+    // listening. The guard runs BEFORE createFriendInvite, synchronously
+    // — the old code minted first and checked pairingRef after, so a
+    // double-tap minted a fresh invite (new room) while runPairing kept
+    // listening on the first one: the displayed code had nobody on the
+    // other end. While pairing runs, the button below is hidden (the
+    // invite is shown instead), so this is the double-tap race only.
     if (pairingRef.current) return
     pairingRef.current = true
+    setError(null)
     try {
+      const inv = await createFriendInvite(identity, myName)
+      setInvite(inv)
       const rec = await runPairing(identity, myName, inv, null, undefined, undefined, {
         singleUse: true,
       })
@@ -146,6 +153,10 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
       // the panel is still open.
       setError(friendlyError(e))
     } finally {
+      // Rel L9: the invite is cleared on EVERY exit — success, timeout,
+      // or error. It used to stay displayed after the 90 s timeout with
+      // "Waiting for them…" and nobody listening.
+      setInvite(null)
       pairingRef.current = false
     }
   }, [identity, myName, reload, onChanged])

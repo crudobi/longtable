@@ -10,6 +10,7 @@ import {
   fetchAuthorPhotoBytes,
   fetchPublicRecipe,
   publicRecordToInput,
+  publicRecordTimestamps,
   searchAppView,
   type PublicRecipe,
   type PublicSearchResult,
@@ -19,8 +20,15 @@ import { friendlyError } from '../friendlyError'
 
 interface DiscoverProps {
   onClose: () => void
-  /** App's create handler: saves the input as a new local recipe. */
-  onSaveCopy: (input: RecipeInput) => Promise<void> | void
+  /**
+   * App's create handler: saves the input as a new local recipe.
+   * The optional timestamps are the ORIGINAL recipe's (save-a-copy
+   * preserves authorship + timestamps); absent, the store stamps now.
+   */
+  onSaveCopy: (
+    input: RecipeInput,
+    timestamps?: { createdAt?: string; updatedAt?: string },
+  ) => Promise<void> | void
 }
 
 function shortDid(did: string): string {
@@ -226,7 +234,7 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
           skipped.push(reason)
         },
       )
-      await onSaveCopy(input)
+      await onSaveCopy(input, publicRecordTimestamps(rec))
       if (skipped.length > 0) {
         // The copy saved, but a photo was left out — stay open and say
         // so, instead of closing and leaving the user wondering where

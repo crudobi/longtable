@@ -1,5 +1,15 @@
 /** Longtable recipe schema. One Y.Doc per recipe. */
 
+/**
+ * Longest plausible prep/cook time, in minutes (Int L12, bounds half):
+ * 10080 minutes is 7 days — room for multi-day ferments and slow
+ * cooks, while 1e9 (or any absurd value) can never be stored. Values
+ * above this are dropped by the store (cleanMinutesValue), rejected by
+ * the importer validator (cleanMinutes), and dropped by the form's
+ * parseMinutes. The fractional half was fixed by H-N3 (rounding).
+ */
+export const MAX_RECIPE_MINUTES = 10080
+
 export interface Recipe {
   title: string
   ingredients: string[]
@@ -72,9 +82,19 @@ export interface RecipeSummary {
   title: string
   url: string
   updatedAt: string
+  /**
+   * Sharing tier, when the index entry carries it (Int L10 part (b)).
+   * Absent means private (or a pre-fix entry not yet backfilled by
+   * the startup reconcile). The API list answers from this field
+   * instead of loading every full doc (the old N+1).
+   */
+  visibility?: VisibilityTier
 }
 
 /** Shape of the dedicated Yjs index document (recipe list -> doc URLs). */
 export interface RecipeIndexDoc {
-  recipes: Record<string, { title: string; url: string; updatedAt: string }>
+  recipes: Record<
+    string,
+    { title: string; url: string; updatedAt: string; visibility?: VisibilityTier }
+  >
 }

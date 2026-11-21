@@ -1,4 +1,6 @@
+import { useState } from 'react'
 import type { RecipeSummary } from '../types'
+import { filterSummaries } from '../store/recipes'
 
 interface Props {
   recipes: RecipeSummary[]
@@ -24,6 +26,13 @@ function formatDate(iso: string): string {
 }
 
 export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport, onDiscover, onHubs, onDeveloper, onBackup }: Props) {
+  // Int L10 part (b): the list finally has a search — it filters the
+  // already-loaded summaries by title (filterSummaries), so searching
+  // costs no extra doc reads. It matches titles only: summaries carry
+  // no ingredients or steps, and loading every full doc to match them
+  // would reintroduce the N+1 this wave removes.
+  const [query, setQuery] = useState('')
+  const shown = filterSummaries(recipes, query)
   return (
     <div className="view" data-testid="recipe-list">
       <header className="app-header">
@@ -63,6 +72,18 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport
           </button>
         )}
       </header>
+      {recipes.length > 0 && (
+        <div className="field">
+          <input
+            type="search"
+            data-testid="recipe-search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search recipes by name…"
+            aria-label="Search recipes by name"
+          />
+        </div>
+      )}
       {recipes.length === 0 ? (
         <div className="empty empty-state" data-testid="cookbook-empty">
           <p>
@@ -77,9 +98,13 @@ export function RecipeList({ recipes, onOpen, onNew, onJoin, onFriends, onImport
             <strong>Discover</strong> finds public recipes.
           </p>
         </div>
+      ) : shown.length === 0 ? (
+        <div className="empty" data-testid="recipe-search-empty">
+          <p>No recipes match “{query.trim()}” — try a shorter name.</p>
+        </div>
       ) : (
         <ul className="recipe-cards">
-          {recipes.map((r) => (
+          {shown.map((r) => (
             <li key={r.id}>
               <button
                 className="recipe-card"

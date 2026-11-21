@@ -266,6 +266,24 @@ export function docUrl(guid: string): string {
   return `${URL_SCHEME}${guid}`
 }
 
+/**
+ * Drop a cached document and wipe its IndexedDB database (Rel L5
+ * residual): a join that created the doc and then failed must leave
+ * no orphaned doc behind. No-op when the doc was never loaded.
+ * Never call on a doc that holds the user's own content — the caller
+ * must have established the doc is join-created (fresh join, no
+ * pre-existing share record). Mirrors deleteRecipe's wipe, minus the
+ * index removal (an orphaned join doc has no index entry).
+ */
+export async function dropDoc(store: YjsStore, guid: string): Promise<void> {
+  const cached = store.docs.get(guid)
+  store.docs.delete(guid)
+  store.pending.delete(guid)
+  if (cached) {
+    await cached.persistence.clearData()
+  }
+}
+
 /** Parse a `yjs:<guid>` URL; null for anything else. */
 export function guidFromUrl(url: string): string | null {
   return url.startsWith(URL_SCHEME) ? url.slice(URL_SCHEME.length) : null

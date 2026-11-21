@@ -89,16 +89,52 @@ export interface QrScanSession {
 }
 
 /**
+ * Scan timing (Rel L3): the scanner used to run forever with no
+ * feedback — a camera pointed at nothing looked hung. Now the session
+ * reports progress on every detector tick, shows an idle hint after
+ * 60 s without a decode, and stops itself at a hard timeout (2 min).
+ * The modal renders all three; callers that drive startQrScan
+ * directly get the same signals through the options.
+ */
+export const QR_SCAN_IDLE_HINT_MS = 60_000
+export const QR_SCAN_TIMEOUT_MS = 120_000
+
+export interface QrScanOptions {
+  /** Delay before the idle hint applies. Default QR_SCAN_IDLE_HINT_MS. */
+  idleHintMs?: number
+  /** Hard stop: no decode within this long ends the session. Default QR_SCAN_TIMEOUT_MS. */
+  timeoutMs?: number
+  /**
+   * Called on every detector tick with the elapsed milliseconds and
+   * whether the idle hint applies yet. Drives the "Scanning… Ns"
+   * progress display (and the idle hint) in the modal.
+   */
+  onProgress?: (elapsedMs: number, idle: boolean) => void
+  /**
+   * Called exactly once when the hard timeout fires. The session is
+   * already stopped when this runs (camera tracks released) — the
+   * caller only has to say so, and point at the paste fallback.
+   */
+  onTimeout?: () => void
+}
+
+/**
  * Start the camera into `video` and poll the detector until a QR code
- * decodes (onCode fires exactly once, then the session stops) or the
- * caller stops the session. Rejects when the camera can't be opened —
+ * decodes (onCode fires exactly once, then the session stops), the
+ * caller stops the session, or the hard timeout fires (opts.timeoutMs,
+ * default 2 min — Rel L3). Rejects when the camera can't be opened —
  * permission refused, no camera, insecure context; the caller turns
- * that into a plain-language note and the paste fallback.
+ * that into a plain-language note and the paste fallback. Progress
+ * (elapsed time + idle state) is reported on every tick via
+ * opts.onProgress, so the UI never looks hung.
  */
 export async function startQrScan(
   video: HTMLVideoElement,
   onCode: (text: string) => void,
+  opts: QrScanOptions = {},
 ): Promise<QrScanSession> {
+  const idleHintMs = opts.idleHintMs ?? QR_SCAN_IDLE_HINT_MS
+  const timeoutMs = opts.timeoutMs ?? QR_SCAN_TIMEOUT_MS
   const w = window as unknown as { BarcodeDetector?: BarcodeDetectorCtor }
   if (typeof w.BarcodeDetector !== 'function') {
     throw new Error("This device's browser can't read QR codes inside the app.")
@@ -111,6 +147,7 @@ export async function startQrScan(
 
   let stopped = false
   let timer: ReturnType<typeof setTimeout> | null = null
+  const t0 = Date.now()
 
   const stop = () => {
     if (stopped) return
@@ -131,6 +168,15 @@ export async function startQrScan(
 
   const tick = async () => {
     if (stopped) return
+    const elapsedMs = Date.now() - t0
+    // Hard timeout (Rel L3): stop the camera and say so once, instead
+    // of polling forever on a code that is never going to arrive.
+    if (elapsedMs >= timeoutMs) {
+      stop()
+      opts.onTimeout?.()
+      return
+    }
+    opts.onProgress?.(elapsedMs, elapsedMs >= idleHintMs)
     try {
       const codes = await detector.detect(video)
       const hit = codes.find((c) => typeof c.rawValue === 'string' && c.rawValue !== '')

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { startQrScan, type QrScanSession } from '../qrscan'
+import { QR_SCAN_TIMEOUT_MS, startQrScan, type QrScanSession } from '../qrscan'
 import { friendlyError } from '../friendlyError'
 
 interface Props {
@@ -32,15 +32,37 @@ export function QrScannerModal({ title, onScanned, onClose }: Props) {
   const scannedRef = useRef(onScanned)
   scannedRef.current = onScanned
   const [error, setError] = useState<string | null>(null)
+  // Rel L3: scan progress — seconds elapsed, and whether the 60 s
+  // idle hint applies. Both come from the session's onProgress ticks;
+  // the timeout (opts.onTimeout) ends the session and reports it.
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const [idleHint, setIdleHint] = useState(false)
 
   useEffect(() => {
     let session: QrScanSession | null = null
     let cancelled = false
     const video = videoRef.current
     if (!video) return
-    startQrScan(video, (text) => {
-      if (!cancelled) scannedRef.current(text)
-    })
+    startQrScan(
+      video,
+      (text) => {
+        if (!cancelled) scannedRef.current(text)
+      },
+      {
+        onProgress: (elapsedMs, idle) => {
+          if (cancelled) return
+          setElapsedSec(Math.floor(elapsedMs / 1000))
+          setIdleHint(idle)
+        },
+        onTimeout: () => {
+          if (cancelled) return
+          setError(
+            `No code found in ${Math.round(QR_SCAN_TIMEOUT_MS / 1000)} seconds — the camera stopped. ` +
+              'Close this and paste the code instead.',
+          )
+        },
+      },
+    )
       .then((s) => {
         if (cancelled) s.stop()
         else session = s
@@ -71,7 +93,17 @@ export function QrScannerModal({ title, onScanned, onClose }: Props) {
             {error}
           </p>
         ) : (
-          <p className="muted">Point the camera at the code — it reads itself.</p>
+          <>
+            <p className="muted" data-testid="qr-scan-progress">
+              Scanning… {elapsedSec}s — point the camera at the code, it reads itself.
+            </p>
+            {idleHint && (
+              <p className="muted" data-testid="qr-scan-idle-hint">
+                Still looking — hold the code steady in good light, or close
+                this and paste the code instead.
+              </p>
+            )}
+          </>
         )}
         <div className="modal-actions">
           <button className="ghost" data-testid="qr-scan-close" onClick={onClose}>

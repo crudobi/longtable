@@ -58,6 +58,7 @@ import { DiscoverPanel } from './components/DiscoverPanel'
 import { ImportPanel } from './components/ImportPanel'
 import { BackupPanel } from './components/BackupPanel'
 import { friendlyError } from './friendlyError'
+import { addStartupNotice, type StartupFailureKind } from './startupNotices'
 import { DEBUG_HOOKS_ENABLED } from './debugHooks'
 import {
   flushSecrets,
@@ -96,6 +97,14 @@ export default function App() {
   const [current, setCurrent] = useState<Recipe | null>(null)
   const [ready, setReady] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Rel L6: non-blocking startup banner. Background jobs that fail at
+  // startup (secret migration, index cleanup, share rejoin, …) append
+  // a plain-language notice here instead of failing console-only.
+  // The app keeps working; the banner dismisses.
+  const [startupNotices, setStartupNotices] = useState<string[]>([])
+  const addNotice = useCallback((kind: StartupFailureKind) => {
+    setStartupNotices((xs) => addStartupNotice(xs, kind))
+  }, [])
   const [sharePayload, setSharePayload] = useState<SharePayload | null>(null)
   const [joinOpen, setJoinOpen] = useState(false)
   const [identity, setIdentity] = useState<Identity | null>(null)
@@ -170,6 +179,7 @@ export default function App() {
         }
       } catch (e) {
         console.warn('secret migration failed', e)
+        addNotice('secrets-migration')
       }
       // One-time Phase 0 (Automerge) recovery migration: imports any
       // recipes orphaned by the Phase 1 storage swap. Flag-guarded and
@@ -185,6 +195,7 @@ export default function App() {
         if (notice) setError(notice)
       } catch (e) {
         console.warn('automerge migration failed', e)
+        addNotice('automerge-migration')
       }
       // Startup index-integrity pass (M11/M13): drop index entries
       // whose recipe document is gone or empty (the crash window the
@@ -195,6 +206,7 @@ export default function App() {
         await reconcileIndexOrphans(getRepo())
       } catch (e) {
         console.warn('startup index cleanup failed', e)
+        addNotice('index-cleanup')
       }
       // Phase 2 identity: load (or create) the device DID, rejoin friend
       // channels, and import any friends-only shares waiting in them.
@@ -209,21 +221,24 @@ export default function App() {
         setIdentity(id)
         if (DEBUG_HOOKS_ENABLED) installFriendsDebugHooks(id)
         await rejoinFriendChannels()
-        await importReceivedShares(id).catch((e) =>
-          console.warn('import received shares failed', e),
-        )
+        await importReceivedShares(id).catch((e) => {
+          console.warn('import received shares failed', e)
+          addNotice('received-shares-import')
+        })
         // M1-rel / M-N4: finish any interrupted unfriend, then sweep
         // every friend's shelf so each holds only their own current
         // shares. Best-effort: a failed sweep is logged, never fatal.
-        await sweepFriendsOnlyShares(id).catch((e) =>
-          console.warn('friends-only sweep failed', e),
-        )
+        await sweepFriendsOnlyShares(id).catch((e) => {
+          console.warn('friends-only sweep failed', e)
+          addNotice('friends-sweep')
+        })
       } catch (e) {
         if (e instanceof IdentityDamagedError) {
           damaged = e
           setIdentityDamaged(e)
         } else {
           console.warn('identity setup failed', e)
+          addNotice('identity-setup')
         }
       }
       // H9: probe every JSON store once, so corruption in a store
@@ -251,7 +266,10 @@ export default function App() {
     // hidden, so a kill right after a mutation does not lose the write.
     const stopPagehideFlush = registerPagehideFlush(getRepo())
     // Rejoin P2P shares (peers rediscover via signaling and sync converges).
-    void rejoinShares().catch((e) => console.warn('rejoin shares failed', e))
+    void rejoinShares().catch((e) => {
+      console.warn('rejoin shares failed', e)
+      addNotice('rejoin-shares')
+    })
     // Friends-only channel updates: a friend published or republished a
     // share — decrypt what's addressed to me and refresh.
     let channelTimer: ReturnType<typeof setTimeout> | null = null
@@ -283,14 +301,19 @@ export default function App() {
       if (channelTimer) clearTimeout(channelTimer)
       if (refreshTimer.current) clearTimeout(refreshTimer.current)
     }
-  }, [refresh, openDetail])
+  }, [refresh, openDetail, addNotice])
 
 
   const handleCreate = useCallback(
-    async (input: RecipeInput) => {
+    async (
+      input: RecipeInput,
+      timestamps?: { createdAt?: string; updatedAt?: string },
+    ) => {
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
-      const summary = await createRecipe(repo, index, input)
+      // Timestamps pass through only from save-a-copy (the original
+      // recipe's history, preserved); a fresh recipe stamps "now".
+      const summary = await createRecipe(repo, index, input, timestamps)
       await refresh()
       await openDetail(summary.id)
     },
@@ -590,10 +613,11 @@ export default function App() {
         },
       }),
     )
-    void syncLocalApiServer().catch((e) =>
-      console.warn('localhost API start failed', e),
-    )
-  }, [identity, refresh])
+    void syncLocalApiServer().catch((e) => {
+      console.warn('localhost API start failed', e)
+      addNotice('local-api-start')
+    })
+  }, [identity, refresh, addNotice])
 
   /**
    * Bulk import (Import panel): recipes arrive fully validated by the
@@ -758,6 +782,26 @@ export default function App() {
   return (
     <div className="app">
       {error && <p className="status error">{error}</p>}
+      {startupNotices.length > 0 && (
+        <div className="status" data-testid="startup-notices">
+          <strong>Something didn’t finish at startup.</strong>{' '}
+          The cookbook itself is fine — but:
+          <ul>
+            {startupNotices.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+          <div className="modal-actions">
+            <button
+              className="ghost"
+              data-testid="dismiss-startup-notices"
+              onClick={() => setStartupNotices([])}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
       {corruptStores.length > 0 && (
         <div className="status error" data-testid="corrupt-stores-banner">
           <strong>Some saved data could not be read.</strong>{' '}

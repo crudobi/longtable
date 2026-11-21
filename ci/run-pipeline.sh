@@ -463,8 +463,37 @@ do_apk()       { (cd "$WT/android" && ./gradlew assembleDebug --console=plain); 
 # The e2e harness is box infrastructure and runs from the repo checkout
 # (it derives its paths from its own location); the artifact under test
 # is the worktree-built APK.
-do_e2e()       { "$REPO/e2e/run-e2e.sh" "$WT/$APK_REL"; }
-do_migration() { (cd "$REPO/e2e" && APK="$WT/$APK_REL" node proof-migration.mjs); }
+# Rel L8 — proof retries are split from full-run retries. A failed proof
+# used to fail the run, and lt_main_loop's next trigger then re-ran the
+# WHOLE pipeline for the same commit (~15 min: checkout, npm ci, both
+# builds, provision, every proof) — even though the fleet was still up
+# and the APK already built. Now each proof stage retries in place
+# (retry_proof, once by default) against the same provisioned fleet and
+# the same APK: a proof failure costs one more proof run (minutes), not
+# a full re-run. This is NOT a second chance for the app — the proof
+# must still pass in full on some attempt, assertions untouched — it
+# only stops an infrastructure transient from discarding a whole green
+# run. LT_PIPELINE_PROOF_RETRIES tunes the count; 0 restores the old
+# fail-fast behavior. Non-proof stages never retry here: a build/test
+# failure still fails the run, and the next trigger re-runs the
+# pipeline (that retry is for real breakage, not flakes). The
+# lt_main_loop full-run retry stays as the backstop.
+PIPELINE_PROOF_RETRIES="${LT_PIPELINE_PROOF_RETRIES:-1}"
+case "$PIPELINE_PROOF_RETRIES" in ''|*[!0-9]*) PIPELINE_PROOF_RETRIES=1 ;; esac
+retry_proof() { # label, command... — run; on failure retry in place
+  local label=$1; shift
+  local attempt=1 rc=0
+  while :; do
+    "$@"
+    rc=$?
+    if [ "$rc" = "0" ]; then return 0; fi
+    if [ "$attempt" -gt "$PIPELINE_PROOF_RETRIES" ]; then return "$rc"; fi
+    ci_say "proof $label failed — pipeline-level retry $attempt/$PIPELINE_PROOF_RETRIES, same fleet, same APK (Rel L8)"
+    attempt=$((attempt + 1))
+  done
+}
+do_e2e()       { retry_proof e2e-gate "$REPO/e2e/run-e2e.sh" "$WT/$APK_REL"; }
+do_migration() { (cd "$REPO/e2e" && retry_proof migration-proof env APK="$WT/$APK_REL" node proof-migration.mjs); }
 # The fleet suite (e2e/run-fleet.sh) is driven stage-by-stage so
 # status.json keeps per-proof granularity. The pipeline already holds
 # pipeline.lock, so the orchestrator runs with LT_FLEET_NO_LOCK=1 (its
@@ -475,8 +504,8 @@ do_fleet_provision() {
   FLEET_UP=1
   APK="$WT/$APK_REL" LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" provision
 }
-do_proof() { # proof-name
-  APK="$WT/$APK_REL" LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" run "$1"
+do_proof() { # proof-name — retried in place on failure (Rel L8, see retry_proof)
+  retry_proof "$1" env APK="$WT/$APK_REL" LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" run "$1"
 }
 do_fleet_teardown() {
   LT_FLEET_NO_LOCK=1 "$REPO/e2e/run-fleet.sh" teardown

@@ -229,17 +229,15 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
     async listRecipes() {
       const idx = await index()
       const summaries = await storeListRecipes(idx)
-      const out: ApiRecipeSummary[] = []
-      for (const s of summaries) {
-        const full = await host.getRecipe(s.id)
-        out.push({
-          id: s.id,
-          title: s.title,
-          visibility: full?.visibility ?? 'private',
-          updatedAt: s.updatedAt,
-        })
-      }
-      return out
+      // Int L10 part (b): the tier rides in the index entry now, so
+      // listing is ONE index read — the old loop loaded every full
+      // recipe doc (photos included) just to learn its visibility.
+      return summaries.map((s) => ({
+        id: s.id,
+        title: s.title,
+        visibility: s.visibility ?? 'private',
+        updatedAt: s.updatedAt,
+      }))
     },
 
     async getRecipe(id) {

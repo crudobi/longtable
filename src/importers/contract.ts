@@ -12,6 +12,7 @@
  * Developer documentation: docs/importers.md.
  */
 import type { RecipeInput, RecipePatch } from '../types'
+import { MAX_RECIPE_MINUTES } from '../types'
 
 /** The plugin API version this app implements. Importers must declare it. */
 export const IMPORTER_API_VERSION = 1
@@ -205,7 +206,17 @@ function cleanMinutes(value: unknown, field: string, source: string): number | u
   if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
     throw new ImporterError(`${source}: "${field}" must be a number of minutes (0 or more).`)
   }
-  return Math.round(n)
+  // Int L12 (bounds half): the fractional case rounds (H-N3), but an
+  // absurd value must fail the import visibly, never persist — 1e9
+  // minutes is not a cook time. The bound is MAX_RECIPE_MINUTES
+  // (7 days), shared with the store and the form.
+  const rounded = Math.round(n)
+  if (rounded > MAX_RECIPE_MINUTES) {
+    throw new ImporterError(
+      `${source}: "${field}" is too large (${rounded} minutes — the limit is ${MAX_RECIPE_MINUTES}).`,
+    )
+  }
+  return rounded
 }
 
 /**
