@@ -15,10 +15,23 @@
  *                  instructions, prepTimeMinutes??null,
  *                  cookTimeMinutes??null, recipeYield||"", tags||[],
  *                  imageCids]) — imageCids are the blob $link strings.
- *   recipe msg   = "longtable-recipe:v1\n" + accountDid + "\n" +
- *                  longtableId + "\n" + hashHex        (UTF-8, detached)
+ *   recipe msg   = "longtable-recipe:v2\n" + accountDid + "\n" +
+ *                  longtableId + "\n" + hashHex + "\n" + createdAt
+ *                  (UTF-8, detached). v2 (Sec L11) binds the signature
+ *                  to the record's createdAt, so a signature cannot be
+ *                  transplanted onto a copy of the recipe created at a
+ *                  different time. v1 (same string without the
+ *                  createdAt line) is still ACCEPTED by every verifier
+ *                  for records published before v2 — it is never
+ *                  produced by this signer anymore.
  *   pubkey msg   = "longtable-pubkey:v1\n" + accountDid + "\n" +
  *                  deviceDid + "\n" + devicePublicKeyBase64
+ *   Replay note (Sec L11 residual): v2 binds the signature to the
+ *   record's creation time, but a signature still has no expiry — an
+ *   old signed version re-put verbatim still verifies as that old
+ *   version (see S17, AppView-side). True expiry would invalidate
+ *   every already-published record, so it is a protocol-version
+ *   decision for a future release, not a silent rule change here.
  */
 import sodium from 'libsodium-wrappers'
 import {
@@ -122,9 +135,13 @@ type RecipeExtras = Recipe & {
 }
 
 /**
- * Map a local recipe to its ATProto record (unsigned). `images` may be
- * full blob objects (from uploadBlob) or bare CID strings; bare strings
- * become ref-only blob objects so the $link order is preserved either way.
+ * Map a local recipe to its ATProto record (unsigned). `images` must be
+ * the real blob objects uploadBlob returned — a record is never built
+ * over placeholder metadata (Int L4): a bare CID string, a wildcard
+ * mimeType, or a zero/unknown size is refused here, so no caller can
+ * publish a record whose images claim bytes nobody verified. (The old
+ * bare-string path fabricated `{mimeType: 'image/*', size: 0}` — a
+ * placeholder that then got signed as if it were a real blob.)
  * Pure: no I/O, no signing (deviceDid/deviceSignature are attached by
  * publishRecipe after signRecipeRecord).
  */
@@ -134,14 +151,29 @@ export function buildRecipeRecord(
   // the account's repo; the signature payload binds it). The record body
   // itself carries no account field.
   _accountDid: string,
-  images: Array<AtprotoBlob | string> = [],
+  images: AtprotoBlob[] = [],
 ): RecipeRecord {
   const r = recipe as RecipeExtras
-  const blobs: AtprotoBlob[] = images.map((img) =>
-    typeof img === 'string'
-      ? { $type: 'blob', ref: { $link: img }, mimeType: 'image/*', size: 0 }
-      : img,
-  )
+  const blobs: AtprotoBlob[] = images.map((img) => {
+    if (
+      typeof img !== 'object' ||
+      img === null ||
+      img.$type !== 'blob' ||
+      typeof img.ref?.$link !== 'string' ||
+      !img.ref.$link ||
+      typeof img.mimeType !== 'string' ||
+      !/^[^/*]+\/[^/*]+$/.test(img.mimeType) ||
+      typeof img.size !== 'number' ||
+      !Number.isFinite(img.size) ||
+      img.size <= 0
+    ) {
+      throw new Error(
+        'A recipe record needs real blob objects (from uploadBlob) for its images — ' +
+          'a CID string or placeholder metadata (wildcard mime type, unknown size) is not publishable.',
+      )
+    }
+    return img
+  })
   const record: RecipeRecord = {
     $type: 'kitchen.longtable.recipe',
     name: recipe.title,
@@ -160,9 +192,27 @@ export function buildRecipeRecord(
   return record
 }
 
-/** The image $link strings of a record, in order (canonical-hash input). */
+/**
+ * The image $link strings of a record, in order (canonical-hash input).
+ *
+ * L-N4: every image ref must be a `{$link}` blob reference carrying a
+ * string CID. Anything else (a bare string ref, a missing ref, a
+ * non-string $link) THROWS instead of silently yielding `undefined` —
+ * the signer never emits that shape, and the AppView / offline
+ * verifier reject it at ingest, so all four implementations agree
+ * that such a record is unverifiable. Callers that verify served
+ * records (discover.ts) translate the throw into `signature-invalid`;
+ * callers that sign (signRecipeRecord) fail the publish instead of
+ * signing a record whose hash no verifier would reproduce.
+ */
 export function recordImageCids(record: RecipeRecord): string[] {
-  return (record.images ?? []).map((b) => b.ref.$link)
+  return (record.images ?? []).map((b) => {
+    const link = (b as AtprotoBlob | undefined)?.ref?.$link
+    if (typeof link !== 'string' || !link) {
+      throw new Error('image ref is not a {$link} blob reference')
+    }
+    return link
+  })
 }
 
 /**
@@ -188,8 +238,32 @@ export async function canonicalRecipeHash(
   return sodium.to_hex(sodium.crypto_generichash(32, utf8ToU8(canonical), null))
 }
 
-/** The exact UTF-8 payload signed for a recipe record. */
+/**
+ * The exact UTF-8 payload signed for a recipe record (Sec L11, v2).
+ *
+ * v2 binds the signature to the record's `createdAt` as well as to the
+ * account, the recipe id, and the content hash: the same signature
+ * cannot verify a copy of the record stamped with a different creation
+ * time. Verifiers try v2 first and fall back to v1 for records
+ * published before v2 existed — see `legacyRecipeSignatureMessage`.
+ * The canonical HASH is unchanged (createdAt is still not in it), so
+ * v1-signed records keep verifying under their own message.
+ */
 export function recipeSignatureMessage(
+  accountDid: string,
+  longtableId: string,
+  hashHex: string,
+  createdAt: string,
+): string {
+  return `longtable-recipe:v2\n${accountDid}\n${longtableId}\n${hashHex}\n${createdAt}`
+}
+
+/**
+ * The pre-v2 recipe message (no createdAt line). Produced by signers
+ * before v2; accepted by every verifier as the legacy form. Never
+ * produced by this signer anymore — signRecipeRecord always signs v2.
+ */
+export function legacyRecipeSignatureMessage(
   accountDid: string,
   longtableId: string,
   hashHex: string,
@@ -204,7 +278,9 @@ export async function signRecipeRecord(
   record: RecipeRecord,
 ): Promise<string> {
   const hashHex = await canonicalRecipeHash(record)
-  const msg = utf8ToU8(recipeSignatureMessage(accountDid, record.longtableId, hashHex))
+  const msg = utf8ToU8(
+    recipeSignatureMessage(accountDid, record.longtableId, hashHex, record.createdAt),
+  )
   const sig = await signDetached(identity, msg)
   return u8ToBase64(sig)
 }

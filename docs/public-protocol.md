@@ -86,11 +86,22 @@ exact array:
 ```
 
 where `imageCids` are the `images[].ref.$link` strings, in order. Then
-sign the UTF-8 string:
+sign the UTF-8 string (v2 — Sec L11: the signature binds the record's
+`createdAt`, so it cannot be transplanted onto a copy of the recipe
+created at a different time):
 
 ```
-longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>
+longtable-recipe:v2\n<accountDid>\n<longtableId>\n<hashHex>\n<createdAt>
 ```
+
+Verifiers accept the v1 string (the same lines without `createdAt`)
+as the legacy form for records published before v2. The canonical
+hash is unchanged — `createdAt` is bound by the message, not the hash
+— so v1-signed records keep verifying under their own message. A
+signature has no expiry: an old signed version re-put verbatim still
+verifies as that old version (replay is the AppView-side S17 item);
+true expiry would invalidate every already-published record and is a
+protocol-version decision for a future release.
 
 Both signatures are Ed25519 detached signatures produced by the device
 key, base64-encoded in the records.

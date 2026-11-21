@@ -253,6 +253,14 @@ export class AtprotoClient {
   /**
    * POST refreshSession (Bearer refreshJwt). Mutates `session` in place
    * with the fresh tokens and returns it.
+   *
+   * L-N2: a refresh response that names a DIFFERENT DID is rejected,
+   * without mutating the session — a misbehaving or compromised PDS
+   * must never silently rebind the session to another account (later
+   * publishes would sign under the wrong accountDid). The caller must
+   * sign in again; the old session is left untouched so the failure is
+   * visible instead of half-applied. A response with no DID at all keeps
+   * the session's DID (the field is optional in the lexicon).
    */
   async refreshSession(session: AtprotoSession): Promise<AtprotoSession> {
     const res = await this.fetchFn(this.url('com.atproto.server.refreshSession'), {
@@ -267,9 +275,13 @@ export class AtprotoClient {
       accessJwt: string
       refreshJwt: string
     }
+    if (data.did && data.did !== session.did) {
+      throw new Error(
+        'The publishing server answered the session refresh with a different account — sign in again.',
+      )
+    }
     session.accessJwt = data.accessJwt
     session.refreshJwt = data.refreshJwt
-    if (data.did) session.did = data.did
     if (data.handle) session.handle = data.handle
     this.onSessionRefresh?.(session)
     return session

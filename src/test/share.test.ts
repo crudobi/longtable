@@ -214,6 +214,84 @@ describe('parseSharePayload validation', () => {
     )
     expect(parsed.secret).toBeUndefined()
   })
+
+  it('rejects an unknown top-level envelope key (Sec L3)', async () => {
+    const id = freshId()
+    const snapshot = await snapshotOf(id, 'Extra')
+    const payload = {
+      v: 1,
+      room: roomForRecipe(id),
+      signaling: 'wss://test:4444',
+      recipeId: id,
+      title: 'Extra',
+      snapshot,
+      secret: 'c2VjcmV0',
+      admin: true,
+    }
+    expect(() => parseSharePayload(JSON.stringify(payload))).toThrow(
+      /not a valid Longtable share invitation/,
+    )
+  })
+
+  it('rejects a snapshot whose recipe map carries an unknown key (Sec L3)', async () => {
+    const id = freshId()
+    // A crafted snapshot smuggling a field no recipe this app writes.
+    const src = new Y.Doc({ guid: id })
+    src.transact(() => {
+      const map = src.getMap(RECIPE_MAP)
+      map.set('title', 'Crafted')
+      map.set('isAdmin', true)
+    })
+    const snapshot = b64(Y.encodeStateAsUpdate(src))
+    src.destroy()
+    const payload = {
+      v: 1,
+      room: roomForRecipe(id),
+      signaling: 'wss://test:4444',
+      recipeId: id,
+      title: 'Crafted',
+      snapshot,
+      secret: 'c2VjcmV0',
+    }
+    // parseSharePayload wraps every snapshot-validation failure in
+    // the generic invitation error (pre-existing S9 behavior — the
+    // scanner is told the code is invalid, not which check failed);
+    // the specific 'unknown recipe field' message surfaces at
+    // joinShare, which validates the real doc directly (see below).
+    expect(() => parseSharePayload(JSON.stringify(payload))).toThrow(
+      /not a valid Longtable share invitation/,
+    )
+  })
+
+  it('accepts a snapshot carrying every legitimate recipe key (Sec L3 control)', async () => {
+    const id = freshId()
+    const src = new Y.Doc({ guid: id })
+    src.transact(() => {
+      const map = src.getMap(RECIPE_MAP)
+      map.set('schemaVersion', 1)
+      map.set('title', 'Full')
+      map.set('visibility', 'friends-only')
+      map.set('createdAt', '2026-01-01T00:00:00.000Z')
+      map.set('updatedAt', '2026-01-02T00:00:00.000Z')
+      const ing = new Y.Array()
+      ing.push(['tomatoes', 'salt'])
+      map.set('ingredients', ing)
+    })
+    const snapshot = b64(Y.encodeStateAsUpdate(src))
+    src.destroy()
+    const parsed = parseSharePayload(
+      JSON.stringify({
+        v: 1,
+        room: roomForRecipe(id),
+        signaling: 'wss://test:4444',
+        recipeId: id,
+        title: 'Full',
+        snapshot,
+        secret: 'c2VjcmV0',
+      }),
+    )
+    expect(parsed.recipeId).toBe(id)
+  })
 })
 
 describe('joinShare fresh-GUID binding', () => {
@@ -256,5 +334,37 @@ describe('joinShare fresh-GUID binding', () => {
     // Second join of the SAME share: the doc now has content, but the
     // share record marks it as this share's doc — must not refuse.
     await expect(joinShare(payload)).resolves.toBeUndefined()
+  })
+
+  it('rejects a snapshot with an unknown recipe key at apply time (Sec L3)', async () => {
+    const id = freshId()
+    // joinShare re-validates the snapshot on the real doc, so a
+    // crafted code that somehow bypassed parse-time validation still
+    // cannot smuggle an unknown field into the guest's store — and
+    // the room is never joined.
+    const src = new Y.Doc({ guid: id })
+    src.transact(() => {
+      const map = src.getMap(RECIPE_MAP)
+      map.set('title', 'Crafted')
+      map.set('isAdmin', true)
+    })
+    const snapshot = b64(Y.encodeStateAsUpdate(src))
+    src.destroy()
+    const payload: SharePayload = {
+      v: 1,
+      room: roomForRecipe(id),
+      signaling: 'wss://test:4444',
+      recipeId: id,
+      title: 'Crafted',
+      snapshot,
+      secret: 'c2VjcmV0',
+    }
+    await expect(joinShare(payload)).rejects.toThrow(/unknown recipe field/)
+    expect(providerCalls).toHaveLength(0) // never joined the attacker's room
+    expect(getShare(id)).toBeUndefined()
+    // And nothing was left behind in the guest's store: the crafted
+    // snapshot was validated on a scratch doc, never applied here.
+    const doc = await getOrCreateDoc(getRepo(), id)
+    expect(doc.getMap(RECIPE_MAP).size).toBe(0)
   })
 })

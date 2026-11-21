@@ -69,6 +69,7 @@ import {
 import {
   bytesToDataUrl,
   canonicalRecipeHash,
+  legacyRecipeSignatureMessage,
   recipeSignatureMessage,
   type RecipeRecord,
 } from './publish'
@@ -284,8 +285,10 @@ export async function searchAppView(
 // The AppView half verifies the deviceDid↔deviceKey binding at ingest and
 // serves the three fields per recipe. This half verifies the recipe itself
 // at read time, using the SAME canonicalRecipeHash as publish.ts — never a
-// second scheme. Timestamps, mime/size and $type are NOT in the hash, and
-// the message format is unchanged (out of scope for C2).
+// second scheme. Timestamps, mime/size and $type are NOT in the hash.
+// The signed MESSAGE is v2 (Sec L11): it binds the record's createdAt
+// as well as the account, id, and hash; v1 (no createdAt line) is still
+// accepted for records published before v2 existed.
 // ---------------------------------------------------------------------------
 
 /** Machine-readable reason a record failed verification. */
@@ -353,8 +356,13 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
  * must agree with each other); deviceSignature is present and strict
  * standard base64 for exactly 64 bytes; the canonical hash of the record
  * AS SERVED recomputed with publish.ts's canonicalRecipeHash, signed over
- * `longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>`, verifies
- * detached-Ed25519 against the served deviceKey.
+ * the v2 recipe message
+ * `longtable-recipe:v2\n<accountDid>\n<longtableId>\n<hashHex>\n<createdAt>`
+ * (or the legacy v1 message without the createdAt line, for records
+ * published before v2), verifies detached-Ed25519 against the served
+ * deviceKey. L-N4: a record whose canonical hash cannot be computed at
+ * all (e.g. an image ref that is not a `{$link}` blob reference) fails
+ * here as `signature-invalid` — never as a raw TypeError from the hash.
  *
  * When `trustedDeviceKey` is given (the key the author's PDS binds to
  * this device, fetched + verified by fetchAuthorBinding — S3/H-N4),
@@ -412,13 +420,36 @@ export async function verifyPublicRecipe(
   }
   const sigBytes = decodeBase64Strict(record.deviceSignature, 64)
   if (!sigBytes) throw new RecipeVerificationError('invalid-deviceSignature')
-  const hashHex = await canonicalRecipeHash(record)
-  const msg = utf8ToU8(recipeSignatureMessage(accountDid, record.longtableId, hashHex))
-  let ok: boolean
+  // L-N4: the hash can THROW on a malformed served record (an image ref
+  // that is not a {$link} blob reference) — that is a verification
+  // failure, not a generic error: the record must not be displayed.
+  let hashHex: string
   try {
-    ok = sodium.crypto_sign_verify_detached(sigBytes, msg, keyBytes)
+    hashHex = await canonicalRecipeHash(record)
   } catch {
-    ok = false
+    throw new RecipeVerificationError('signature-invalid')
+  }
+  // Sec L11: v2 first (the signer emits v2), v1 as the legacy fallback
+  // for records published before v2. A v2 signature never verifies
+  // under v1 (the messages differ), so accepting v1 cannot downgrade
+  // a v2-signed record — it only keeps old publications readable.
+  const messages: string[] = []
+  if (typeof record.createdAt === 'string' && record.createdAt) {
+    messages.push(
+      recipeSignatureMessage(accountDid, record.longtableId, hashHex, record.createdAt),
+    )
+  }
+  messages.push(legacyRecipeSignatureMessage(accountDid, record.longtableId, hashHex))
+  let ok = false
+  for (const message of messages) {
+    try {
+      if (sodium.crypto_sign_verify_detached(sigBytes, utf8ToU8(message), keyBytes)) {
+        ok = true
+        break
+      }
+    } catch {
+      // A verify that throws is a failed verify, not a pass.
+    }
   }
   if (!ok) throw new RecipeVerificationError('signature-invalid')
 }

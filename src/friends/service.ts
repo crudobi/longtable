@@ -624,16 +624,49 @@ export async function sweepFriendsOnlyShares(
 export interface ReceivedMapping {
   localId: string
   updatedAt: string
+  /**
+   * FNV-1a-64 hex of the received recipe content last applied (L-N1).
+   * Absent on mappings written before this field existed; those entries
+   * apply once on an equal timestamp and then record the hash, so the
+   * fallback only ever fires once per legacy entry.
+   */
+  contentHash?: string
 }
 
-/** One mapping entry is usable only when both of its fields check out. */
+/** One mapping entry is usable only when its required fields check out. */
 function isReceivedMapping(o: unknown): o is ReceivedMapping {
   return (
     typeof o === 'object' &&
     o !== null &&
     typeof (o as ReceivedMapping).localId === 'string' &&
-    typeof (o as ReceivedMapping).updatedAt === 'string'
+    typeof (o as ReceivedMapping).updatedAt === 'string' &&
+    ((o as ReceivedMapping).contentHash === undefined ||
+      typeof (o as ReceivedMapping).contentHash === 'string')
   )
+}
+
+/**
+ * Content hash for the staleness fallback (L-N1): FNV-1a-64 over the
+ * canonical JSON of the upsert input, the same hash family as the hub
+ * migration digests (hubs.ts `legacyMatchHash`) — deterministic, no
+ * dependency, and it only ever distinguishes "same content" from
+ * "changed content", so a non-cryptographic hash is the right tool.
+ */
+export function receivedContentHash(input: {
+  title: string
+  ingredients: string[]
+  steps: string[]
+  photos: string[]
+  prepMinutes?: number
+  cookMinutes?: number
+}): string {
+  let hash = BigInt('0xcbf29ce484222325')
+  const bytes = new TextEncoder().encode(JSON.stringify(input))
+  for (const b of bytes) {
+    hash ^= BigInt(b)
+    hash = (hash * BigInt('0x100000001b3')) & BigInt('0xffffffffffffffff')
+  }
+  return hash.toString(16).padStart(16, '0')
 }
 
 /**
@@ -898,7 +931,11 @@ async function upsertReceived(
       createdAt: share.recipe.createdAt,
       updatedAt: share.recipe.updatedAt,
     })
-    mapping[key] = { localId: summary.id, updatedAt: share.updatedAt }
+    mapping[key] = {
+      localId: summary.id,
+      updatedAt: share.updatedAt,
+      contentHash: receivedContentHash(input),
+    }
     // H4: this local copy is received, not owned — record provenance
     // so it can never be re-published public or QR-shared onward.
     recordReceivedProvenance(
@@ -913,9 +950,25 @@ async function upsertReceived(
     )
     return
   }
-  if (existing.updatedAt === share.updatedAt) return // already current
+  // L-N1: staleness is a timestamp ORDER, not an equality check — and
+  // the timestamp alone is not enough. An older updatedAt (owner clock
+  // skew, restore from backup) must never overwrite a newer local copy;
+  // a same-millisecond re-edit must still land, so an equal timestamp
+  // falls back to the content hash: identical content is already
+  // current, changed content applies. An unparseable timestamp on
+  // either side degrades to the content hash alone.
+  const hash = receivedContentHash(input)
+  const shareTs = Date.parse(share.updatedAt)
+  const existingTs = Date.parse(existing.updatedAt)
+  if (Number.isFinite(shareTs) && Number.isFinite(existingTs)) {
+    if (shareTs < existingTs) return // older — never overwrite newer
+    if (shareTs === existingTs && existing.contentHash === hash) return
+  } else if (existing.contentHash === hash) {
+    return // unparseable timestamp, identical content
+  }
   await updateRecipe(repo, index, existing.localId, input)
   existing.updatedAt = share.updatedAt
+  existing.contentHash = hash
   // H4 backfill: an older received copy updated here may predate
   // provenance — make sure it is marked before the next import ends.
   if (!getRecipeProvenance(existing.localId, kv)) {

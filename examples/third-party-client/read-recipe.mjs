@@ -100,12 +100,16 @@ function pdsEndpointFromDoc(didDoc) {
 }
 
 /* Canonical recipe hash + signature strings, exactly as the protocol
- * doc specifies (BLAKE2b-256 over the canonical JSON array). */
+ * doc specifies (BLAKE2b-256 over the canonical JSON array). L-N4: an
+ * image ref that is not a {$link} blob reference throws — such a
+ * record has no well-defined hash and must fail verification, not be
+ * hashed as if the ref were its own CID. */
 function canonicalHashHex(record) {
   const imageCids = (record.images || []).map((img) => {
     const ref = img?.ref
-    if (!ref) return ''
-    return typeof ref.$link === 'string' ? ref.$link : String(ref)
+    if (!ref) throw new Error('image ref is not a {$link} blob reference')
+    if (typeof ref.$link === 'string' && ref.$link) return ref.$link
+    throw new Error('image ref is not a {$link} blob reference')
   })
   const canonical = JSON.stringify([
     record.name,
@@ -287,8 +291,21 @@ async function main() {
     }
   })
   check('recipe device signature verifies (canonical hash + signed string)', () => {
-    const msg = `longtable-recipe:v1\n${did}\n${record.longtableId}\n${canonicalHashHex(record)}`
-    if (!verifyDetached(record.deviceSignature, msg, devicePubKey)) throw new Error('bad signature')
+    // Sec L11: v2 (bound to createdAt) first, v1 as the legacy fallback
+    // for records published before v2.
+    const hashHex = canonicalHashHex(record)
+    const messages = []
+    if (typeof record.createdAt === 'string' && record.createdAt) {
+      messages.push(
+        `longtable-recipe:v2\n${did}\n${record.longtableId}\n${hashHex}\n${record.createdAt}`,
+      )
+    }
+    messages.push(`longtable-recipe:v1\n${did}\n${record.longtableId}\n${hashHex}`)
+    if (
+      !messages.some((msg) => verifyDetached(record.deviceSignature, msg, devicePubKey))
+    ) {
+      throw new Error('bad signature')
+    }
   })
 
   console.log('\n--- the recipe, as published ---')

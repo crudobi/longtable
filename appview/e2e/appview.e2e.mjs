@@ -147,7 +147,11 @@ function signedRecipeRecord(device, accountDid, name, longtableId, ingredients) 
   return {
     ...record,
     deviceDid: device.deviceDid,
-    deviceSignature: signMsg(device, recipeSignatureMessage(accountDid, record.longtableId, hashHex)),
+    // Sec L11: the signer emits the v2 message, bound to createdAt.
+    deviceSignature: signMsg(
+      device,
+      recipeSignatureMessage(accountDid, record.longtableId, hashHex, record.createdAt),
+    ),
   }
 }
 

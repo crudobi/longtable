@@ -254,7 +254,12 @@ describe('device-signature gate (C2)', () => {
     const attacker = makeDevice()
     const record = signedRecipeRecord(device, DID, 'Resigned Soup', ['1 egg'])
     const hashHex = canonicalRecipeHashHex(record)
-    record.deviceSignature = signMsg(attacker, recipeSignatureMessage(DID, record.longtableId, hashHex))
+    // The attacker signs the CURRENT (v2) message with their own key:
+    // the rejection must come from the wrong key, not a stale message.
+    record.deviceSignature = signMsg(
+      attacker,
+      recipeSignatureMessage(DID, record.longtableId, hashHex, record.createdAt),
+    )
     state.records = [recipeEntry('a', record), bindingEntryFor(device)]
     await ingestor.reconcileRepo(DID)
     expect(index.count()).toBe(0)

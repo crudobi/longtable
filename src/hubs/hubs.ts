@@ -151,6 +151,18 @@ export const DEFAULT_HUB: HubConfig = {
  * second set (LEGACY_HUB_HASHES_V0, fragment-joined strings that never
  * shipped) was matched for one release only (v0.2.2) and removed after
  * it — no real device can carry fragment-valued entries.
+ *
+ * S23: the id digest ALONE is not enough to rename an entry. FNV-1a-64
+ * is 64-bit, so a user hub id could in principle collide with the
+ * legacy id digest — and renaming it would silently rewire the user's
+ * hub to the default. The entry is renamed only when the id digest
+ * matches AND the same set's name digest or credential digest also
+ * matches: a real legacy entry always carries the legacy default name
+ * (unless the user renamed it, in which case it still carries the
+ * burned credential) — so a genuine legacy hub always satisfies one
+ * of the two, and an id-only collision satisfies neither. activeId
+ * follows only when it named the renamed entry itself, never on its
+ * own digest match.
  */
 export function migrateLegacyDefaultHub(
   reg: HubRegistry,
@@ -162,16 +174,22 @@ export function migrateLegacyDefaultHub(
   )
   if (!legacy) return false
   const matched = sets.find((s) => legacyMatchHash(legacy.id) === s.id) as LegacyHubHashes
-  legacy.id = DEFAULT_HUB_ID
-  if (legacyMatchHash(legacy.name) === matched.name) legacy.name = DEFAULT_HUB.name
-  if (
+  const nameMatches = legacyMatchHash(legacy.name) === matched.name
+  const credentialMatches =
     legacy.turnCredential !== undefined &&
     legacyMatchHash(legacy.turnCredential) === matched.credential
-  ) {
+  // S23 dedupe guard: an id-digest collision with neither the legacy
+  // name nor the legacy credential is not the legacy hub — leave it
+  // exactly as the user configured it.
+  if (!nameMatches && !credentialMatches) return false
+  const wasActive = reg.activeId === legacy.id
+  legacy.id = DEFAULT_HUB_ID
+  if (nameMatches) legacy.name = DEFAULT_HUB.name
+  if (credentialMatches) {
     if (DEV_TURN_PASSWORD) legacy.turnCredential = DEV_TURN_PASSWORD
     else delete legacy.turnCredential
   }
-  if (sets.some((s) => legacyMatchHash(reg.activeId) === s.id)) {
+  if (wasActive) {
     reg.activeId = DEFAULT_HUB_ID
   }
   return true
