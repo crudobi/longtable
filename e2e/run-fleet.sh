@@ -470,6 +470,7 @@ proof_serials() {
     proof-p2p)       echo "emulator-5554 emulator-5556" ;;
     proof-friends)   echo "emulator-5554 emulator-5556 emulator-5558" ;;
     proof-hubfail)   echo "emulator-5554 emulator-5556" ;;
+    proof-manual-sdp) echo "emulator-5554 emulator-5556" ;;
     *)               echo "emulator-5554" ;;
   esac
 }
@@ -477,6 +478,7 @@ proof_timeout() {
   case "$1" in
     proof-p2p)        echo 1500 ;;
     proof-friends)    echo 1800 ;;
+    proof-manual-sdp) echo 1500 ;;
     proof-public)     echo 1500 ;;
     proof-thirdparty) echo 1200 ;;
     proof-importer)   echo 900 ;;

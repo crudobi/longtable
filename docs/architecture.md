@@ -81,13 +81,35 @@ Friend pairing and friends-only sharing (Phase 2).
 
 - `friends.ts` — pairing + channels. Invites (v2) carry the inviter's
   DID, a one-time pairing room, and a 32-byte pair secret; both sides
-  exchange signed hellos (`longtable-pair:<room>:<did>`) and the guest
-  pins the inviter's DID from the invite, so substitution fails. Each
-  pair gets a persistent channel room derived from
-  `BLAKE2b-256(pairSecret)`; the y-webrtc room password is the pair
-  secret. Interface: `createFriendInvite`, `parseFriendInvite`,
-  `runPairing`, `listFriends`/`getFriend`/`saveFriend`/`removeFriend`,
-  `joinFriendChannel`, `rejoinFriendChannels`, `onChannelUpdate`.
+  exchange signed hellos (`longtable-pair:v2:<room>:<did>:<pairId>`,
+  plus a v3 signature binding the display name) and the guest pins
+  the inviter's DID and name from the invite, so substitution fails.
+  Each pair gets a persistent channel room/doc bound to BOTH DIDs
+  (`channelTag`, derived from the pairId and the sorted DIDs), so two
+  pairings on one reused invite land in different rooms; the y-webrtc
+  room password is the pair secret. Invites expire after 24 h and are
+  single-use at the app's entry points. Interface:
+  `createFriendInvite`, `parseFriendInvite`, `runPairing`,
+  `buildMyHello` / `verifyPeerHello` / `finalizePairing` (the shared
+  hello core — see below), `listFriends`/`getFriend`/`saveFriend`/
+  `removeFriend`, `joinFriendChannel`, `rejoinFriendChannels`,
+  `onChannelUpdate`.
+- `manualSdp.ts` — the manual-SDP fallback (E3): the same pairing
+  with no hub in the path. The offerer mints an invite and a WebRTC
+  offer; the offer blob (offer SDP + invite, base64url) is copied to
+  the guest by hand or as a link with the blob in its URL hash, and
+  the answer blob is pasted back. The two devices then pair over the
+  direct RTCPeerConnection data channel. Only the transport changes:
+  the hello is built, verified, and persisted by the shared core in
+  `friends.ts`, so the DID-bound channel, the signed name, and
+  single-use enforcement hold exactly as on the signaling path. ICE
+  servers (STUN/TURN from the configured hubs) are still used for NAT
+  traversal; only signaling is manual. Interface:
+  `createManualOffer`, `acceptManualOffer`, `completeManualOffer`,
+  `exchangeHelloOverChannel` (hello exchange over any `HelloChannel`;
+  the loopback pair is the test implementation),
+  `encodeManualOffer` / `decodeManualOffer` / `encodeManualAnswer` /
+  `decodeManualAnswer`, `manualOfferLink`, `isManualSdpSupported`.
 - `shelf.ts` — the friends-only cryptography. Each shared recipe gets a
   random secretbox key, kept in an owner-only local vault (`loadVault`,
   `ensureRecipeKey`, `getRecipeKey`). What enters the channel is only:
