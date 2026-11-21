@@ -35,7 +35,46 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe('parseRecipeHtml', () => {
+describe('parseRecipeHtml (M15)', () => {
+  it('keeps durations, description, yield, author, tags, and source URL', () => {
+    const html = `<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Recipe","name":"Timed Cake",
+ "description":"Tasty.",
+ "recipeYield":"4 servings",
+ "author":{"@type":"Person","name":"Chef A"},
+ "keywords":"quick, easy",
+ "prepTime":"PT1H30M","cookTime":"PT45M",
+ "recipeIngredient":["flour"],
+ "recipeInstructions":[
+   {"@type":"HowToStep","text":"Mix."},
+   {"@type":"HowToStep","name":"Rest."},
+   {"@type":"HowToSection","name":"Baking","itemListElement":[{"@type":"HowToStep","text":"Bake."}]}
+ ]}</script></head></html>`
+    const r = parseRecipeHtml(html, 'https://example.com/cake')
+    expect(r.title).toBe('Timed Cake')
+    expect(r.prepMinutes).toBe(90)
+    expect(r.cookMinutes).toBe(45)
+    expect(r.description).toBe('Tasty.')
+    expect(r.recipeYield).toBe('4 servings')
+    expect(r.author).toBe('Chef A')
+    expect(r.tags).toEqual(['quick', 'easy'])
+    expect(r.sourceUrl).toBe('https://example.com/cake')
+    expect(r.steps).toEqual(['Mix.', 'Rest.', 'Baking: Bake.'])
+  })
+
+  it('derives the missing leg from totalTime, never from the total alone', () => {
+    const withPrep = `<html><head><script type="application/ld+json">
+{"@type":"Recipe","name":"T","recipeIngredient":[],
+ "prepTime":"PT10M","totalTime":"PT40M","recipeInstructions":[]}</script></head></html>`
+    expect(parseRecipeHtml(withPrep, 'https://example.com/t').cookMinutes).toBe(30)
+    const totalOnly = `<html><head><script type="application/ld+json">
+{"@type":"Recipe","name":"T","recipeIngredient":[],
+ "totalTime":"PT40M","recipeInstructions":[]}</script></head></html>`
+    const r = parseRecipeHtml(totalOnly, 'https://example.com/t')
+    expect(r.prepMinutes).toBeUndefined()
+    expect(r.cookMinutes).toBeUndefined()
+  })
+
   it('prefers schema.org Recipe JSON-LD', () => {
     const r = parseRecipeHtml(JSON_LD_PAGE, 'https://example.com/r')
     expect(r.title).toBe('Fluffy Pancakes')

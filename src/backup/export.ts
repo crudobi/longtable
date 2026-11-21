@@ -42,6 +42,11 @@ export interface ExportedRecipe {
   cookMinutes?: number
   /** Present only when the recipe is not private. */
   visibility?: 'private' | 'friends-only' | 'public'
+  description?: string
+  recipeYield?: string
+  tags?: string[]
+  author?: string
+  sourceUrl?: string
   createdAt: string
   updatedAt: string
 }
@@ -107,6 +112,11 @@ export function buildExport(
       ...(recipe.prepMinutes !== undefined ? { prepMinutes: recipe.prepMinutes } : {}),
       ...(recipe.cookMinutes !== undefined ? { cookMinutes: recipe.cookMinutes } : {}),
       ...(recipe.visibility !== undefined ? { visibility: recipe.visibility } : {}),
+      ...(recipe.description !== undefined ? { description: recipe.description } : {}),
+      ...(recipe.recipeYield !== undefined ? { recipeYield: recipe.recipeYield } : {}),
+      ...(recipe.tags !== undefined ? { tags: [...recipe.tags] } : {}),
+      ...(recipe.author !== undefined ? { author: recipe.author } : {}),
+      ...(recipe.sourceUrl !== undefined ? { sourceUrl: recipe.sourceUrl } : {}),
       createdAt: recipe.createdAt,
       updatedAt: recipe.updatedAt,
     })),
@@ -171,6 +181,14 @@ export function parseExport(text: string): LongtableExport {
     if (raw.visibility !== undefined && !isVisibility(raw.visibility)) {
       throw new ExportError(`${where}: unknown visibility "${String(raw.visibility)}".`)
     }
+    for (const key of ['description', 'recipeYield', 'author', 'sourceUrl'] as const) {
+      if (raw[key] !== undefined && typeof raw[key] !== 'string') {
+        throw new ExportError(`${where}: "${key}" must be text.`)
+      }
+    }
+    if (raw.tags !== undefined && !isStringArray(raw.tags)) {
+      throw new ExportError(`${where}: tags must be a list of text.`)
+    }
     if (typeof raw.createdAt !== 'string' || typeof raw.updatedAt !== 'string') {
       throw new ExportError(`${where}: missing created/updated timestamps.`)
     }
@@ -183,6 +201,11 @@ export function parseExport(text: string): LongtableExport {
       ...(typeof raw.prepMinutes === 'number' ? { prepMinutes: raw.prepMinutes } : {}),
       ...(typeof raw.cookMinutes === 'number' ? { cookMinutes: raw.cookMinutes } : {}),
       ...(isVisibility(raw.visibility) ? { visibility: raw.visibility } : {}),
+      ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+      ...(typeof raw.recipeYield === 'string' ? { recipeYield: raw.recipeYield } : {}),
+      ...(isStringArray(raw.tags) ? { tags: raw.tags } : {}),
+      ...(typeof raw.author === 'string' ? { author: raw.author } : {}),
+      ...(typeof raw.sourceUrl === 'string' ? { sourceUrl: raw.sourceUrl } : {}),
       createdAt: raw.createdAt,
       updatedAt: raw.updatedAt,
     }

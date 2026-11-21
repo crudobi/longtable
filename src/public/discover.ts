@@ -538,6 +538,9 @@ export async function publicRecordToInput(
     photos,
     prepMinutes: record.prepTimeMinutes,
     cookMinutes: record.cookTimeMinutes,
+    ...(record.description ? { description: record.description } : {}),
+    ...(record.recipeYield ? { recipeYield: record.recipeYield } : {}),
+    ...(record.tags && record.tags.length > 0 ? { tags: [...record.tags] } : {}),
   }
 }
 

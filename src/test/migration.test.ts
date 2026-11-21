@@ -11,8 +11,10 @@ import { describe, expect, it } from 'vitest'
 import { createRepo } from '../store/repo'
 import {
   MIGRATED_KEY,
+  MIGRATION_FLAG_VERSION,
   asRecoveredRecipe,
   migrateFromAutomergeIfNeeded,
+  migrationFailureNotice,
   recipeFingerprint,
 } from '../store/migrateFromAutomerge'
 import {
@@ -94,7 +96,11 @@ describe('automerge recovery migration', () => {
     expect(outcome.ran).toBe(true)
     expect(outcome.imported).toBe(1)
     expect(outcome.failedDocs).toBe(1) // the corrupt doc only
-    expect(kv.getItem(MIGRATED_KEY)).toBeTruthy()
+    expect(outcome.failedDocIds).toEqual(['corruptDoc'])
+    // M14: a failed load blocks completion — the flag stays unset so
+    // the next launch retries, and the failed id is recorded.
+    expect(outcome.complete).toBe(false)
+    expect(kv.getItem(MIGRATED_KEY)).toBeNull()
 
     const index = await getOrCreateIndex(store, kv)
     const listed = await listRecipes(index)
@@ -113,10 +119,10 @@ describe('automerge recovery migration', () => {
     expect(recipe!.updatedAt).toBe('2026-10-11T11:30:00.000Z')
   })
 
-  it('is a no-op when the flag is already set', async () => {
+  it('is a no-op when the flag is already set (v2)', async () => {
     const store = createRepo(uniq('longtable-new'))
     const kv = memoryStore()
-    kv.setItem(MIGRATED_KEY, '{"at":"earlier"}')
+    kv.setItem(MIGRATED_KEY, JSON.stringify({ version: MIGRATION_FLAG_VERSION, at: 'earlier' }))
     const outcome = await migrateFromAutomergeIfNeeded({
       store,
       kv,
@@ -218,5 +224,56 @@ describe('shape check + fingerprint', () => {
     expect(recipeFingerprint(base)).not.toBe(
       recipeFingerprint({ ...base, prepMinutes: undefined }),
     )
+  })
+})
+
+describe('migration flag versioning + failure notice (M14)', () => {
+  it('re-runs when the flag is pre-v2, then writes a v2 flag', async () => {
+    const store = createRepo(uniq('longtable-new'))
+    const kv = memoryStore()
+    kv.setItem(MIGRATED_KEY, '{"at":"earlier"}')
+    const outcome = await migrateFromAutomergeIfNeeded({
+      store,
+      kv,
+      oldDbName: uniq('longtable-never-existed'),
+    })
+    expect(outcome.ran).toBe(true)
+    expect(outcome.complete).toBe(true)
+    const flag = JSON.parse(kv.getItem(MIGRATED_KEY)!) as { version?: unknown }
+    expect(flag.version).toBe(MIGRATION_FLAG_VERSION)
+    // And now it no-ops.
+    const second = await migrateFromAutomergeIfNeeded({
+      store,
+      kv,
+      oldDbName: uniq('longtable-never-existed'),
+    })
+    expect(second.ran).toBe(false)
+  })
+
+  it('tells the user once per failed-doc set', () => {
+    const kv = memoryStore()
+    const outcome = {
+      ran: true,
+      imported: 0,
+      skippedDuplicates: 0,
+      failedDocs: 1,
+      failedDocIds: ['docX'],
+      complete: false,
+    }
+    const first = migrationFailureNotice(outcome, kv)
+    expect(first).toMatch(/couldn't read 1 recipe/)
+    // Same set again: quiet.
+    expect(migrationFailureNotice(outcome, kv)).toBeNull()
+    // A new failure speaks up again.
+    const second = migrationFailureNotice(
+      { ...outcome, failedDocIds: ['docX', 'docY'], failedDocs: 2 },
+      kv,
+    )
+    expect(second).toMatch(/couldn't read 2 recipes/)
+    // Nothing to say when the run was clean or never ran.
+    expect(
+      migrationFailureNotice({ ...outcome, failedDocIds: [], failedDocs: 0, complete: true }, kv),
+    ).toBeNull()
+    expect(migrationFailureNotice({ ...outcome, ran: false }, kv)).toBeNull()
   })
 })

@@ -16,6 +16,8 @@
 import type { RecipeInput } from '../types'
 import {
   ImporterError,
+  MAX_IMPORT_PHOTOS,
+  MAX_IMPORT_RECIPES,
   assertImporterShape,
   validateImportedRecipe,
   type ImporterInput,
@@ -133,14 +135,24 @@ export function sanitizePluginMessage(raw: string): string | null {
 
 /**
  * Run an importer and validate its output. Resolves with the recipes as
- * app-ready `RecipeInput[]`; rejects with an `ImporterError` whose message
- * is safe to show the user. Nothing is saved by this function — the caller
- * creates the recipes only after the whole run validates.
+ * app-ready `RecipeInput[]` plus any non-fatal `warnings` the import
+ * raised (a recipe with no steps, a Mealie photo file name that could
+ * not be fetched, image references that could not be resolved); rejects
+ * with an `ImporterError` whose message is safe to show the user.
+ * Nothing is saved by this function — the caller creates the recipes
+ * only after the whole run validates.
+ *
+ * Image CIDs (M-N6): a recipe may carry `imageCids` (a saved public
+ * record's `images[].ref.$link`). When the caller supplied
+ * `input.resolveImageCid`, each CID is resolved to a data URL and
+ * appended to the recipe's photos (within the photo cap); CIDs that
+ * cannot be resolved — or a run with no resolver at all — produce a
+ * warning naming the recipe and the count, never a silent drop.
  */
 export async function runImporter(
   id: string,
   input: ImporterInput,
-): Promise<{ importer: RecipeImporter; recipes: RecipeInput[] }> {
+): Promise<{ importer: RecipeImporter; recipes: RecipeInput[]; warnings: string[] }> {
   const importer = registry.get(id)
   if (!importer) throw new ImporterError('That importer is not available.')
   if (!importer.accepts.includes(input.kind)) {
@@ -171,6 +183,61 @@ export async function runImporter(
   if (raw.length === 0) {
     throw new ImporterError(`${importer.name} found no recipes in that source. Nothing was imported.`)
   }
+  if (raw.length > MAX_IMPORT_RECIPES) {
+    throw new ImporterError(
+      `${importer.name} found ${raw.length} recipes — at most ${MAX_IMPORT_RECIPES} can be imported at once. Nothing was imported.`,
+    )
+  }
+  // Non-fatal notes the importers attached (warnings) and photo CIDs
+  // they could not turn into bytes themselves (imageCids) are read off
+  // the raw output here — validation strips both, so they must be
+  // collected before it runs.
+  const warnings: string[] = []
+  const imageCidsByIndex = new Map<number, string[]>()
+  raw.forEach((r, i) => {
+    if (typeof r !== 'object' || r === null || Array.isArray(r)) return
+    const rec = r as Record<string, unknown>
+    if (Array.isArray(rec.warnings)) {
+      for (const w of rec.warnings) {
+        if (typeof w === 'string' && w.trim()) warnings.push(w)
+      }
+    }
+    if (Array.isArray(rec.imageCids)) {
+      const cids = rec.imageCids.filter(
+        (c): c is string => typeof c === 'string' && c.trim() !== '',
+      )
+      if (cids.length > 0) imageCidsByIndex.set(i, cids)
+    }
+  })
   const recipes = raw.map((r, i) => validateImportedRecipe(r, importer.name, i))
-  return { importer, recipes }
+  for (const [i, cids] of imageCidsByIndex) {
+    const recipe = recipes[i]
+    const label = `${importer.name}, recipe ${i + 1}`
+    if (!input.resolveImageCid) {
+      warnings.push(
+        `${label} has ${cids.length} photo${cids.length === 1 ? '' : 's'} saved as image references that this import couldn't fetch — the photos were left out. Attach them from the original afterwards.`,
+      )
+      continue
+    }
+    let resolved = 0
+    for (const cid of cids) {
+      if ((recipe.photos?.length ?? 0) >= MAX_IMPORT_PHOTOS) break
+      try {
+        const url = await input.resolveImageCid(cid)
+        if (typeof url === 'string' && url.startsWith('data:image/')) {
+          recipe.photos = [...(recipe.photos ?? []), url]
+          resolved += 1
+        }
+      } catch {
+        // One unresolvable CID must not fail the whole import.
+      }
+    }
+    const leftOut = cids.length - resolved
+    if (leftOut > 0) {
+      warnings.push(
+        `${label}: ${resolved} of ${cids.length} photo${cids.length === 1 ? '' : 's'} could be fetched; ${leftOut} ${leftOut === 1 ? 'was' : 'were'} left out.`,
+      )
+    }
+  }
+  return { importer, recipes, warnings }
 }

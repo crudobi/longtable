@@ -93,6 +93,27 @@ export function createRepo(dbName: string = REPO_DB_NAME): YjsStore {
   }
 }
 
+/**
+ * Flush pending IndexedDB writes when the page is being hidden or
+ * unloaded (integrity M12: flush() existed but had zero callers, so a
+ * kill right after a mutation could lose the write even though the
+ * in-memory doc held it). Best-effort: pagehide gives no time to
+ * await, so failures are logged, not thrown. Returns an unsubscribe
+ * function. No-op where there is no window (tests running in node).
+ */
+export function registerPagehideFlush(store: YjsStore): () => void {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return () => undefined
+  }
+  const onPagehide = () => {
+    void store.flush().catch((e) => {
+      console.warn('[longtable] pagehide flush failed; writes may be lost:', e)
+    })
+  }
+  window.addEventListener('pagehide', onPagehide)
+  return () => window.removeEventListener('pagehide', onPagehide)
+}
+
 /** Test hook: drop the singleton so tests can build isolated instances. */
 export function resetRepoForTests(): void {
   if (store) {

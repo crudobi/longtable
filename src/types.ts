@@ -11,6 +11,19 @@ export interface Recipe {
   /** data URLs (image/*), downscaled on import */
   photos: string[]
   /**
+   * Descriptive fields (Wave 4F, integrity M15/M21): kept when an
+   * importer records them, so a URL/Mealie/JSON import no longer
+   * silently drops the description, yield, tags, author, or source.
+   * The public publisher already emits description/recipeYield/tags
+   * when present; the edit form does not edit them yet, and an edit
+   * that omits them leaves them untouched.
+   */
+  description?: string
+  recipeYield?: string
+  tags?: string[]
+  author?: string
+  sourceUrl?: string
+  /**
    * Sharing tier (Phase 2/3). Absent/'private' = this device only.
    * 'friends-only' = encrypted shares exist for chosen friends; the
    * plaintext still lives only in this device's doc — encryption happens
@@ -40,6 +53,11 @@ export interface RecipePatch {
   prepMinutes?: number
   cookMinutes?: number
   photos?: string[]
+  description?: string
+  recipeYield?: string
+  tags?: string[]
+  author?: string
+  sourceUrl?: string
 }
 
 /** Lightweight list entry kept in the recipe index document. */

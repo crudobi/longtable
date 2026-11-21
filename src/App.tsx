@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getRepo } from './store/repo'
+import { getRepo, registerPagehideFlush } from './store/repo'
 import {
   createRecipe,
   getOrCreateIndex,
@@ -141,14 +141,28 @@ export default function App() {
       }
       // One-time Phase 0 (Automerge) recovery migration: imports any
       // recipes orphaned by the Phase 1 storage swap. Flag-guarded and
-      // dynamically imported, so it is inert after the first run.
+      // dynamically imported, so it is inert after the first run. A run
+      // with failed documents does NOT set the flag (it retries next
+      // launch) and the user is told once per failed set (M14).
       try {
-        const { migrateFromAutomergeIfNeeded } = await import(
+        const { migrateFromAutomergeIfNeeded, migrationFailureNotice } = await import(
           './store/migrateFromAutomerge'
         )
-        await migrateFromAutomergeIfNeeded()
+        const outcome = await migrateFromAutomergeIfNeeded()
+        const notice = migrationFailureNotice(outcome)
+        if (notice) setError(notice)
       } catch (e) {
         console.warn('automerge migration failed', e)
+      }
+      // Startup index-integrity pass (M11/M13): drop index entries
+      // whose recipe document is gone or empty (the crash window the
+      // index-first create leaves behind) and malformed entries the
+      // snapshot drops. Runs before the first refresh below.
+      try {
+        const { reconcileIndexOrphans } = await import('./store/recipes')
+        await reconcileIndexOrphans(getRepo())
+      } catch (e) {
+        console.warn('startup index cleanup failed', e)
       }
       // Phase 2 identity: load (or create) the device DID, rejoin friend
       // channels, and import any friends-only shares waiting in them.
@@ -168,6 +182,9 @@ export default function App() {
     })()
       .catch((e) => setError(friendlyError(e)))
       .finally(() => setReady(true))
+    // Integrity M12: flush pending IndexedDB writes when the page is
+    // hidden, so a kill right after a mutation does not lose the write.
+    const stopPagehideFlush = registerPagehideFlush(getRepo())
     // Rejoin P2P shares (peers rediscover via signaling and sync converges).
     void rejoinShares().catch((e) => console.warn('rejoin shares failed', e))
     // Friends-only channel updates: a friend published or republished a
@@ -197,6 +214,7 @@ export default function App() {
     return () => {
       unsubscribe()
       unsubChannel()
+      stopPagehideFlush()
       if (channelTimer) clearTimeout(channelTimer)
       if (refreshTimer.current) clearTimeout(refreshTimer.current)
     }

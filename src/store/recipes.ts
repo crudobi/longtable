@@ -70,6 +70,17 @@ export const RECIPE_LIMITS = {
   photos: 20,
 } as const
 
+/**
+ * Store schema version (integrity M13). Written into the index doc's
+ * `meta` map and into every recipe doc on create/restore/update, so a
+ * future shape change can tell v1 data from older unversioned data
+ * instead of degrading silently. Bump when the stored shape changes.
+ */
+export const SCHEMA_VERSION = 1
+/** Y.Map name inside the index doc holding schema metadata. */
+export const INDEX_META_MAP = 'meta'
+
+
 /** Whole, non-negative minutes or undefined. Non-numeric, negative, or
  * non-finite values are dropped (a missing minute is harmless; a NaN
  * minute is poison). Fractional values round (H-N3): the AppView serves
@@ -116,6 +127,50 @@ function cleanPhotos(items: unknown): string[] {
   return out
 }
 
+function cleanOptionalText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  return trimmed.slice(0, maxChars)
+}
+
+function cleanTagList(items: unknown): string[] | undefined {
+  if (!Array.isArray(items)) return undefined
+  const out: string[] = []
+  for (const item of items) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed) continue
+    if (!out.includes(trimmed)) out.push(trimmed.slice(0, 200))
+    if (out.length >= 50) break
+  }
+  return out.length > 0 ? out : undefined
+}
+
+function cleanSourceUrlValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (!/^https?:\/\//i.test(trimmed) || trimmed.length > 2000) return undefined
+  return trimmed
+}
+
+/**
+ * Flush pending IndexedDB writes after a mutation (integrity M12).
+ * A flush failure is logged, not thrown: the write already landed in
+ * the live Y.Doc, and the pagehide hook retries the persist — but it
+ * is never silent.
+ */
+async function flushQuietly(repo: YjsStore): Promise<void> {
+  try {
+    await repo.flush()
+  } catch (e) {
+    console.warn(
+      '[longtable] IndexedDB flush failed after a mutation; the change is held in memory and will retry on the next flush:',
+      e,
+    )
+  }
+}
+
 /**
  * Validate + cap a recipe input before persistence. Throws on a
  * non-string title; truncates everything else to RECIPE_LIMITS; rounds
@@ -127,11 +182,21 @@ export function sanitizeRecipeInput(input: RecipeInput): RecipeInput {
   if (typeof input.title !== 'string') {
     throw new Error('Recipe title must be text.')
   }
+  const description = cleanOptionalText(input.description, 5000)
+  const recipeYield = cleanOptionalText(input.recipeYield, 200)
+  const tags = cleanTagList(input.tags)
+  const author = cleanOptionalText(input.author, 200)
+  const sourceUrl = cleanSourceUrlValue(input.sourceUrl)
   const out: RecipeInput = {
     title: input.title.slice(0, RECIPE_LIMITS.titleChars),
     ingredients: cleanStringList(input.ingredients),
     steps: cleanStringList(input.steps),
     photos: cleanPhotos(input.photos),
+    ...(description ? { description } : {}),
+    ...(recipeYield ? { recipeYield } : {}),
+    ...(tags ? { tags } : {}),
+    ...(author ? { author } : {}),
+    ...(sourceUrl ? { sourceUrl } : {}),
   }
   if (input.visibility !== undefined) out.visibility = input.visibility
   const prep = cleanMinutesValue(input.prepMinutes)
@@ -161,6 +226,11 @@ export function sanitizeRecipePatch(patch: RecipePatch): RecipePatch {
   if (patch.photos !== undefined) {
     out.photos = cleanPhotos(patch.photos)
   }
+  if ('description' in patch) out.description = cleanOptionalText(patch.description, 5000)
+  if ('recipeYield' in patch) out.recipeYield = cleanOptionalText(patch.recipeYield, 200)
+  if ('tags' in patch) out.tags = cleanTagList(patch.tags)
+  if ('author' in patch) out.author = cleanOptionalText(patch.author, 200)
+  if ('sourceUrl' in patch) out.sourceUrl = cleanSourceUrlValue(patch.sourceUrl)
   if ('prepMinutes' in patch) out.prepMinutes = cleanMinutesValue(patch.prepMinutes)
   if ('cookMinutes' in patch) out.cookMinutes = cleanMinutesValue(patch.cookMinutes)
   return out
@@ -213,6 +283,7 @@ function replaceArray(map: Y.Map<unknown>, key: string, items: string[]): void {
 
 function snapshotIndex(doc: Y.Doc): RecipeIndexDoc {
   const recipes: Record<string, IndexEntry> = {}
+  const dropped: string[] = []
   doc.getMap(INDEX_MAP).forEach((raw, id) => {
     if (raw instanceof Y.Map) {
       const e = raw.toJSON() as IndexEntry
@@ -222,9 +293,18 @@ function snapshotIndex(doc: Y.Doc): RecipeIndexDoc {
         typeof e.updatedAt === 'string'
       ) {
         recipes[id] = { title: e.title, url: e.url, updatedAt: e.updatedAt }
+        return
       }
     }
+    dropped.push(id)
   })
+  // Integrity M13: a dropped entry is logged with its id instead of
+  // vanishing silently — the startup reconciliation pass removes it.
+  if (dropped.length > 0) {
+    console.warn(
+      `[longtable] recipe index: dropped ${dropped.length} malformed ${dropped.length === 1 ? 'entry' : 'entries'} (${dropped.join(', ')}); the startup cleanup removes them.`,
+    )
+  }
   return { recipes }
 }
 
@@ -241,6 +321,21 @@ export async function getOrCreateIndex(
     kv.setItem(INDEX_URL_KEY, url)
   }
   const doc = await getOrCreateDoc(repo, INDEX_GUID)
+  // Integrity M13: stamp the schema version on the index document so a
+  // future shape change can tell v1 data from older unversioned data.
+  // A version from a newer app is left alone (and warned about, not
+  // downgraded); only a missing or older version is stamped.
+  const meta = doc.getMap(INDEX_META_MAP)
+  const stamped = meta.get('schemaVersion')
+  if (typeof stamped !== 'number' || stamped < SCHEMA_VERSION) {
+    doc.transact(() => {
+      meta.set('schemaVersion', SCHEMA_VERSION)
+    })
+  } else if (stamped > SCHEMA_VERSION) {
+    console.warn(
+      `[longtable] recipe index was written by a newer app version (schema ${stamped}); continuing without changing it.`,
+    )
+  }
   return {
     url,
     doc: async () => snapshotIndex(doc),
@@ -266,22 +361,12 @@ export async function createRecipe(
   const id = crypto.randomUUID()
   const createdAt = timestamps?.createdAt ?? nowIso()
   const updatedAt = timestamps?.updatedAt ?? createdAt
-  // Fresh UUID: the document cannot already exist in IndexedDB.
-  const doc = await getOrCreateDoc(repo, id)
-  doc.transact(() => {
-    const map = doc.getMap(RECIPE_MAP)
-    map.set('title', input.title)
-    map.set('ingredients', strArray(input.ingredients))
-    map.set('steps', strArray(input.steps))
-    map.set('photos', strArray(input.photos))
-    map.set('createdAt', createdAt)
-    map.set('updatedAt', updatedAt)
-    if (input.visibility !== undefined) map.set('visibility', input.visibility)
-    // Only set optional fields when present.
-    if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
-    if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
-  })
-
+  // Integrity M11: index-first. The index entry is written BEFORE the
+  // document, so a crash between the two phases leaves an index entry
+  // pointing at an empty document — which the startup reconciliation
+  // pass removes — instead of an orphaned document nothing points at.
+  // If the document write itself throws, the index entry is rolled
+  // back here so no dangling entry survives even without a restart.
   const url = docUrl(id)
   const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
   const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
@@ -290,6 +375,37 @@ export async function createRecipe(
       .getMap(INDEX_MAP)
       .set(id, entryMap({ title: input.title, url, updatedAt }))
   })
+  try {
+    // Fresh UUID: the document cannot already exist in IndexedDB.
+    const doc = await getOrCreateDoc(repo, id)
+    doc.transact(() => {
+      const map = doc.getMap(RECIPE_MAP)
+      map.set('schemaVersion', SCHEMA_VERSION)
+      map.set('title', input.title)
+      map.set('ingredients', strArray(input.ingredients))
+      map.set('steps', strArray(input.steps))
+      map.set('photos', strArray(input.photos))
+      map.set('createdAt', createdAt)
+      map.set('updatedAt', updatedAt)
+      if (input.visibility !== undefined) map.set('visibility', input.visibility)
+      // Only set optional fields when present.
+      if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
+      if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
+      if (input.description !== undefined) map.set('description', input.description)
+      if (input.recipeYield !== undefined) map.set('recipeYield', input.recipeYield)
+      if (input.tags !== undefined) map.set('tags', strArray(input.tags))
+      if (input.author !== undefined) map.set('author', input.author)
+      if (input.sourceUrl !== undefined) map.set('sourceUrl', input.sourceUrl)
+    })
+  } catch (e) {
+    indexDoc.transact(() => {
+      indexDoc.getMap(INDEX_MAP).delete(id)
+    })
+    throw e
+  }
+  // Integrity M12: wait until the writes have committed before the
+  // caller reports success.
+  await flushQuietly(repo)
   return summary
 }
 
@@ -318,12 +434,18 @@ export async function restoreRecipe(
     prepMinutes: recipe.prepMinutes,
     cookMinutes: recipe.cookMinutes,
     visibility: recipe.visibility,
+    description: recipe.description,
+    recipeYield: recipe.recipeYield,
+    tags: recipe.tags,
+    author: recipe.author,
+    sourceUrl: recipe.sourceUrl,
   })
   const createdAt = typeof recipe.createdAt === 'string' && recipe.createdAt ? recipe.createdAt : nowIso()
   const updatedAt = typeof recipe.updatedAt === 'string' && recipe.updatedAt ? recipe.updatedAt : createdAt
   const doc = await getOrCreateDoc(repo, id)
   doc.transact(() => {
     const map = doc.getMap(RECIPE_MAP)
+    map.set('schemaVersion', SCHEMA_VERSION)
     map.set('title', input.title)
     map.set('ingredients', strArray(input.ingredients))
     map.set('steps', strArray(input.steps))
@@ -336,6 +458,16 @@ export async function restoreRecipe(
     else map.delete('prepMinutes')
     if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
     else map.delete('cookMinutes')
+    if (input.description !== undefined) map.set('description', input.description)
+    else map.delete('description')
+    if (input.recipeYield !== undefined) map.set('recipeYield', input.recipeYield)
+    else map.delete('recipeYield')
+    if (input.tags !== undefined) map.set('tags', strArray(input.tags))
+    else map.delete('tags')
+    if (input.author !== undefined) map.set('author', input.author)
+    else map.delete('author')
+    if (input.sourceUrl !== undefined) map.set('sourceUrl', input.sourceUrl)
+    else map.delete('sourceUrl')
   })
   const url = docUrl(id)
   const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
@@ -343,6 +475,7 @@ export async function restoreRecipe(
   indexDoc.transact(() => {
     indexDoc.getMap(INDEX_MAP).set(id, entryMap({ title: input.title, url, updatedAt }))
   })
+  await flushQuietly(repo)
   return summary
 }
 
@@ -365,6 +498,7 @@ export async function registerSharedRecipe(
       map.set(id, entryMap({ title, url, updatedAt }))
     }
   })
+  await flushQuietly(repo)
 }
 
 /** List all recipes (newest first) from the index document. */
@@ -397,6 +531,19 @@ export async function getRecipe(repo: YjsStore, url: string): Promise<Recipe | n
     ingredients: toStringArray(map.get('ingredients')),
     steps: toStringArray(map.get('steps')),
     photos: toStringArray(map.get('photos')),
+    ...(typeof map.get('description') === 'string'
+      ? { description: map.get('description') as string }
+      : {}),
+    ...(typeof map.get('recipeYield') === 'string'
+      ? { recipeYield: map.get('recipeYield') as string }
+      : {}),
+    ...(map.has('tags') ? { tags: toStringArray(map.get('tags')) } : {}),
+    ...(typeof map.get('author') === 'string'
+      ? { author: map.get('author') as string }
+      : {}),
+    ...(typeof map.get('sourceUrl') === 'string'
+      ? { sourceUrl: map.get('sourceUrl') as string }
+      : {}),
     createdAt: typeof createdAt === 'string' ? createdAt : '',
     updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
     ...(map.get('visibility') === 'friends-only'
@@ -449,9 +596,32 @@ export async function updateRecipe(
         setIfChanged('visibility', patch.visibility)
       }
     }
+    // Integrity M13: stamp the schema version on first write after
+    // versioning landed, so old documents gain it without a migration.
+    if (!map.has('schemaVersion')) map.set('schemaVersion', SCHEMA_VERSION)
     if (patch.ingredients !== undefined) replaceArray(map, 'ingredients', patch.ingredients)
     if (patch.steps !== undefined) replaceArray(map, 'steps', patch.steps)
     if (patch.photos !== undefined) replaceArray(map, 'photos', patch.photos)
+    if ('description' in patch) {
+      if (patch.description === undefined) map.delete('description')
+      else setIfChanged('description', patch.description)
+    }
+    if ('recipeYield' in patch) {
+      if (patch.recipeYield === undefined) map.delete('recipeYield')
+      else setIfChanged('recipeYield', patch.recipeYield)
+    }
+    if ('tags' in patch) {
+      if (patch.tags === undefined) map.delete('tags')
+      else replaceArray(map, 'tags', patch.tags)
+    }
+    if ('author' in patch) {
+      if (patch.author === undefined) map.delete('author')
+      else setIfChanged('author', patch.author)
+    }
+    if ('sourceUrl' in patch) {
+      if (patch.sourceUrl === undefined) map.delete('sourceUrl')
+      else setIfChanged('sourceUrl', patch.sourceUrl)
+    }
     // Optional fields are only touched when the patch explicitly mentions them,
     // so a partial patch never clobbers them; explicit `undefined` clears.
     if ('prepMinutes' in patch) {
@@ -481,6 +651,7 @@ export async function updateRecipe(
       }),
     )
   })
+  await flushQuietly(repo)
 }
 
 /**
@@ -510,4 +681,73 @@ export async function deleteRecipe(
   if (cached) {
     await cached.persistence.clearData()
   }
+  await flushQuietly(repo)
+}
+
+/**
+ * Startup index-integrity pass (integrity M11/M13). Removes index
+ * entries whose recipe document is missing or holds no recipe (the
+ * crash window the index-first create leaves behind), and entries
+ * whose shape the snapshot drops as malformed. Entries whose document
+ * cannot be read at all (an I/O error, not an empty document) are left
+ * alone — a read failure is not proof the recipe is gone. Returns the
+ * ids removed, so the caller can log them; never throws.
+ */
+export async function reconcileIndexOrphans(
+  repo: YjsStore,
+): Promise<{ checked: number; removed: string[] }> {
+  const removed: string[] = []
+  let checked = 0
+  try {
+    const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+    const map = indexDoc.getMap(INDEX_MAP)
+    const ids = [...map.keys()]
+    checked = ids.length
+    for (const id of ids) {
+      const raw = map.get(id)
+      let malformed = false
+      if (raw instanceof Y.Map) {
+        const e = raw.toJSON() as IndexEntry
+        malformed = !(
+          typeof e.title === 'string' &&
+          typeof e.url === 'string' &&
+          typeof e.updatedAt === 'string'
+        )
+      } else {
+        malformed = true
+      }
+      if (malformed) {
+        indexDoc.transact(() => {
+          map.delete(id)
+        })
+        removed.push(id)
+        continue
+      }
+      try {
+        const entry = (raw as Y.Map<unknown>).toJSON() as IndexEntry
+        const recipe = await getRecipe(repo, entry.url)
+        if (!recipe) {
+          indexDoc.transact(() => {
+            map.delete(id)
+          })
+          removed.push(id)
+        }
+      } catch (e) {
+        // Read failure, not an empty document — leave the entry alone.
+        console.warn(
+          `[longtable] index cleanup: could not read recipe ${id}; leaving it in place:`,
+          e,
+        )
+      }
+    }
+  } catch (e) {
+    console.warn('[longtable] index cleanup failed:', e)
+  }
+  if (removed.length > 0) {
+    console.warn(
+      `[longtable] startup index cleanup removed ${removed.length} orphaned ${removed.length === 1 ? 'entry' : 'entries'}: ${removed.join(', ')}`,
+    )
+    await flushQuietly(repo)
+  }
+  return { checked, removed }
 }

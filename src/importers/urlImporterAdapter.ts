@@ -4,7 +4,9 @@
  * the import UI offers it alongside file importers. In the recipe form the
  * same underlying importer is used in "prefill" mode via UrlImportDialog;
  * through the registry it creates a recipe directly, so a page with no
- * recipe title fails validation visibly instead of importing a stub.
+ * recipe title fails validation visibly instead of importing a stub —
+ * and so does a title-only page with no ingredients and no steps (M15:
+ * a bare title is not a recipe, it is a stub).
  */
 import {
   IMPORTER_API_VERSION,
@@ -25,6 +27,14 @@ export const urlImporterAdapter: RecipeImporter = {
     const url = (input.url ?? '').trim()
     if (!url) throw new ImporterError('Paste a recipe page URL first.')
     const partial = await importRecipeFromUrl(url)
+    if (
+      (partial.ingredients?.length ?? 0) === 0 &&
+      (partial.steps?.length ?? 0) === 0
+    ) {
+      throw new ImporterError(
+        `The page “${partial.title || url}” has a title but no ingredients or steps — nothing was imported. Try a recipe page, or copy the ingredients and steps by hand.`,
+      )
+    }
     return [
       {
         title: partial.title ?? '',
@@ -33,6 +43,11 @@ export const urlImporterAdapter: RecipeImporter = {
         prepMinutes: partial.prepMinutes,
         cookMinutes: partial.cookMinutes,
         photos: partial.photos ?? [],
+        ...(partial.description ? { description: partial.description } : {}),
+        ...(partial.recipeYield ? { recipeYield: partial.recipeYield } : {}),
+        ...(partial.tags ? { tags: partial.tags } : {}),
+        ...(partial.author ? { author: partial.author } : {}),
+        ...(partial.sourceUrl ? { sourceUrl: partial.sourceUrl } : {}),
       },
     ]
   },

@@ -10,6 +10,7 @@ import {
   validateImportedRecipe,
   type RecipeImporter,
 } from '../importers/contract'
+import { buildExport, serializeExport } from '../backup/export'
 import { jsonImporter } from '../importers/jsonImporter'
 import { isoDurationToMinutes, mealieImporter } from '../importers/mealieImporter'
 import {
@@ -171,13 +172,20 @@ describe('mealieImporter', () => {
     expect(out[0].ingredients).toEqual(['200 g flour', '2 eggs', '300 ml milk'])
     expect(out[0].steps).toEqual([
       'Whisk the flour and eggs.',
-      'Fry ladles of batter 2 minutes per side.',
+      // The HowToSection name is kept on its first step (M15/M21).
+      'Cooking: Fry ladles of batter 2 minutes per side.',
       'Serve warm.',
     ])
     expect(out[0].prepMinutes).toBe(10)
     expect(out[0].cookMinutes).toBe(15)
-    // The Mealie "image" file name is not imported as a photo.
+    expect(out[0].description).toBe('Fast pancakes.')
+    expect(out[0].recipeYield).toBe('4 servings')
+    expect(out[0].tags).toEqual(['easy', 'Breakfast'])
+    // The Mealie "image" file name is not imported as a photo — but it
+    // is warned about instead of dropped silently (M21).
     expect(out[0].photos).toBeUndefined()
+    expect(out[0].warnings).toHaveLength(1)
+    expect(out[0].warnings![0]).toMatch(/weeknight-pancakes\.jpg/)
   })
 
   it('derives cook time from totalTime when cookTime is absent', async () => {
@@ -296,5 +304,272 @@ describe('registry: plugin error contract (M-L)', () => {
     expect(err).toBeInstanceOf(ImporterError)
     expect((err as Error).message.length).toBe(300)
     expect((err as Error).message.startsWith('Broken export: ')).toBe(true)
+  })
+})
+
+describe('jsonImporter (M16/M-N6)', () => {
+  it('accepts the recipeIngredient alias', async () => {
+    const out = await jsonImporter.import({
+      kind: 'text',
+      text: JSON.stringify({ name: 'Alias Soup', recipeIngredient: ['water'], instructions: ['Boil'] }),
+    })
+    expect(out[0].title).toBe('Alias Soup')
+    expect(out[0].ingredients).toEqual(['water'])
+    expect(out[0].steps).toEqual(['Boil'])
+  })
+
+  it('a populated instructions list beats an empty steps list', async () => {
+    const out = await jsonImporter.import({
+      kind: 'text',
+      text: JSON.stringify({ title: 'Empty Steps', steps: [], instructions: ['Real step'] }),
+    })
+    expect(out[0].steps).toEqual(['Real step'])
+  })
+
+  it('a numeric title stringifies instead of throwing', async () => {
+    const out = await jsonImporter.import({
+      kind: 'text',
+      text: JSON.stringify({ title: 42, name: 'Named', ingredients: [], steps: [] }),
+    })
+    expect(out[0].title).toBe('42')
+  })
+
+  it('keeps description, yield, tags, author, and source URL', async () => {
+    const out = await jsonImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        title: 'Kept',
+        ingredients: [],
+        steps: [],
+        description: 'A note.',
+        recipeYield: '4 servings',
+        tags: ['soup', 'quick'],
+        author: 'Chef A',
+        sourceUrl: 'https://example.com/kept',
+      }),
+    })
+    expect(out[0].description).toBe('A note.')
+    expect(out[0].recipeYield).toBe('4 servings')
+    expect(out[0].tags).toEqual(['soup', 'quick'])
+    expect(out[0].author).toBe('Chef A')
+    expect(out[0].sourceUrl).toBe('https://example.com/kept')
+  })
+
+  it('surfaces a public record images[] as imageCids (M-N6)', async () => {
+    const out = await jsonImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        $type: 'kitchen.longtable.recipe',
+        name: 'Public Soup',
+        ingredients: ['water'],
+        instructions: ['Boil'],
+        images: [
+          { $type: 'blob', ref: { $link: 'bafyAAA' }, mimeType: 'image/jpeg', size: 10 },
+          { ref: { $link: 'bafyBBB' } },
+          { ref: 'bafyCCC' },
+          'bafyDDD',
+        ],
+      }),
+    })
+    expect(out[0].title).toBe('Public Soup')
+    expect(out[0].imageCids).toEqual(['bafyAAA', 'bafyBBB', 'bafyCCC', 'bafyDDD'])
+    expect(out[0].photos).toBeUndefined()
+  })
+
+  it('round-trips the C3 export: photos, tier, and description survive', async () => {
+    const exp = buildExport(
+      [
+        {
+          id: 'r1',
+          recipe: {
+            title: 'Export Soup',
+            ingredients: ['water'],
+            steps: ['Boil'],
+            photos: ['data:image/png;base64,xx'],
+            visibility: 'public',
+            description: 'Exported.',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      ],
+      [],
+    )
+    const out = await jsonImporter.import({ kind: 'text', text: serializeExport(exp) })
+    expect(out).toHaveLength(1)
+    expect(out[0].title).toBe('Export Soup')
+    expect(out[0].photos).toEqual(['data:image/png;base64,xx'])
+    expect(out[0].visibility).toBe('public')
+    expect(out[0].description).toBe('Exported.')
+  })
+})
+
+describe('mealieImporter (M21)', () => {
+  it('parses ISO-8601 weeks, months, and years', () => {
+    expect(isoDurationToMinutes('P1W')).toBe(10080)
+    expect(isoDurationToMinutes('P2M')).toBe(86400)
+    expect(isoDurationToMinutes('P1Y')).toBe(525600)
+    expect(isoDurationToMinutes('P1DT2H')).toBe(1560)
+  })
+
+  it('keeps a name-only HowToStep as a step', async () => {
+    const out = await mealieImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        name: 'Name Only',
+        recipeIngredient: ['x'],
+        recipeInstructions: [{ '@type': 'HowToStep', name: 'Rest the dough.' }],
+      }),
+    })
+    expect(out[0].steps).toEqual(['Rest the dough.'])
+  })
+
+  it('accepts single-string instructions', async () => {
+    const oneLine = await mealieImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        name: 'One Line',
+        recipeIngredient: ['x'],
+        recipeInstructions: 'Mix. Bake.',
+      }),
+    })
+    expect(oneLine[0].steps).toEqual(['Mix. Bake.'])
+    const multiLine = await mealieImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        name: 'Multi Line',
+        recipeIngredient: ['x'],
+        recipeInstructions: 'Mix.\nBake.',
+      }),
+    })
+    expect(multiLine[0].steps).toEqual(['Mix.', 'Bake.'])
+  })
+
+  it('does not derive cook time from totalTime when prep is unknown', async () => {
+    const out = await mealieImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        name: 'Total Only',
+        recipeIngredient: ['x'],
+        recipeInstructions: [],
+        totalTime: 'PT40M',
+      }),
+    })
+    expect(out[0].prepMinutes).toBeUndefined()
+    expect(out[0].cookMinutes).toBeUndefined()
+  })
+
+  it('keeps a web-URL image as a photo', async () => {
+    const out = await mealieImporter.import({
+      kind: 'text',
+      text: JSON.stringify({
+        name: 'Web Photo',
+        recipeIngredient: ['x'],
+        recipeInstructions: [],
+        image: 'https://example.com/p.jpg',
+      }),
+    })
+    expect(out[0].photos).toEqual(['https://example.com/p.jpg'])
+    expect(out[0].warnings).toBeUndefined()
+  })
+})
+
+describe('contract caps (M17)', () => {
+  it('rejects more than 20 photos', () => {
+    const photos = Array.from({ length: 21 }, (_, i) => `data:image/png;base64,${i}`)
+    expect(() =>
+      validateImportedRecipe({ title: 'X', ingredients: [], steps: [], photos }, 'Test'),
+    ).toThrow(/too many photos/)
+  })
+
+  it('rejects a photo over 5 MB decoded', () => {
+    const big = `data:image/jpeg;base64,${'A'.repeat(7_000_000)}`
+    expect(() =>
+      validateImportedRecipe({ title: 'X', ingredients: [], steps: [], photos: [big] }, 'Test'),
+    ).toThrow(/too large/)
+  })
+
+  it('rejects an over-long description and too many tags, drops a non-web source URL', () => {
+    expect(() =>
+      validateImportedRecipe(
+        { title: 'X', ingredients: [], steps: [], description: 'd'.repeat(5001) },
+        'Test',
+      ),
+    ).toThrow(/too long/)
+    expect(() =>
+      validateImportedRecipe(
+        { title: 'X', ingredients: [], steps: [], tags: Array.from({ length: 51 }, (_, i) => `t${i}`) },
+        'Test',
+      ),
+    ).toThrow(/too many "tags"/)
+    const out = validateImportedRecipe(
+      { title: 'X', ingredients: [], steps: [], sourceUrl: 'ftp://example.com/r' },
+      'Test',
+    )
+    expect(out.sourceUrl).toBeUndefined()
+  })
+})
+
+describe('registry: warnings, run cap, image-CID resolution (M17/M-N6)', () => {
+  registerImporter({
+    apiVersion: IMPORTER_API_VERSION,
+    id: 'test-warner',
+    name: 'Warner',
+    accepts: ['text'],
+    import: () => [
+      { title: 'W', ingredients: [], steps: [], warnings: ['Careful now.'] },
+    ],
+  })
+  registerImporter({
+    apiVersion: IMPORTER_API_VERSION,
+    id: 'test-cid-holder',
+    name: 'CID holder',
+    accepts: ['text'],
+    import: () => [
+      { title: 'C', ingredients: [], steps: [], imageCids: ['cid1', 'cid2'] },
+    ],
+  })
+
+  it('surfaces importer warnings alongside the recipes', async () => {
+    const { recipes, warnings } = await runImporter('test-warner', {
+      kind: 'text',
+      text: 'x',
+    })
+    expect(recipes).toHaveLength(1)
+    expect(warnings).toEqual(['Careful now.'])
+  })
+
+  it('resolves image CIDs through the caller resolver (M-N6)', async () => {
+    const { recipes, warnings } = await runImporter('test-cid-holder', {
+      kind: 'text',
+      text: 'x',
+      resolveImageCid: async (cid: string) => `data:image/jpeg;base64,${cid}`,
+    })
+    expect(recipes[0].photos).toEqual([
+      'data:image/jpeg;base64,cid1',
+      'data:image/jpeg;base64,cid2',
+    ])
+    expect(warnings).toEqual([])
+  })
+
+  it('warns when image CIDs cannot be resolved (M-N6)', async () => {
+    const { recipes, warnings } = await runImporter('test-cid-holder', {
+      kind: 'text',
+      text: 'x',
+    })
+    expect(recipes[0].photos).toEqual([])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/2 photos.*couldn't fetch/)
+  })
+
+  it('rejects a run with more than 500 recipes', async () => {
+    const many = Array.from({ length: 501 }, (_, i) => ({
+      title: `R${i}`,
+      ingredients: [],
+      steps: [],
+    }))
+    await expect(
+      runImporter('longtable-json', { kind: 'text', text: JSON.stringify(many) }),
+    ).rejects.toThrow(/at most 500/)
   })
 })
