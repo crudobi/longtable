@@ -66,7 +66,8 @@ the socket reconnects automatically after a drop.
 5. Verify every recipe's **device signature** (`device-signature.mjs`,
    the same scheme as `src/public/publish.ts` and the independent
    verifier in `scripts/verify-public` — same canonical BLAKE2b-256 hash,
-   same `longtable-pubkey:v1` / `longtable-recipe:v1` messages, same
+   same `longtable-pubkey:v1` / `longtable-recipe:v2` messages (v1 recipe
+   messages still accepted as the legacy form), same
    libsodium Ed25519 `verifyDetached`): load ALL of the author's
    `kitchen.longtable.pubkey` bindings from the same verified CAR — one
    record per device at its per-device rkey
@@ -224,7 +225,9 @@ object carries `deviceDid` (the author's Longtable device DID, a
 `did:key:z...` Ed25519 DID, exactly as in the recipe record),
 `deviceSignature` (standard padded base64 Ed25519 detached signature,
 exactly as in the recipe record, over
-`longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>` where
+`longtable-recipe:v2\n<accountDid>\n<longtableId>\n<hashHex>\n<createdAt>`
+— v1, the same string without the `createdAt` line, is still accepted
+for records published before v2 — where
 `hashHex` is the BLAKE2b-256 hex of the canonical JSON array — see
 `device-signature.mjs`), and `deviceKey` (standard padded base64 of the
 32-byte Ed25519 device public key — byte-identical to the `devicePublicKey`

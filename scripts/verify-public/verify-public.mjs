@@ -186,11 +186,17 @@ function devicePublicKeyFromDid(deviceDid) {
   return raw.slice(2)
 }
 
+// L-N4: every image ref must be a {$link} blob reference carrying a
+// string CID. Anything else throws — the signer never emits that shape,
+// so a record carrying one has no well-defined hash. Callers treat the
+// throw as a verification failure, never as a crash: modeVerify wraps
+// the signature check (see below), so a malformed record FAILs the
+// check instead of aborting the audit.
 function imageCid(img) {
   const ref = img?.ref
-  if (!ref) return ''
-  if (typeof ref.$link === 'string') return ref.$link
-  return String(ref)
+  if (!ref) throw new Error('image ref is not a {$link} blob reference')
+  if (typeof ref.$link === 'string' && ref.$link) return ref.$link
+  throw new Error('image ref is not a {$link} blob reference')
 }
 
 function canonicalHashHex(record) {
@@ -209,10 +215,42 @@ function canonicalHashHex(record) {
   return sodium.to_hex(hash)
 }
 
+// Sec L11: the signed message is v2 (bound to the record's createdAt),
+// with a v1 fallback for records published before v2. A v2 signature
+// never verifies under v1 (the messages differ), so accepting v1 cannot
+// downgrade a v2-signed record — it only keeps old publications
+// verifiable. Returns false (never throws) for an unverifiable record,
+// including one whose hash cannot be computed (L-N4).
 function verifyDeviceSignature(record, accountDid, devicePubKey) {
-  const msg = `longtable-recipe:v1\n${accountDid}\n${record.longtableId}\n${canonicalHashHex(record)}`
-  const sig = sodium.from_base64(record.deviceSignature, sodium.base64_variants.ORIGINAL)
-  return sodium.crypto_sign_verify_detached(sig, sodium.from_string(msg), devicePubKey)
+  let hashHex
+  try {
+    hashHex = canonicalHashHex(record)
+  } catch {
+    return false
+  }
+  let sig
+  try {
+    sig = sodium.from_base64(record.deviceSignature, sodium.base64_variants.ORIGINAL)
+  } catch {
+    return false
+  }
+  const messages = []
+  if (typeof record.createdAt === 'string' && record.createdAt) {
+    messages.push(
+      `longtable-recipe:v2\n${accountDid}\n${record.longtableId}\n${hashHex}\n${record.createdAt}`,
+    )
+  }
+  messages.push(`longtable-recipe:v1\n${accountDid}\n${record.longtableId}\n${hashHex}`)
+  for (const msg of messages) {
+    try {
+      if (sodium.crypto_sign_verify_detached(sig, sodium.from_string(msg), devicePubKey)) {
+        return true
+      }
+    } catch {
+      // A verify that throws is a failed verify, not a pass.
+    }
+  }
+  return false
 }
 
 /* ---------------- modes --------------------------------------------------- */
@@ -373,10 +411,12 @@ async function modeForgeSelftest(did, rkey) {
   }
   pass('genuine signature verifies (selftest precondition)')
 
-  // Forge 1: attacker re-signs the genuine content with THEIR key.
+  // Forge 1: attacker re-signs the genuine content with THEIR key, over
+  // the current (v2) message — the shape a real attacker would forge
+  // today. The key is wrong, so it must fail under both messages.
   const attacker = sodium.crypto_sign_keypair()
   const msg = sodium.from_string(
-    `longtable-recipe:v1\n${did}\n${record.longtableId}\n${canonicalHashHex(record)}`,
+    `longtable-recipe:v2\n${did}\n${record.longtableId}\n${canonicalHashHex(record)}\n${record.createdAt}`,
   )
   const forgedSig = sodium.crypto_sign_detached(msg, attacker.privateKey)
   if (!sodium.crypto_sign_verify_detached(forgedSig, msg, devicePubKey)) {

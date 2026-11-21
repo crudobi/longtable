@@ -16,11 +16,13 @@
  *      `longtable-pubkey:v1\n<accountDid>\n<deviceDid>\n<devicePublicKey>`.
  *   2. Each recipe record carries `deviceDid` + `deviceSignature` — the
  *      detached Ed25519 signature over
- *      `longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>`, where
- *      `hashHex` is the BLAKE2b-256 hex of the canonical JSON array
- *      (see canonicalRecipeHashHex). A recipe verifies against ITS OWN
- *      device's binding — a second device publishing never un-indexes
- *      the first device's recipes.
+ *      `longtable-recipe:v2\n<accountDid>\n<longtableId>\n<hashHex>\n<createdAt>`,
+ *      where `hashHex` is the BLAKE2b-256 hex of the canonical JSON array
+ *      (see canonicalRecipeHashHex). The v1 message (same string without
+ *      the createdAt line) is still accepted for records published
+ *      before v2. A recipe verifies against ITS OWN device's binding —
+ *      a second device publishing never un-indexes the first device's
+ *      recipes.
  *
  * This module is a port of the same checks in the independent verifier
  * (scripts/verify-public/verify-public.mjs) — same canonical hash, same
@@ -55,12 +57,24 @@ async function ready() {
 
 /* ---------------- canonical hash (== publish.ts / verify-public) -------- */
 
-/** The image $link strings of a record, in order (canonical-hash input). */
+/**
+ * The image $link strings of a record, in order (canonical-hash input).
+ *
+ * L-N4: every image ref must be a `{$link}` blob reference carrying a
+ * string CID. Anything else THROWS (a bare string ref, a missing ref,
+ * a non-string $link) — the signer never emits that shape, so the hash
+ * of such a record is undefined by construction. verifyRecipeDeviceSignature
+ * catches the throw and rejects the record as unhashable, which is the
+ * ingest rejection the finding asks for: the record never indexes.
+ * (The old `String(ref)` fallback hashed a bare-string ref AS its own
+ * CID while the signer hashed it as `undefined` — the same record
+ * verified differently on each side.)
+ */
 function imageCid(img) {
   const ref = img?.ref
-  if (!ref) return ''
-  if (typeof ref.$link === 'string') return ref.$link
-  return String(ref)
+  if (!ref) throw new Error('image ref is not a {$link} blob reference')
+  if (typeof ref.$link === 'string' && ref.$link) return ref.$link
+  throw new Error('image ref is not a {$link} blob reference')
 }
 
 /**
@@ -68,7 +82,8 @@ function imageCid(img) {
  * Field order and defaults are load-bearing — they must match
  * publish.ts `canonicalRecipeHash` exactly: timestamps, mime/size and
  * $type are NOT in the hash (scope decision: changing the message format
- * is out of scope for the C2 fix).
+ * is out of scope for the C2 fix). The signed MESSAGE is v2 (Sec L11)
+ * — see recipeSignatureMessage; the hash itself is unchanged.
  */
 export function canonicalRecipeHashHex(record) {
   const canonical = JSON.stringify([
@@ -86,8 +101,17 @@ export function canonicalRecipeHashHex(record) {
   return sodium.to_hex(hash)
 }
 
-/** The exact UTF-8 payload signed for a recipe record. */
-export function recipeSignatureMessage(accountDid, longtableId, hashHex) {
+/**
+ * The exact UTF-8 payload signed for a recipe record (Sec L11, v2):
+ * the signature binds the record's `createdAt` as well as the account,
+ * the recipe id, and the content hash.
+ */
+export function recipeSignatureMessage(accountDid, longtableId, hashHex, createdAt) {
+  return `longtable-recipe:v2\n${accountDid}\n${longtableId}\n${hashHex}\n${createdAt}`
+}
+
+/** The pre-v2 recipe message (no createdAt line), accepted as the legacy form. */
+export function legacyRecipeSignatureMessage(accountDid, longtableId, hashHex) {
   return `longtable-recipe:v1\n${accountDid}\n${longtableId}\n${hashHex}`
 }
 
@@ -301,7 +325,10 @@ export async function verifyPubkeyBindings(accountDid, records) {
  * device; the record has a well-formed 64-byte deviceSignature; the
  * signature verifies against the bound key over the recipe message for
  * the recomputed canonical hash of the record AS SERVED (so any content
- * change after signing fails).
+ * change after signing fails). The message is v2 (Sec L11, bound to
+ * createdAt) with a v1 fallback for records published before v2; a
+ * record whose hash cannot be computed (L-N4, non-{$link} image ref)
+ * is rejected as unhashable-record and never indexes.
  */
 export async function verifyRecipeDeviceSignature(accountDid, record, binding) {
   await ready()
@@ -323,15 +350,33 @@ export async function verifyRecipeDeviceSignature(accountDid, record, binding) {
   } catch {
     return { ok: false, reason: 'unhashable-record' }
   }
-  let ok = false
-  try {
-    ok = sodium.crypto_sign_verify_detached(
-      sig,
-      sodium.from_string(recipeSignatureMessage(accountDid, record.longtableId, hashHex)),
-      binding.devicePublicKeyBytes,
+  // Sec L11: v2 first (the signer emits v2), v1 as the legacy fallback
+  // for records published before v2. A v2 signature never verifies
+  // under v1 (the messages differ), so accepting v1 cannot downgrade
+  // a v2-signed record — it only keeps old publications indexed.
+  const messages = []
+  if (typeof record.createdAt === 'string' && record.createdAt) {
+    messages.push(
+      recipeSignatureMessage(accountDid, record.longtableId, hashHex, record.createdAt),
     )
-  } catch {
-    ok = false
+  }
+  messages.push(legacyRecipeSignatureMessage(accountDid, record.longtableId, hashHex))
+  let ok = false
+  for (const message of messages) {
+    try {
+      if (
+        sodium.crypto_sign_verify_detached(
+          sig,
+          sodium.from_string(message),
+          binding.devicePublicKeyBytes,
+        )
+      ) {
+        ok = true
+        break
+      }
+    } catch {
+      // A verify that throws is a failed verify, not a pass.
+    }
   }
   return ok ? { ok: true } : { ok: false, reason: 'recipe-signature-invalid' }
 }

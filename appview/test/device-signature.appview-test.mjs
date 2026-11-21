@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import {
   canonicalRecipeHashHex,
   recipeSignatureMessage,
+  legacyRecipeSignatureMessage,
   pubkeyBindingMessage,
   pubkeyRkeyForDeviceDid,
   base58Decode,
@@ -69,7 +70,11 @@ function recipeRecord(device, extra = {}) {
   return {
     ...record,
     deviceDid: device.deviceDid,
-    deviceSignature: signMsg(device, recipeSignatureMessage(DID, record.longtableId, hashHex)),
+    // Sec L11: the signer emits the v2 message, bound to createdAt.
+    deviceSignature: signMsg(
+      device,
+      recipeSignatureMessage(DID, record.longtableId, hashHex, record.createdAt),
+    ),
   }
 }
 
@@ -98,8 +103,10 @@ describe('canonical recipe hash', () => {
   it('leaves timestamps, mime/size and $type out of the hash (scope decision)', () => {
     const a = recipeRecord(makeDevice())
     const b = { ...a, createdAt: '2031-01-01T00:00:00.000Z', $type: 'kitchen.longtable.recipe' }
-    // Same content fields -> same hash even though the signature over it
-    // still verifies (the verifier recomputes from the served record).
+    // Same content fields -> same hash. The hash is NOT the whole
+    // story under v2, though: the signature ALSO binds createdAt, so
+    // b's signature (signed over a's createdAt) does not verify b —
+    // see 'rejects a v2 signature transplanted to another createdAt'.
     expect(canonicalRecipeHashHex(a)).toBe(canonicalRecipeHashHex(b))
   })
 })
@@ -300,10 +307,55 @@ describe('recipe device-signature verification', () => {
     const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
     const record = recipeRecord(device)
     const hashHex = canonicalRecipeHashHex(record)
-    record.deviceSignature = signMsg(attacker, recipeSignatureMessage(DID, record.longtableId, hashHex))
+    record.deviceSignature = signMsg(
+      attacker,
+      recipeSignatureMessage(DID, record.longtableId, hashHex, record.createdAt),
+    )
     const res = await verifyRecipeDeviceSignature(DID, record, binding)
     expect(res.ok).toBe(false)
     expect(res.reason).toBe('recipe-signature-invalid')
+  })
+
+  it('accepts a legacy v1 signature (Sec L11: pre-v2 records stay verifiable)', async () => {
+    const device = makeDevice()
+    const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
+    const record = recipeRecord(device)
+    const hashHex = canonicalRecipeHashHex(record)
+    record.deviceSignature = signMsg(
+      device,
+      legacyRecipeSignatureMessage(DID, record.longtableId, hashHex),
+    )
+    const res = await verifyRecipeDeviceSignature(DID, record, binding)
+    expect(res).toEqual({ ok: true })
+  })
+
+  it('rejects a v2 signature transplanted to a different createdAt (Sec L11 replay case)', async () => {
+    const device = makeDevice()
+    const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
+    const record = recipeRecord(device)
+    // Same content, same signature — only the creation time moved.
+    // The v2 message binds createdAt, so the signature must not
+    // verify the copy; and it cannot fall back to v1 either, because
+    // the v2 message differs from the v1 message.
+    record.createdAt = '2099-01-01T00:00:00.000Z'
+    const res = await verifyRecipeDeviceSignature(DID, record, binding)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('recipe-signature-invalid')
+  })
+
+  it('rejects a non-{$link} image ref as unhashable (L-N4)', async () => {
+    const device = makeDevice()
+    const binding = await verifyPubkeyBinding(DID, bindingRecord(device))
+    // A bare-string ref: the signer never emits this shape, so the
+    // record has no well-defined hash — it is rejected at ingest,
+    // never indexed, and never crashes the verifier. (The images are
+    // swapped in AFTER signing: the helper hashes the record to sign
+    // it, and hashing a bare-string ref throws by design.)
+    const record = recipeRecord(device)
+    record.images = [{ ref: 'bafyimg1' }]
+    const res = await verifyRecipeDeviceSignature(DID, record, binding)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('unhashable-record')
   })
 
   it('rejects a recipe whose deviceDid is not the bound device', async () => {

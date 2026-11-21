@@ -16,6 +16,16 @@
  * no secret and still join passwordless: they stay exactly as open as
  * they always were (see parseSharePayload).
  *
+ * Snapshot plaintext (Sec L3, intended): the embedded snapshot is the
+ * recipe itself in plaintext — a QR guest holds no key yet, so there is
+ * nothing to decrypt it with, and the snapshot IS the thing being
+ * shared. Anyone holding the code can read the recipe; the secret
+ * protects the LIVE room (later edits), not the snapshot. The snapshot
+ * is schema-checked instead: parseSharePayload validates its keys on a
+ * scratch doc and joinShare validates again on the real doc
+ * (validateSharedDoc), so a crafted code cannot smuggle unknown
+ * fields into the guest's store.
+ *
  * Shares persist in the secure store (Keystore on Android, localStorage
  * on web — see src/secrets/secretStore.ts) and are rejoined on every
  * launch, so peers reconnect after app restarts (this is also what
@@ -152,6 +162,33 @@ export function roomForRecipe(recipeId: string): string {
 }
 
 /**
+ * The only keys a shared recipe doc may carry (Sec L3). Exactly the
+ * keys createRecipe / updateRecipe write (src/store/recipes.ts) — a
+ * snapshot naming any other key is a crafted doc, not a recipe this
+ * app produced. This matters because getRecipe reads `visibility`
+ * straight off the map: without the allowlist a crafted snapshot
+ * could stamp a guest's local copy `visibility: 'public'` (or any
+ * other field the render path trusts) before it is ever listed.
+ */
+const SHARED_DOC_KEYS = new Set([
+  'schemaVersion',
+  'title',
+  'ingredients',
+  'steps',
+  'photos',
+  'createdAt',
+  'updatedAt',
+  'visibility',
+  'prepMinutes',
+  'cookMinutes',
+  'description',
+  'recipeYield',
+  'tags',
+  'author',
+  'sourceUrl',
+])
+
+/**
  * Validate the content of a shared recipe doc before it is registered
  * (S9). A share snapshot is unauthenticated bytes from a QR code or a
  * pasted string: a crafted code could carry a non-string title, huge
@@ -161,9 +198,19 @@ export function roomForRecipe(recipeId: string): string {
  * importer and store caps). Throws on anything that cannot be safely
  * listed; an over-long title alone is truncated, not refused, so a
  * pre-fix recipe with a long title still joins.
+ *
+ * Sec L3: the snapshot's keys are schema-checked too — any map key
+ * outside SHARED_DOC_KEYS is refused, on parse (parseSharePayload
+ * applies the snapshot to a scratch doc and calls this) and on apply
+ * (joinShare calls this after applying the snapshot to the real doc).
  */
 export function validateSharedDoc(doc: Y.Doc): string {
   const map = doc.getMap(RECIPE_MAP)
+  for (const key of map.keys()) {
+    if (!SHARED_DOC_KEYS.has(key)) {
+      throw new Error(`That share code carries an unknown recipe field (${key}).`)
+    }
+  }
   const title = map.get('title')
   if (typeof title !== 'string' || !title.trim()) {
     throw new Error('That share code does not contain a readable recipe.')
@@ -479,6 +526,19 @@ export async function joinShare(payload: SharePayload): Promise<void> {
     if (estimatedDecodedBytes(payload.snapshot) > MAX_SNAPSHOT_BYTES) {
       throw new Error('That share code carries a snapshot that is too large.')
     }
+    // Sec L3: validate the snapshot on a SCRATCH doc before it touches
+    // the real doc or the room is joined — a crafted snapshot must
+    // leave nothing behind: no provider, no share record, and no
+    // content in the guest's store. (Parse-time callers already did
+    // this on their own scratch doc; this covers programmatic callers
+    // that skip parsing.)
+    const scratch = new Y.Doc()
+    try {
+      Y.applyUpdate(scratch, base64ToU8(payload.snapshot))
+      validateSharedDoc(scratch)
+    } finally {
+      scratch.destroy()
+    }
     Y.applyUpdate(doc, base64ToU8(payload.snapshot))
   }
   await joinRoom(payload.room, doc, payload.signaling, payload.secret)
@@ -583,6 +643,25 @@ export function parseSharePayload(text: string): SharePayload {
     typeof o.title !== 'string'
   ) {
     throw new Error('That code is not a valid Longtable share invitation.')
+  }
+  // Sec L3: the envelope is schema-checked too — an unknown top-level
+  // key is a forged or corrupted code, not a newer payload (the only
+  // keys this build mints are the SharePayload fields). Unknown keys
+  // are refused rather than silently ignored.
+  const knownKeys = new Set([
+    'v',
+    'room',
+    'signaling',
+    'recipeId',
+    'title',
+    'snapshot',
+    'secret',
+    'upgradedFromLegacy',
+  ])
+  for (const key of Object.keys(o)) {
+    if (!knownKeys.has(key)) {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    }
   }
   // The room is a pure function of the recipe id (roomForRecipe). A
   // payload whose room disagrees is forged or corrupted — accepting it

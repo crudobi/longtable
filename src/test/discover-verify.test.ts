@@ -32,6 +32,7 @@ import {
   signRecipeRecord,
   type PublishableRecipe,
 } from '../public/publish'
+import { type AtprotoBlob } from '../public/atproto'
 import { identityFromSeed, signDetached, type Identity } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
 
@@ -41,6 +42,11 @@ const OTHER_SEED = new Uint8Array(32).fill(8)
 const APPVIEW = 'http://localhost:3210'
 const PDS_URL = 'http://localhost:2583'
 const PLC_URL = 'https://plc.directory'
+
+/** A real blob object (Int L4): buildRecipeRecord no longer fabricates one. */
+function blob(cid: string): AtprotoBlob {
+  return { $type: 'blob', ref: { $link: cid }, mimeType: 'image/png', size: 8 }
+}
 
 function fixtureRecipe(): PublishableRecipe {
   return {
@@ -64,7 +70,7 @@ function fixtureRecipe(): PublishableRecipe {
 async function signedServedRecord(
   identity: Identity,
 ): Promise<Record<string, unknown>> {
-  const unsigned = buildRecipeRecord(fixtureRecipe(), ACCT, ['bafyimg1'])
+  const unsigned = buildRecipeRecord(fixtureRecipe(), ACCT, [blob('bafyimg1')])
   const deviceSignature = await signRecipeRecord(identity, ACCT, unsigned)
   return {
     uri: `at://${ACCT}/kitchen.longtable.recipe/recipe-1`,

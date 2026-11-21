@@ -133,14 +133,55 @@ describe('hub registry', () => {
       name: legacyMatchHash('Old Test Hub'),
       credential: legacyMatchHash('old-test-credential'),
     }
+    // S23: a renamed legacy hub proves itself by its credential — the
+    // name no longer matches, so the burned credential is the evidence
+    // the migration requires. A real renamed legacy entry still carries
+    // the burned credential (nothing else rotates it).
     const reg: HubRegistry = {
-      hubs: [{ ...DEFAULT_HUB, id: oldId, name: 'My kitchen hub' }],
+      hubs: [
+        {
+          ...DEFAULT_HUB,
+          id: oldId,
+          name: 'My kitchen hub',
+          turnCredential: 'old-test-credential',
+        },
+      ],
       activeId: oldId,
     }
     expect(migrateLegacyDefaultHub(reg, hashes)).toBe(true)
     expect(reg.hubs[0].id).toBe(DEFAULT_HUB.id)
     expect(reg.hubs[0].name).toBe('My kitchen hub')
+    expect(reg.hubs[0].turnCredential).toBeUndefined()
     expect(reg.activeId).toBe(DEFAULT_HUB.id)
+  })
+
+  it('legacy migration refuses an id-digest-only collision (S23)', () => {
+    // The id digest matches the legacy set, but neither the name nor
+    // the credential does: this is a user hub that happens to share
+    // the 64-bit id digest, not the legacy hub. It must be left
+    // exactly as configured — id, name, credential, and activeId.
+    const oldId = 'old-test-hub'
+    const hashes = {
+      id: legacyMatchHash(oldId),
+      name: legacyMatchHash('Old Test Hub'),
+      credential: legacyMatchHash('old-test-credential'),
+    }
+    const reg: HubRegistry = {
+      hubs: [
+        {
+          ...DEFAULT_HUB,
+          id: oldId,
+          name: 'My kitchen hub',
+          turnCredential: 'my-own-credential',
+        },
+      ],
+      activeId: oldId,
+    }
+    expect(migrateLegacyDefaultHub(reg, hashes)).toBe(false)
+    expect(reg.hubs[0].id).toBe(oldId)
+    expect(reg.hubs[0].name).toBe('My kitchen hub')
+    expect(reg.hubs[0].turnCredential).toBe('my-own-credential')
+    expect(reg.activeId).toBe(oldId)
   })
 
   it('legacy migration leaves non-legacy entries untouched', () => {

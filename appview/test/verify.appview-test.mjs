@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { parseDidKey, Secp256k1Keypair } from '@atproto/crypto'
-import { createVerifiedRepoProvider, extractSigningDidKey, MAX_CAR_BYTES } from '../verify.mjs'
+import { createVerifiedRepoProvider, extractSigningDidKey, MAX_CAR_BYTES, MAX_DID_DOC_BYTES } from '../verify.mjs'
 import { RecipeIndex } from '../db.mjs'
 import { createIngestor } from '../ingest.mjs'
 
@@ -59,6 +59,21 @@ describe('extractSigningDidKey', () => {
       }),
     ).toBeUndefined()
   })
+
+  it('refuses a doc whose only method is not #atproto (Sec L17: no methods[0] fallback)', async () => {
+    const keypair = await Secp256k1Keypair.create({ exportable: true })
+    const mb = keypair.did().replace('did:key:', '')
+    const doc = {
+      id: 'did:plc:onlyauth',
+      verificationMethod: [
+        { id: 'did:plc:onlyauth#authentication', type: 'Multikey', controller: 'did:plc:onlyauth', publicKeyMultibase: mb },
+      ],
+    }
+    // The key itself is perfectly valid — it is simply the WRONG key
+    // for repo signing. The old methods[0] fallback would have
+    // returned it as the signing key.
+    expect(extractSigningDidKey(doc)).toBeUndefined()
+  })
 })
 
 describe('createVerifiedRepoProvider resource bounds', () => {
@@ -72,6 +87,47 @@ describe('createVerifiedRepoProvider resource bounds', () => {
 
   it('has a sane production CAR cap (100 MiB)', () => {
     expect(MAX_CAR_BYTES).toBe(100 * 1024 * 1024)
+  })
+
+  it('has a sane DID-document cap (1 MiB, Sec L17)', () => {
+    expect(MAX_DID_DOC_BYTES).toBe(1 * 1024 * 1024)
+  })
+
+  it('percent-encodes the DID in the PLC URL (Sec L17)', async () => {
+    const seen = []
+    const fetchImpl = async (url) => {
+      seen.push(url)
+      if (url.startsWith('http://plc.test/')) return plcRes()
+      return new Response('not found', { status: 404 })
+    }
+    const provider = createVerifiedRepoProvider({
+      pdsUrl: 'http://pds.test',
+      plcUrl: 'http://plc.test',
+      fetchImpl,
+    })
+    // The CAR fetch 404s — the assertion is the PLC URL itself.
+    await expect(provider(DID)).rejects.toThrow(/getRepo for .* failed: HTTP 404/)
+    const plcUrl = seen.find((u) => u.startsWith('http://plc.test/'))
+    expect(plcUrl).toBe(`http://plc.test/${encodeURIComponent(DID)}`)
+  })
+
+  it('rejects an oversize DID-document body (Sec L17)', async () => {
+    const fetchImpl = async (url) => {
+      if (url.startsWith('http://plc.test/')) {
+        return new Response(new Uint8Array(2048), {
+          status: 200,
+          headers: { 'content-length': '2048' },
+        })
+      }
+      return plcRes()
+    }
+    const provider = createVerifiedRepoProvider({
+      pdsUrl: 'http://pds.test',
+      plcUrl: 'http://plc.test',
+      fetchImpl,
+      maxDidDocBytes: 1024,
+    })
+    await expect(provider(DID)).rejects.toThrow(/DID document for .* exceeds the 1024-byte cap/)
   })
 
   it('rejects a CAR whose declared size exceeds the cap', async () => {

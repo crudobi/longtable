@@ -12,6 +12,7 @@
 import { getRepo } from './store/repo'
 import { deleteRecipe, getOrCreateIndex, updateRecipe } from './store/recipes'
 import { leaveShare } from './p2p/share'
+import { getRecipeKey } from './friends/shelf'
 import { unshareRecipeEverywhere } from './friends/service'
 import {
   ensurePubkeyBinding,
@@ -74,6 +75,34 @@ export const TOMBSTONE_NOTICE =
 export const PUBLIC_LIVE_NOTICE =
   'The public copy could not be removed because no publishing account ' +
   'is signed in on this device — it may still be listed publicly.'
+
+/**
+ * Int L14 — the friends-only → public notice. Going public does NOT
+ * end the encrypted friends-only shares: the content is public now,
+ * so the friends channel is redundant but harmless, and ending it
+ * would DESTROY the friends' copies (the tombstone recall) for a
+ * visibility widening, not a narrowing. That is the intended behavior
+ * — and it is flagged, not silent: this notice goes into the warnings
+ * the UI shows and the localhost API returns, so the user knows the
+ * friends copies stay live and that ending one is a separate explicit
+ * unshare. The vault's authorized-friend set is the signal: a friend
+ * listed there holds a live share (the startup sweep republishes any
+ * share whose publish failed, so the set and the live shares agree).
+ */
+export const FRIENDS_SHARES_LIVE_NOTICE =
+  'This recipe stays shared with friends through their encrypted copies — ' +
+  'they keep receiving updates there. Stop sharing it with a friend to end that copy.'
+
+/** The Int L14 notice when this flip leaves friends shares live, else null. */
+export function friendsSharesLiveNotice(
+  id: string,
+  recipe: Recipe,
+  kv: KeyValueStore,
+): string | null {
+  if (recipe.visibility !== 'friends-only') return null
+  const sharedWith = getRecipeKey(id, kv)?.friends ?? []
+  return sharedWith.length > 0 ? FRIENDS_SHARES_LIVE_NOTICE : null
+}
 
 function publicationOf(id: string, ctx: FlowContext) {
   return ctx.publicationsKv ? getPublication(id, ctx.publicationsKv) : getPublication(id)
@@ -152,7 +181,11 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
  *                  pubkey binding, publish the signed record to the
  *                  PDS, only then mark the recipe 'public'. The P2P room
  *                  is untouched: it is a separate channel the user
- *                  started, and the content is public anyway.
+ *                  started, and the content is public anyway. The
+ *                  encrypted friends-only shares are likewise left
+ *                  live on purpose (Int L14) — ending them would
+ *                  destroy friends' copies — and the flip returns a
+ *                  warning saying so when any are live.
  *   → private:     unpublish the ATProto record first (if any); strip
  *                  friends-only shares everywhere (if friends-only);
  *                  leave the P2P room; then mark 'private'.
@@ -217,6 +250,11 @@ export async function applyVisibilityFlow(
     await ensurePubkeyBinding(client, session, idn)
     await publishRecipe(client, session, idn, { ...recipe, id })
     await updateRecipe(repo, index, id, { visibility: 'public' })
+    // Int L14: the friends shares stay live on purpose (see
+    // FRIENDS_SHARES_LIVE_NOTICE) — flag it in the returned warnings
+    // (UI + localhost API) rather than silently keeping them.
+    const liveNotice = friendsSharesLiveNotice(id, recipe, ctx.kv ?? secretKv)
+    if (liveNotice) warnings.push(liveNotice)
   } else if (tier === 'private') {
     await unpublishIfNeeded()
     if (recipe.visibility === 'friends-only' && idn) {

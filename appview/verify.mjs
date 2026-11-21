@@ -58,6 +58,12 @@ import { parseDidKey, formatDidKey, multibaseToBytes } from '@atproto/crypto'
  * normalization only: the result is validated with parseDidKey, and the
  * actual signature check still happens in verifyRepoCar — a wrong guess
  * fails verification and indexes nothing.
+ *
+ * Sec L17 / Int L3: only the #atproto verification method is ever
+ * used. A doc with no #atproto method yields nothing — there used to
+ * be a fallback to `methods[0]`, which would have accepted ANY first
+ * verification method (e.g. an authentication key) as the repo signing
+ * key when no #atproto method existed.
  */
 export function extractSigningDidKey(didDoc) {
   try {
@@ -70,9 +76,9 @@ export function extractSigningDidKey(didDoc) {
     // fall through to manual extraction / legacy normalization
   }
   const methods = Array.isArray(didDoc?.verificationMethod) ? didDoc.verificationMethod : []
-  const vm =
-    methods.find((m) => typeof m?.id === 'string' && m.id.endsWith('#atproto')) ?? methods[0]
-  const mb = vm?.publicKeyMultibase
+  const vm = methods.find((m) => typeof m?.id === 'string' && m.id.endsWith('#atproto'))
+  if (!vm) return undefined
+  const mb = vm.publicKeyMultibase
   if (!mb) return undefined
 
   const direct = `did:key:${mb}`
@@ -116,6 +122,15 @@ export function extractSigningDidKey(didDoc) {
  * is checked first; the streamed read aborts the moment the cap is
  * crossed). Without a cap, one huge repo could OOM the AppView. */
 export const MAX_CAR_BYTES = 100 * 1024 * 1024
+/**
+ * Hard cap on a fetched DID document: 1 MiB (Sec L17 / Int L3). A DID
+ * doc is a few hundred bytes of JSON; the old code parsed it with an
+ * uncapped `docRes.json()`, so a hostile PLC could make the AppView
+ * buffer an unbounded body — the same hole the 100 MiB CAR cap closes
+ * for repos, at 1/100th the scale because a DID doc has no business
+ * being anywhere near that large.
+ */
+export const MAX_DID_DOC_BYTES = 1 * 1024 * 1024
 /** Per-fetch timeout for the PLC and PDS calls: a hung upstream must
  * fail this repo's reconcile (counted as a rejection), never stall the
  * shared reconcile queue behind it forever. */
@@ -162,6 +177,7 @@ export function createVerifiedRepoProvider({
   plcUrl,
   fetchImpl = fetch,
   maxCarBytes = MAX_CAR_BYTES,
+  maxDidDocBytes = MAX_DID_DOC_BYTES,
   fetchTimeoutMs = FETCH_TIMEOUT_MS,
 } = {}) {
   if (!pdsUrl) throw new Error('createVerifiedRepoProvider: pdsUrl is required')
@@ -169,11 +185,21 @@ export function createVerifiedRepoProvider({
 
   return async function getVerifiedRepoState(did) {
     // 1. DID document -> signing key
-    const docRes = await fetchImpl(`${plcUrl}/${did}`, {
+    // Sec L17 / Int L3: the DID is URL-encoded (a raw DID in the path
+    // is an injection-shaped interpolation), and the doc body is read
+    // through the same capped reader as the CAR — never an uncapped
+    // .json() — then parsed explicitly so a non-JSON body fails here.
+    const docRes = await fetchImpl(`${plcUrl}/${encodeURIComponent(did)}`, {
       signal: AbortSignal.timeout(fetchTimeoutMs),
     })
     if (!docRes.ok) throw new Error(`PLC lookup for ${did} failed: HTTP ${docRes.status}`)
-    const didDoc = await docRes.json()
+    const docBytes = await readBodyWithCap(docRes, maxDidDocBytes, `DID document for ${did}`)
+    let didDoc
+    try {
+      didDoc = JSON.parse(new TextDecoder().decode(docBytes))
+    } catch {
+      throw new Error(`DID document for ${did} is not valid JSON`)
+    }
     if (didDoc?.id !== did) throw new Error(`DID document id mismatch for ${did}`)
     const signingKey = extractSigningDidKey(didDoc)
     if (!signingKey) throw new Error(`No #atproto signing key in DID document for ${did}`)

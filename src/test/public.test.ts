@@ -12,6 +12,7 @@ import {
   AtprotoClient,
   loadSession,
   saveSession,
+  type AtprotoBlob,
   type AtprotoSession,
 } from '../public/atproto'
 import {
@@ -20,6 +21,7 @@ import {
   dataUrlToBytes,
   ensurePubkeyBinding,
   getPublication,
+  legacyRecipeSignatureMessage,
   publishRecipe,
   pubkeyBindingMessage,
   pubkeyRkeyForDeviceDid,
@@ -33,6 +35,7 @@ import { cidForBytes } from '../public/blobCid'
 import {
   identityFromSeed,
   publicKeyFromDid,
+  signDetached,
   verifyDetached,
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
@@ -41,6 +44,11 @@ import { memoryStore } from '../store/recipes'
 const PDS = 'http://localhost:2583'
 const ACCT = 'did:plc:accttest'
 const SEED = new Uint8Array(32).fill(9)
+
+/** A real blob object (Int L4): buildRecipeRecord no longer fabricates one. */
+function realBlob(cid: string): AtprotoBlob {
+  return { $type: 'blob', ref: { $link: cid }, mimeType: 'image/png', size: 8 }
+}
 
 // ---------------------------------------------------------------------------
 // Fake PDS over fetch
@@ -232,7 +240,7 @@ describe('atproto session', () => {
 describe('buildRecipeRecord', () => {
   it('maps local fields to the lexicon shape', () => {
     const recipe = fixtureRecipe()
-    const rec = buildRecipeRecord(recipe, ACCT, ['bafyimg1'])
+    const rec = buildRecipeRecord(recipe, ACCT, [realBlob('bafyimg1')])
     expect(rec.$type).toBe('kitchen.longtable.recipe')
     expect(rec.name).toBe('Tomato Soup')
     expect(rec.ingredients).toEqual(['tomatoes', 'salt'])
@@ -266,7 +274,10 @@ describe('buildRecipeRecord', () => {
 describe('device signatures', () => {
   it('canonical hash matches an independent recomputation', async () => {
     await sodium.ready
-    const rec = buildRecipeRecord(fixtureRecipe(), ACCT, ['bafyimg1', 'bafyimg2'])
+    const rec = buildRecipeRecord(fixtureRecipe(), ACCT, [
+      realBlob('bafyimg1'),
+      realBlob('bafyimg2'),
+    ])
     const canonical = JSON.stringify([
       'Tomato Soup',
       '',
@@ -290,12 +301,13 @@ describe('device signatures', () => {
   it('signRecipeRecord verifies against the device DID with the exact payload', async () => {
     await sodium.ready
     const identity = await identityFromSeed(SEED)
-    const rec = buildRecipeRecord(fixtureRecipe(), ACCT, ['bafyimg1'])
+    const rec = buildRecipeRecord(fixtureRecipe(), ACCT, [realBlob('bafyimg1')])
     const sigB64 = await signRecipeRecord(identity, ACCT, rec)
     const hashHex = await canonicalRecipeHash(rec)
-    const msg = utf8ToU8(recipeSignatureMessage(ACCT, 'recipe-1', hashHex))
+    // Sec L11: the signer emits the v2 message, bound to createdAt.
+    const msg = utf8ToU8(recipeSignatureMessage(ACCT, 'recipe-1', hashHex, rec.createdAt))
     expect(msg).toEqual(
-      utf8ToU8(`longtable-recipe:v1\n${ACCT}\nrecipe-1\n${hashHex}`),
+      utf8ToU8(`longtable-recipe:v2\n${ACCT}\nrecipe-1\n${hashHex}\n${rec.createdAt}`),
     )
     const sig = base64ToU8(sigB64)
     expect(await verifyDetached(identity.did, msg, sig)).toBe(true)
@@ -304,8 +316,45 @@ describe('device signatures', () => {
       sodium.crypto_sign_verify_detached(sig, msg, publicKeyFromDid(identity.did)),
     ).toBe(true)
     // A tampered account DID or recipe id must fail.
-    const wrong = utf8ToU8(`longtable-recipe:v1\ndid:plc:other\nrecipe-1\n${hashHex}`)
+    const wrong = utf8ToU8(
+      `longtable-recipe:v2\ndid:plc:other\nrecipe-1\n${hashHex}\n${rec.createdAt}`,
+    )
     expect(await verifyDetached(identity.did, wrong, sig)).toBe(false)
+    // A legacy v1 signature still verifies (pre-v2 records stay valid).
+    const v1Msg = utf8ToU8(legacyRecipeSignatureMessage(ACCT, 'recipe-1', hashHex))
+    const v1Sig = await signDetached(identity, v1Msg)
+    expect(await verifyDetached(identity.did, v1Msg, v1Sig)).toBe(true)
+    // But a v2 signature must NOT verify a record created at another
+    // time — the createdAt transplant is the L11 replay case.
+    const moved = utf8ToU8(
+      recipeSignatureMessage(ACCT, 'recipe-1', hashHex, '2099-01-01T00:00:00.000Z'),
+    )
+    expect(await verifyDetached(identity.did, moved, sig)).toBe(false)
+  })
+
+  it('buildRecipeRecord rejects placeholder blob metadata (Int L4)', () => {
+    const recipe = fixtureRecipe()
+    // A bare CID string used to be fabricated into a blob with
+    // mimeType 'image/*' and size 0; it is no longer accepted — and
+    // neither is any other placeholder shape (wildcard mime, zero
+    // size, empty ref). All fail with the same real-blob error.
+    expect(() => buildRecipeRecord(recipe, ACCT, ['bafyimg1'] as never)).toThrow(
+      /real blob object/,
+    )
+    expect(() =>
+      buildRecipeRecord(recipe, ACCT, [
+        { $type: 'blob', ref: { $link: 'bafyimg1' }, mimeType: 'image/*', size: 0 },
+      ]),
+    ).toThrow(/real blob object/)
+    expect(() =>
+      buildRecipeRecord(recipe, ACCT, [
+        { $type: 'blob', ref: { $link: '' }, mimeType: 'image/png', size: 8 },
+      ]),
+    ).toThrow(/real blob object/)
+    // A real blob object passes.
+    expect(() =>
+      buildRecipeRecord(recipe, ACCT, [realBlob('bafyimg1')]),
+    ).not.toThrow()
   })
 })
 
@@ -474,9 +523,11 @@ describe('publish → unpublish', () => {
     expect(images[0].ref.$link).toBe(blobCid)
 
     const hashHex = await canonicalRecipeHash(
-      buildRecipeRecord(recipe, ACCT, [blobCid]),
+      buildRecipeRecord(recipe, ACCT, [realBlob(blobCid)]),
     )
-    const msg = utf8ToU8(recipeSignatureMessage(ACCT, 'recipe-1', hashHex))
+    const msg = utf8ToU8(
+      recipeSignatureMessage(ACCT, 'recipe-1', hashHex, rec.createdAt as string),
+    )
     expect(
       await verifyDetached(
         identity.did,
