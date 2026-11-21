@@ -217,7 +217,18 @@ async function main() {
       `&collection=${encodeURIComponent(collection)}&rkey=${encodeURIComponent(key)}`
     const res = await fetch(url)
     if (res.status === 404) return null
-    if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`)
+    if (!res.ok) {
+      // ATProto getRecord signals a missing record as 400
+      // RecordNotFound, not 404 (this testnet PDS does; production
+      // PDSes do too, per the lexicon). Treat that as "no such
+      // record" so the per-device → `self` fallback can run and a
+      // missing binding is reported cleanly instead of crashing.
+      try {
+        const err = await res.json()
+        if (err?.error === 'RecordNotFound') return null
+      } catch { /* non-JSON error body — fall through to throw */ }
+      throw new Error(`GET ${url} → HTTP ${res.status}`)
+    }
     return res.json()
   }
   const recipeRes = await getRecord('kitchen.longtable.recipe', rkey)

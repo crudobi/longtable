@@ -194,10 +194,16 @@ async function main() {
     // missing forgery is not a passed check. Mimic rkey: proof-public
     // publishes it at 'mimic-stew' (run proof-public first).
     const bad = runClient(['--did', ATTACKER.did, '--rkey', 'mimic-stew'])
-    const gotForgery = bad.out.includes('records fetched from the author')
-    const rejected = bad.code !== 0 && gotForgery && bad.out.includes('FAIL') && !bad.out.includes('RESULT: ALL PASS')
+    // Rejection evidence: either Step 6 FAIL lines (a binding existed
+    // to check the forgery against) or "no pubkey binding for device"
+    // (the live case — the mimic claims Olga's device, which has no
+    // binding in the attacker's repo at all, so the client refuses
+    // after fetching the forgery). Both are reachable only after the
+    // recipe fetch, so either proves the client saw the forgery.
+    const sawForgery = bad.out.includes('no pubkey binding for device') || bad.out.includes('FAIL')
+    const rejected = bad.code !== 0 && sawForgery && !bad.out.includes('RESULT: ALL PASS')
     step('third-party client: attacker mimic REJECTED', rejected,
-      rejected ? `exit ${bad.code} (forgery fetched and rejected)` : `exit ${bad.code} — ${gotForgery ? 'client accepted a forgery!' : 'mimic record not fetched; run proof-public first'}`)
+      rejected ? `exit ${bad.code} (forgery fetched and rejected)` : `exit ${bad.code} — ${sawForgery ? 'client accepted a forgery!' : 'client errored before judging the forgery; run proof-public first'}`)
     if (!rejected) console.log(bad.out)
 
     // Cleanup: flip back to private via the app's own byte path.
