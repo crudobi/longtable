@@ -35,12 +35,17 @@ import {
   type KeyValueStore,
 } from '../identity/identity'
 import { flushSecrets, secretKv } from '../secrets/secretStore'
+import {
+  assertStoreWritable,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
 import { base64ToU8, u8ToBase64, u8ToHex, utf8ToU8 } from '../identity/codec'
 import { getOrCreateDoc, getRepo, type YjsStore } from '../store/repo'
 import { getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
 
-const FRIENDS_KEY = 'longtable:friends'
+export const FRIENDS_KEY = 'longtable:friends'
 
 export interface FriendRecord {
   /** The friend's DID (did:key). */
@@ -82,23 +87,46 @@ export interface FriendInvitePayload {
 // Friend record storage
 // ---------------------------------------------------------------------------
 
+/**
+ * Load the friend list (H9). Absent reads as empty; corrupt JSON — or
+ * a top-level value that is not an array — is quarantined (bytes
+ * preserved, see src/store/corrupt.ts) and reads as empty. Entries
+ * that fail the shape check are dropped individually: one bad record
+ * never wipes the other friends.
+ */
 export function listFriends(kv: KeyValueStore = secretKv): FriendRecord[] {
-  try {
-    const raw = kv.getItem(FRIENDS_KEY)
-    if (!raw) return []
-    const arr: unknown = JSON.parse(raw)
-    if (!Array.isArray(arr)) return []
-    return arr.filter(
-      (f): f is FriendRecord =>
-        typeof f === 'object' &&
-        f !== null &&
-        typeof (f as FriendRecord).did === 'string' &&
-        typeof (f as FriendRecord).pairSecret === 'string' &&
-        typeof (f as FriendRecord).pairId === 'string',
-    )
-  } catch {
+  const read = readStoredJson(kv, FRIENDS_KEY)
+  if (read.status === 'absent') return []
+  if (read.status === 'corrupt') return []
+  if (!Array.isArray(read.value)) {
+    noteCorruptStore(kv, FRIENDS_KEY, read.raw, 'not a JSON array')
     return []
   }
+  return (read.value as unknown[]).filter(
+    (f): f is FriendRecord =>
+      typeof f === 'object' &&
+      f !== null &&
+      typeof (f as FriendRecord).did === 'string' &&
+      typeof (f as FriendRecord).pairSecret === 'string' &&
+      typeof (f as FriendRecord).pairId === 'string',
+  )
+}
+
+/**
+ * Persist a friend list. Refuses (throws CorruptStoreError) when the
+ * stored list is corrupt: a pairing that saved over the damaged bytes
+ * would silently drop every existing friend. Backup restore clears
+ * the corruption record first — it is the deliberate replacement path.
+ *
+ * Exported for the backup restore, which replaces the whole list in
+ * one write: unlike saveFriend it does NOT re-load first, so a
+ * restore can replace a damaged list after clearing the record
+ * (saveFriend's load would re-detect the still-damaged bytes and
+ * refuse). Any other caller must read through listFriends first.
+ */
+export function saveFriendsList(friends: FriendRecord[], kv: KeyValueStore): void {
+  assertStoreWritable(FRIENDS_KEY)
+  kv.setItem(FRIENDS_KEY, JSON.stringify(friends))
 }
 
 export function getFriend(
@@ -114,7 +142,7 @@ export function saveFriend(
 ): void {
   const friends = listFriends(kv).filter((f) => f.did !== rec.did)
   friends.push(rec)
-  kv.setItem(FRIENDS_KEY, JSON.stringify(friends))
+  saveFriendsList(friends, kv)
 }
 
 export function removeFriend(
@@ -122,7 +150,7 @@ export function removeFriend(
   kv: KeyValueStore = secretKv,
 ): void {
   const friends = listFriends(kv).filter((f) => f.did !== did)
-  kv.setItem(FRIENDS_KEY, JSON.stringify(friends))
+  saveFriendsList(friends, kv)
 }
 
 // ---------------------------------------------------------------------------

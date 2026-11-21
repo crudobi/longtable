@@ -30,6 +30,12 @@ import {
 } from './friends'
 import { secretKv } from '../secrets/secretStore'
 import {
+  assertStoreWritable,
+  isStoreCorrupt,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
+import {
   dropRecipeKey,
   ensureRecipeKey,
   getRecipeKey,
@@ -51,7 +57,7 @@ import {
 } from '../store/recipes'
 
 const NAME_KEY = 'longtable:display-name'
-const RECEIVED_KEY = 'longtable:received-shares'
+export const RECEIVED_KEY = 'longtable:received-shares'
 
 export function getDisplayName(kv: KeyValueStore = secretKv): string {
   return kv.getItem(NAME_KEY) ?? ''
@@ -227,25 +233,52 @@ export interface ReceivedMapping {
   updatedAt: string
 }
 
-/** Read the received-shares mapping (exported for the backup, Wave 3 C3). */
-export function loadReceivedMap(kv: KeyValueStore): Record<string, ReceivedMapping> {
-  try {
-    const raw = kv.getItem(RECEIVED_KEY)
-    if (!raw) return {}
-    const obj: unknown = JSON.parse(raw)
-    return typeof obj === 'object' && obj !== null
-      ? (obj as Record<string, ReceivedMapping>)
-      : {}
-  } catch {
-    return {}
-  }
+/** One mapping entry is usable only when both of its fields check out. */
+function isReceivedMapping(o: unknown): o is ReceivedMapping {
+  return (
+    typeof o === 'object' &&
+    o !== null &&
+    typeof (o as ReceivedMapping).localId === 'string' &&
+    typeof (o as ReceivedMapping).updatedAt === 'string'
+  )
 }
 
-/** Replace the received-shares mapping (backup restore). */
+/**
+ * Read the received-shares mapping (exported for the backup, Wave 3 C3).
+ * Absent reads as empty; corrupt JSON — or a top-level value that is
+ * not an object — is quarantined (bytes preserved, see
+ * src/store/corrupt.ts) and reads as empty. Entries that fail
+ * validation are dropped individually: one bad entry never wipes the
+ * mapping for the other shares.
+ */
+export function loadReceivedMap(kv: KeyValueStore): Record<string, ReceivedMapping> {
+  const read = readStoredJson(kv, RECEIVED_KEY)
+  if (read.status === 'absent') return {}
+  if (read.status === 'corrupt') return {}
+  const obj = read.value
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    noteCorruptStore(kv, RECEIVED_KEY, read.raw, 'not a JSON object')
+    return {}
+  }
+  const out: Record<string, ReceivedMapping> = {}
+  for (const [key, m] of Object.entries(obj as Record<string, unknown>)) {
+    if (isReceivedMapping(m)) out[key] = m
+  }
+  return out
+}
+
+/**
+ * Replace the received-shares mapping (backup restore). Refuses
+ * (throws CorruptStoreError) when the stored mapping is corrupt:
+ * overwriting it would drop every received share's local-id link.
+ * Backup restore clears the corruption record first — it is the
+ * deliberate replacement path.
+ */
 export function saveReceivedMap(
   kv: KeyValueStore,
   mapping: Record<string, ReceivedMapping>,
 ): void {
+  assertStoreWritable(RECEIVED_KEY)
   kv.setItem(RECEIVED_KEY, JSON.stringify(mapping))
 }
 
@@ -308,7 +341,10 @@ export async function importReceivedShares(
   repo: YjsStore = getRepo(),
   onFailure?: (f: { shareId: string; reason: string }) => void,
 ): Promise<number> {
-  const index = await getOrCreateIndex(repo)
+  // The index reads through the caller's kv: the default (localStorage)
+  // does not exist in node, and a backup/restore kv is not the app's
+  // store — the mapping's kv is the index's kv.
+  const index = await getOrCreateIndex(repo, kv)
   const mapping = loadReceived(kv)
   let count = 0
   for (const friend of listFriends(kv)) {
@@ -343,7 +379,20 @@ export async function importReceivedShares(
       })
     }
   }
-  saveReceivedMap(kv, mapping)
+  // Persist the updated mapping — unless the stored mapping is corrupt
+  // (H9): the import ran against a safe empty in-memory view, and
+  // saving it would persist that emptiness over the damaged bytes.
+  // Skipping the save is safe (the mapping is an upsert cache; the
+  // next import rebuilds the entries it needs) and the corruption
+  // banner surfaces the damage to the user.
+  if (isStoreCorrupt(RECEIVED_KEY)) {
+    console.warn(
+      'import received shares: stored mapping is damaged, not saving it — ' +
+        'restore from an encrypted backup to recover it',
+    )
+  } else {
+    saveReceivedMap(kv, mapping)
+  }
   return count
 }
 

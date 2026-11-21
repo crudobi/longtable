@@ -17,6 +17,11 @@
  */
 import type { KeyValueStore } from '../store/recipes'
 import { secretKv } from '../secrets/secretStore'
+import {
+  assertStoreWritable,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
 
 export const LOCAL_API_SETTINGS_KEY = 'longtable:localapi'
 export const LOCAL_API_DEFAULT_PORT = 17337
@@ -38,27 +43,46 @@ function validPort(n: unknown): n is number {
   return typeof n === 'number' && Number.isInteger(n) && n >= 1024 && n <= 65535
 }
 
+/**
+ * Load the localhost API settings (H9). Absent reads as the defaults;
+ * corrupt JSON — or a top-level value that is not an object — is
+ * quarantined (bytes preserved, see src/store/corrupt.ts) and reads
+ * as the defaults. Individual fields keep the old per-field fallback
+ * (a wrong-typed field falls back to its default, never the whole
+ * settings object).
+ */
 export function loadLocalApiSettings(
   kv: KeyValueStore = secretKv,
 ): LocalApiSettings {
-  try {
-    const raw = kv.getItem(LOCAL_API_SETTINGS_KEY)
-    if (!raw) return defaultLocalApiSettings()
-    const parsed = JSON.parse(raw) as Partial<LocalApiSettings>
-    return {
-      enabled: parsed.enabled === true,
-      port: validPort(parsed.port) ? parsed.port : LOCAL_API_DEFAULT_PORT,
-      token: typeof parsed.token === 'string' ? parsed.token : '',
-    }
-  } catch {
+  const read = readStoredJson(kv, LOCAL_API_SETTINGS_KEY)
+  if (read.status === 'absent') return defaultLocalApiSettings()
+  if (read.status === 'corrupt') return defaultLocalApiSettings()
+  if (typeof read.value !== 'object' || read.value === null || Array.isArray(read.value)) {
+    noteCorruptStore(kv, LOCAL_API_SETTINGS_KEY, read.raw, 'not a JSON object')
     return defaultLocalApiSettings()
+  }
+  const parsed = read.value as Partial<LocalApiSettings>
+  return {
+    enabled: parsed.enabled === true,
+    port: validPort(parsed.port) ? parsed.port : LOCAL_API_DEFAULT_PORT,
+    token: typeof parsed.token === 'string' ? parsed.token : '',
   }
 }
 
+/**
+ * Persist the settings. Refuses (throws CorruptStoreError) when the
+ * stored settings are corrupt: saving the defaults over them would
+ * destroy the API token. The settings modal loads at mount, so the
+ * corruption record exists before any save is attempted. Backup
+ * restore does not cover API settings (they are re-enterable) — a
+ * corrupt settings value heals by discarding the damaged copy from
+ * the app's corruption banner.
+ */
 export function saveLocalApiSettings(
   settings: LocalApiSettings,
   kv: KeyValueStore = secretKv,
 ): void {
+  assertStoreWritable(LOCAL_API_SETTINGS_KEY)
   kv.setItem(LOCAL_API_SETTINGS_KEY, JSON.stringify(settings))
 }
 

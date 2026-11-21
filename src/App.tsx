@@ -15,6 +15,7 @@ import { JoinModal } from './components/JoinModal'
 import {
   destroyAllShareProviders,
   leaveShare,
+  loadShares,
   onShareUpdate,
   rejoinShares,
   shareRecipe,
@@ -25,13 +26,28 @@ import {
   VisibilitySessionError,
 } from './recipeFlows'
 import type { SharePayload } from './p2p/share'
-import { getOrCreateIdentity, type Identity } from './identity/identity'
-import { disconnectAllFriendChannels, onChannelUpdate, rejoinFriendChannels } from './friends/friends'
+import {
+  IDENTITY_SECRET_KEY,
+  IdentityDamagedError,
+  getOrCreateIdentity,
+  type Identity,
+} from './identity/identity'
+import { disconnectAllFriendChannels, listFriends, onChannelUpdate, rejoinFriendChannels } from './friends/friends'
 import {
   importReceivedShares,
   installFriendsDebugHooks,
+  loadReceivedMap,
   republishIfShared,
 } from './friends/service'
+import { loadVault } from './friends/shelf'
+import { listHubs } from './hubs/hubs'
+import { loadLocalApiSettings } from './localapi/settings'
+import {
+  corruptStoreLabel,
+  discardCorruptStore,
+  listCorruptStores,
+  type CorruptStoreEntry,
+} from './store/corrupt'
 import { FriendsPanel } from './components/FriendsPanel'
 import { FriendShareModal } from './components/FriendShareModal'
 import { PublishSettingsModal } from './components/PublishSettingsModal'
@@ -59,7 +75,7 @@ import {
   loadSession,
   saveSession,
 } from './public/atproto'
-import { getPublication, publishRecipe, unpublishRecipe } from './public/publish'
+import { getPublication, loadPublications, publishRecipe, unpublishRecipe } from './public/publish'
 import { searchAppView } from './public/discover'
 import type { Recipe, RecipeInput, RecipeSummary, VisibilityTier } from './types'
 
@@ -81,6 +97,12 @@ export default function App() {
   const [joinOpen, setJoinOpen] = useState(false)
   const [identity, setIdentity] = useState<Identity | null>(null)
   const identityRef = useRef<Identity | null>(null)
+  // H8: the stored identity secret is damaged — the app is blocked on
+  // the identity-damaged screen until the user restores from a backup.
+  // H9: stores whose saved JSON could not be read (quarantined, never
+  // overwritten) — shown as a banner with a recovery action each.
+  const [identityDamaged, setIdentityDamaged] = useState<IdentityDamagedError | null>(null)
+  const [corruptStores, setCorruptStores] = useState<CorruptStoreEntry[]>([])
   const [friendsOpen, setFriendsOpen] = useState(false)
   const [friendShareId, setFriendShareId] = useState<string | null>(null)
   const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
@@ -152,6 +174,11 @@ export default function App() {
       }
       // Phase 2 identity: load (or create) the device DID, rejoin friend
       // channels, and import any friends-only shares waiting in them.
+      // H8: a damaged stored secret throws IdentityDamagedError — the
+      // app does NOT mint a fresh DID (that would orphan friends +
+      // published recipes) and does NOT proceed as if identity-less:
+      // the blocking screen takes over until the user restores.
+      let damaged: IdentityDamagedError | null = null
       try {
         const id = await getOrCreateIdentity()
         identityRef.current = id
@@ -162,7 +189,27 @@ export default function App() {
           console.warn('import received shares failed', e),
         )
       } catch (e) {
-        console.warn('identity setup failed', e)
+        if (e instanceof IdentityDamagedError) {
+          damaged = e
+          setIdentityDamaged(e)
+        } else {
+          console.warn('identity setup failed', e)
+        }
+      }
+      // H9: probe every JSON store once, so corruption in a store
+      // nothing else reads at startup (key vault, publications, API
+      // settings) still surfaces in the banner instead of waiting for
+      // the first write to it. The loads are cheap sync reads; a
+      // damaged store reads as its safe empty view.
+      if (!damaged) {
+        listFriends()
+        loadVault()
+        loadShares()
+        loadReceivedMap(secretKv)
+        listHubs()
+        loadPublications()
+        loadLocalApiSettings()
+        setCorruptStores(listCorruptStores())
       }
       await refresh()
     })()
@@ -553,6 +600,33 @@ export default function App() {
     )
   }, [])
 
+  /**
+   * H9: discard one damaged store's live value, after an explicit
+   * confirm. The quarantine copy keeps the bytes, so this loses
+   * nothing recoverable; the store heals to its absent/default state
+   * (re-enter hubs, re-publish, re-enable the API, or restore from
+   * backup afterwards). Never offered for the identity key — the
+   * blocking identity-damaged screen is the only identity-damage UI.
+   */
+  const handleDiscardCorrupt = useCallback(
+    (entry: CorruptStoreEntry) => {
+      if (entry.key === IDENTITY_SECRET_KEY) return
+      const label = corruptStoreLabel(entry.key)
+      if (
+        !window.confirm(
+          `Discard the damaged ${label}? The damaged copy is preserved under ${entry.quarantineKey}, ` +
+            `but this device will forget the ${label} as it was — you will need to re-enter it, or restore it from a backup.`,
+        )
+      ) {
+        return
+      }
+      discardCorruptStore(secretKv, entry.key)
+      setCorruptStores(listCorruptStores())
+      void refresh()
+    },
+    [refresh],
+  )
+
   const handleJoined = useCallback(async () => {
     setJoinOpen(false)
     await refresh()
@@ -566,9 +640,92 @@ export default function App() {
     )
   }
 
+  // H8: blocking identity-damaged state. The stored identity key is
+  // unreadable, and no fresh identity was minted — minting one would
+  // orphan every friend and published recipe. Nothing identity-shaped
+  // runs from here (no pairing, publishing, sharing, or localhost
+  // API); the only way forward is restoring from an encrypted backup,
+  // which replaces the damaged key with the backed-up one and reloads
+  // the app. Recipes on this device are untouched by the damage, and
+  // the damaged key itself was preserved (quarantine key below).
+  if (identityDamaged) {
+    return (
+      <div className="app">
+        <div className="view">
+          <h2>Your device identity is damaged</h2>
+          <p>
+            The key that identifies this device could not be read
+            ({identityDamaged.reason}). A new identity was <strong>not</strong>{' '}
+            created: a new one would look like a stranger to your friends
+            and to your published recipes, and the old connections could
+            not be recovered.
+          </p>
+          <p>
+            The damaged key was preserved, not deleted (
+            <code>{identityDamaged.quarantineKey}</code>).
+          </p>
+          <p>
+            <strong>Restore from an encrypted backup</strong> to recover
+            your identity, friends, and shares. If you have no backup
+            file, the previous identity — and the friend connections
+            tied to it — cannot be recovered.
+          </p>
+          <div className="modal-actions">
+            <button
+              className="primary"
+              data-testid="identity-damaged-restore"
+              onClick={() => setBackupOpen(true)}
+            >
+              Restore from backup
+            </button>
+          </div>
+          {backupOpen && (
+            <BackupPanel
+              identity={null}
+              onClose={() => setBackupOpen(false)}
+              onRestored={() => void refresh()}
+            />
+          )}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="app">
       {error && <p className="status error">{error}</p>}
+      {corruptStores.length > 0 && (
+        <div className="status error" data-testid="corrupt-stores-banner">
+          <strong>Some saved data could not be read.</strong>{' '}
+          The original data was preserved and nothing was overwritten.
+          Restore from an encrypted backup to recover it.
+          <ul>
+            {corruptStores.map((entry) => (
+              <li key={entry.key}>
+                {corruptStoreLabel(entry.key)} — damaged (
+                {entry.reason}); preserved as{' '}
+                <code>{entry.quarantineKey}</code>.{' '}
+                <button
+                  className="ghost"
+                  data-testid={`discard-corrupt-${entry.key}`}
+                  onClick={() => handleDiscardCorrupt(entry)}
+                >
+                  Discard damaged copy
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="modal-actions">
+            <button
+              className="primary"
+              data-testid="corrupt-stores-restore"
+              onClick={() => setBackupOpen(true)}
+            >
+              Open backup &amp; restore
+            </button>
+          </div>
+        </div>
+      )}
       {view.name === 'list' && (
         <RecipeList
           recipes={summaries}

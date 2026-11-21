@@ -73,10 +73,15 @@ import {
   type KeyValueStore,
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8, u8ToUtf8 } from '../identity/codec'
-import { listFriends, removeFriend, saveFriend, shelfGuidFor, disconnectAllFriendChannels, type FriendRecord } from '../friends/friends'
-import { getDisplayName, loadReceivedMap, saveReceivedMap, setDisplayName } from '../friends/service'
-import { loadVault, saveVault, type KeyVault } from '../friends/shelf'
-import { destroyAllShareProviders, listShares, roomForRecipe, saveShares, type ShareRecord } from '../p2p/share'
+import { FRIENDS_KEY, listFriends, removeFriend, saveFriendsList, shelfGuidFor, disconnectAllFriendChannels, type FriendRecord } from '../friends/friends'
+import { RECEIVED_KEY, getDisplayName, loadReceivedMap, saveReceivedMap, setDisplayName } from '../friends/service'
+import { VAULT_KEY, loadVault, saveVault, type KeyVault } from '../friends/shelf'
+import { SHARES_KEY, destroyAllShareProviders, listShares, roomForRecipe, saveShares, type ShareRecord } from '../p2p/share'
+import {
+  clearCorruptStore,
+  corruptStoreLabel,
+  isStoreCorrupt,
+} from '../store/corrupt'
 import {
   deleteRecipe,
   getOrCreateIndex,
@@ -570,6 +575,27 @@ export async function collectBackup(
     const doc = await getOrCreateDoc(repo, guid)
     shelves.push({ friendDid: friend.did, guid, update: u8ToBase64(Y.encodeStateAsUpdate(doc)) })
   }
+  const vault = loadVault(kv)
+  const shares = listShares(kv)
+  const received = loadReceivedMap(kv)
+  // Fail closed (H9): a backup snapshots the state a restore will
+  // REPLACE the device with. If any source store is damaged, the
+  // reads above returned safe empty views — backing those up would
+  // mint a backup that deletes the user's friends / keys / shares on
+  // restore. Refuse instead, and say which store is damaged; the user
+  // restores from an older backup (or re-pairs) first. The loads above
+  // are what detect the damage, so the registry is accurate here.
+  const damaged = [FRIENDS_KEY, VAULT_KEY, SHARES_KEY, RECEIVED_KEY].filter(
+    isStoreCorrupt,
+  )
+  if (damaged.length > 0) {
+    throw new BackupError(
+      `Cannot make a backup right now: the saved ${damaged.map(corruptStoreLabel).join(', ')} ` +
+        `could not be read — ${damaged.length === 1 ? 'it looks' : 'they look'} damaged. ` +
+        'A backup made now would be missing that data, so nothing was written. ' +
+        'Restore from an older backup first.',
+    )
+  }
   return {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
@@ -577,9 +603,9 @@ export async function collectBackup(
     displayName: getDisplayName(kv),
     identity: { did: identity.did, secretKey: u8ToBase64(identity.secretKey) },
     friends,
-    vault: loadVault(kv),
-    shares: listShares(kv),
-    received: loadReceivedMap(kv),
+    vault,
+    shares,
+    received,
     recipes,
     shelves,
   }
@@ -641,13 +667,26 @@ export async function restoreBackup(
   }
 
   // --- write phase (validation already passed; these cannot fail on content) ---
+  // H9: restore is the deliberate replacement path — the one writer
+  // allowed to overwrite a corrupt store. Clear the corruption
+  // records for the stores about to be replaced FIRST, so the save
+  // functions below do not refuse; the quarantine copies already
+  // preserve the damaged bytes.
+  clearCorruptStore(FRIENDS_KEY)
+  clearCorruptStore(VAULT_KEY)
+  clearCorruptStore(SHARES_KEY)
+  clearCorruptStore(RECEIVED_KEY)
   const restoredDid = await restoreIdentitySecret(plain.identity.secretKey, kv)
   if (restoredDid !== plain.identity.did) {
     throw new BackupError('Restore failed: the restored identity does not match the backup.')
   }
   setDisplayName(plain.displayName, kv)
   for (const f of currentFriends) removeFriend(f.did, kv)
-  for (const f of plain.friends) saveFriend(f, kv)
+  // Replace the friend list in one write (not one saveFriend per
+  // friend): saveFriend re-loads first, and a still-damaged stored
+  // list would re-register the corruption and refuse — the whole-list
+  // write is the restore primitive for exactly that case.
+  saveFriendsList(plain.friends, kv)
   saveVault(plain.vault, kv)
 
   const recipeIds = new Set(plain.recipes.map((r) => r.id))

@@ -31,6 +31,12 @@ import type { KeyValueStore } from '../identity/identity'
 import { getOrCreateIndex, RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 import { secretKv } from '../secrets/secretStore'
+import {
+  CorruptStoreError,
+  assertStoreWritable,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -43,7 +49,7 @@ import type { WebrtcProvider as WebrtcProviderType } from 'y-webrtc'
  * `getActiveHub().signalingUrl`, `getIceServers()`, `getSignalingUrls()`.
  */
 export const DEFAULT_SIGNALING_URL = 'wss://10.0.2.2:4444'
-const SHARES_KEY = 'longtable:shares'
+export const SHARES_KEY = 'longtable:shares'
 
 /** ICE servers for the built-in default hub (compat export; live code uses
  * `getIceServers()` from the hub registry so the ACTIVE hub supplies TURN.
@@ -179,15 +185,16 @@ export function validateSharedDoc(doc: Y.Doc): string {
   return title.trim().slice(0, RECIPE_LIMITS.titleChars)
 }
 
-function loadShares(): ShareRecord[] {
-  try {
-    const raw = secretKv.getItem(SHARES_KEY)
-    if (!raw) return []
-    const arr: unknown = JSON.parse(raw)
-    return Array.isArray(arr) ? (arr as ShareRecord[]) : []
-  } catch {
-    return []
-  }
+/**
+ * Load the saved share records (H9). Absent reads as empty; corrupt
+ * JSON — or a top-level value that is not an array — is quarantined
+ * (bytes preserved, see src/store/corrupt.ts) and reads as empty.
+ * Records that fail the shape check are dropped individually: one bad
+ * record never wipes the other shares. Exported for App's startup
+ * corruption probe (the app's live store is the secure store).
+ */
+export function loadShares(): ShareRecord[] {
+  return listShares(secretKv)
 }
 
 /**
@@ -199,33 +206,43 @@ function loadShares(): ShareRecord[] {
  * are dropped, never trusted.
  */
 export function listShares(kv: KeyValueStore = localStorage): ShareRecord[] {
-  try {
-    const raw = kv.getItem(SHARES_KEY)
-    if (!raw) return []
-    const arr: unknown = JSON.parse(raw)
-    if (!Array.isArray(arr)) return []
-    return (arr as ShareRecord[]).filter(
-      (s): s is ShareRecord =>
-        typeof s === 'object' &&
-        s !== null &&
-        typeof (s as ShareRecord).recipeId === 'string' &&
-        typeof (s as ShareRecord).room === 'string' &&
-        typeof (s as ShareRecord).signaling === 'string' &&
-        ((s as ShareRecord).role === 'host' || (s as ShareRecord).role === 'guest'),
-    )
-  } catch {
+  const read = readStoredJson(kv, SHARES_KEY)
+  if (read.status === 'absent') return []
+  if (read.status === 'corrupt') return []
+  if (!Array.isArray(read.value)) {
+    noteCorruptStore(kv, SHARES_KEY, read.raw, 'not a JSON array')
     return []
   }
+  return (read.value as ShareRecord[]).filter(
+    (s): s is ShareRecord =>
+      typeof s === 'object' &&
+      s !== null &&
+      typeof (s as ShareRecord).recipeId === 'string' &&
+      typeof (s as ShareRecord).room === 'string' &&
+      typeof (s as ShareRecord).signaling === 'string' &&
+      ((s as ShareRecord).role === 'host' || (s as ShareRecord).role === 'guest'),
+  )
 }
 
-/** Replace the whole saved share-record list (backup restore). */
+/**
+ * Replace the whole saved share-record list (backup restore). Refuses
+ * (throws CorruptStoreError) when the stored list is corrupt: a
+ * restore that saved over the damaged bytes would drop every other
+ * share. Backup restore clears the corruption record first — it is
+ * the deliberate replacement path.
+ */
 export function saveShares(kv: KeyValueStore, shares: ShareRecord[]): void {
+  assertStoreWritable(SHARES_KEY)
   kv.setItem(SHARES_KEY, JSON.stringify(shares))
 }
 
 function saveShare(rec: ShareRecord): void {
   const shares = loadShares().filter((s) => s.recipeId !== rec.recipeId)
   shares.push(rec)
+  // H9: refuse to persist over a corrupt share list (throws
+  // CorruptStoreError — NOT swallowed by the storage catch below, so
+  // joining a share can never silently drop the other shares' records).
+  assertStoreWritable(SHARES_KEY)
   try {
     secretKv.setItem(SHARES_KEY, JSON.stringify(shares))
   } catch {
@@ -233,12 +250,26 @@ function saveShare(rec: ShareRecord): void {
   }
 }
 
-/** Remove the saved share record for a recipe, if one exists. */
+/**
+ * Remove the saved share record for a recipe, if one exists. When the
+ * stored list is corrupt the record is unreadable anyway and the room
+ * is already dead (leaveShare destroys the provider first), so the
+ * refusal is logged, not thrown — leaveShare never throws for a
+ * missing share, and the corrupt bytes stay preserved.
+ */
 function deleteShareRecord(recipeId: string): void {
   const shares = loadShares().filter((s) => s.recipeId !== recipeId)
   try {
+    assertStoreWritable(SHARES_KEY)
     secretKv.setItem(SHARES_KEY, JSON.stringify(shares))
-  } catch {
+  } catch (e) {
+    if (e instanceof CorruptStoreError) {
+      console.warn(
+        'share record not removed: the saved share list is damaged — ' +
+          'restore from an encrypted backup to recover it',
+      )
+      return
+    }
     /* storage unavailable — the provider is already dead (leaveShare
        destroys it before this runs), and rejoinShares re-reads storage,
        so a record that cannot be removed here can only come back if

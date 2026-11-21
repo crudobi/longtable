@@ -175,3 +175,63 @@ Android `allowBackup` stays `false` (`android/app/src/main/AndroidManifest.xml`)
 The backup is an explicit user action (an export file the user keeps),
 never Android auto-backup — a cloud copy of the identity key outside
 the user's control would defeat the point.
+
+## 3. Recovering from damaged data (H8/H9)
+
+Saved data can go bad (a torn write, a corrupt Keystore entry, a bad
+migration): the stored value is present but unreadable. The app never
+silently destroys it and never silently works around it.
+
+- **Quarantine, not deletion.** Any store whose saved JSON cannot be
+  read (unparseable, or the wrong top-level shape) is copied verbatim
+  under `<store-key>.corrupt-<fnv1a64-hex>` — e.g.
+  `longtable:friends.corrupt-3f9a21c47b8e05d1` — and the live value
+  stays in place. The quarantine key is deterministic (same bytes →
+  same key), so re-detecting the damage does not pile up copies.
+  Quarantine copies of secret stores route to the Keystore on native
+  exactly like the keys they preserve. The corrupt value is never
+  deleted by the app, except by the user's explicit "Discard damaged
+  copy" (see below) — and even then the quarantine copy remains.
+- **Damaged identity (H8) blocks the app.** If the stored identity
+  secret is present but unreadable, no fresh identity is minted — a
+  new DID would orphan every friend and published recipe — and the
+  app shows a blocking "Your device identity is damaged" screen
+  instead of the cookbook. The only way forward is restoring from an
+  encrypted backup (the panel's restore flow works without a working
+  identity; creating a backup does not). Restore replaces the damaged
+  key with the backed-up one, and the app reloads onto the restored
+  DID. A plain read path — including the localhost API's identity
+  endpoint — can never rotate the DID by asking for it.
+- **Damaged JSON stores (H9) read as safe empty views.** The friend
+  list, key vault, P2P shares, received-shares mapping, hub registry,
+  publications list, and local API settings each load as their empty
+  default when their stored JSON is corrupt, and the app shows a
+  banner naming each damaged store and its quarantine key. Saves
+  refuse to overwrite a damaged store (pairing, key rotation,
+  share/unshare, hub changes, and API-settings saves all throw a
+  plain-language error instead), so a load-then-save round-trip can
+  never persist emptiness over the damaged bytes. One bad entry
+  inside an otherwise readable store is dropped individually — it
+  never wipes the other entries.
+- **Restore heals what the backup covers.** Restoring replaces the
+  identity, friends, key vault, shares, received mapping, recipes,
+  and shelf docs — and is the one writer allowed to overwrite a
+  damaged store (it clears the damage record first, after the backup
+  itself validated). Not in the backup, and therefore not healed by
+  restore: hub configuration, the publications list, and the local
+  API settings. For those, the banner offers "Discard damaged copy":
+  the live damaged value is removed (the quarantine copy keeps the
+  bytes) and the store heals to its default — re-enter the hubs,
+  re-publish to rebuild the publications list, re-enable the API.
+  The identity key is never offered for discard.
+- **A backup is never made from damaged data.** `collectBackup`
+  refuses when any of its source stores (friends, vault, shares,
+  received mapping) is damaged: the reads would return safe empty
+  views, and backing those up would mint a backup that deletes the
+  user's data on restore.
+
+What the tests prove (`src/test/corrupt.test.ts`): corrupt input is
+quarantined with bytes preserved and never overwritten by any save
+path; a damaged identity blocks regeneration and offers restore;
+restore heals the damaged stores; a backup refuses to snapshot
+damaged sources.

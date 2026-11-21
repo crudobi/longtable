@@ -121,6 +121,17 @@ worker reads secrets through the same accessors). The refactor:
   localhost-API effect). A unit test pins the contract: a
   Keystore-held value is invisible to a fresh store until
   `initSecrets()` resolves.
+- Corrupt-store quarantine copies (Wave 4, H8/H9) route like the
+  secrets they preserve: `isSecretKey` treats
+  `<secret-key>.corrupt-<fnv-hex>` as a secret key, so a damaged
+  identity secret or friend list is quarantined into the Keystore
+  on native, never into plaintext localStorage. Quarantine keys are
+  written after init through the normal `kv` path, so they are never
+  part of migration (no migration report entry, no marker effect).
+  Removing a secret (`secretKv.removeItem`) now removes every copy
+  — Keystore entry, mirror entry, and any legacy localStorage copy —
+  so a removed value cannot be resurrected by the localStorage
+  fallback on the next read.
 
 ## WebView localStorage flush window (proof finding)
 

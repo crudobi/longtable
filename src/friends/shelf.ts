@@ -37,6 +37,11 @@ import {
 } from '../identity/identity'
 import { flushSecrets, secretKv } from '../secrets/secretStore'
 import {
+  assertStoreWritable,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
+import {
   base64ToU8,
   u8ToBase64,
   u8ToUtf8,
@@ -44,7 +49,7 @@ import {
 } from '../identity/codec'
 import type { Recipe } from '../types'
 
-const VAULT_KEY = 'longtable:key-vault'
+export const VAULT_KEY = 'longtable:key-vault'
 const SHELF_MAP = 'shelf'
 
 // ---------------------------------------------------------------------------
@@ -64,18 +69,50 @@ export interface RecipeKeyRecord {
 
 export type KeyVault = Record<string, RecipeKeyRecord>
 
-export function loadVault(kv: KeyValueStore = secretKv): KeyVault {
-  try {
-    const raw = kv.getItem(VAULT_KEY)
-    if (!raw) return {}
-    const obj: unknown = JSON.parse(raw)
-    return typeof obj === 'object' && obj !== null ? (obj as KeyVault) : {}
-  } catch {
-    return {}
-  }
+/** One vault entry is usable only when all of its fields check out. */
+function isRecipeKeyRecord(o: unknown): o is RecipeKeyRecord {
+  if (typeof o !== 'object' || o === null) return false
+  const r = o as Record<string, unknown>
+  return (
+    typeof r.keyId === 'string' &&
+    typeof r.key === 'string' &&
+    typeof r.version === 'number' &&
+    Array.isArray(r.friends) &&
+    r.friends.every((d) => typeof d === 'string')
+  )
 }
 
+/**
+ * Load the key vault (H9). Absent reads as empty; corrupt JSON — or a
+ * top-level value that is not an object — is quarantined (bytes
+ * preserved, see src/store/corrupt.ts) and reads as empty. Entries
+ * that fail validation are dropped individually: one bad entry never
+ * wipes the other recipes' keys.
+ */
+export function loadVault(kv: KeyValueStore = secretKv): KeyVault {
+  const read = readStoredJson(kv, VAULT_KEY)
+  if (read.status === 'absent') return {}
+  if (read.status === 'corrupt') return {}
+  const obj = read.value
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    noteCorruptStore(kv, VAULT_KEY, read.raw, 'not a JSON object')
+    return {}
+  }
+  const out: KeyVault = {}
+  for (const [recipeId, rec] of Object.entries(obj as Record<string, unknown>)) {
+    if (isRecipeKeyRecord(rec)) out[recipeId] = rec
+  }
+  return out
+}
+
+/**
+ * Persist the vault. Refuses (throws CorruptStoreError) when the stored
+ * vault is corrupt: a load-then-save round-trip must never persist an
+ * empty vault over the damaged bytes. Backup restore clears the
+ * corruption record first — it is the deliberate replacement path.
+ */
 export function saveVault(vault: KeyVault, kv: KeyValueStore = secretKv): void {
+  assertStoreWritable(VAULT_KEY)
   kv.setItem(VAULT_KEY, JSON.stringify(vault))
 }
 

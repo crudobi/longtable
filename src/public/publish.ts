@@ -29,6 +29,7 @@ import {
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
 import { secretKv } from '../secrets/secretStore'
+import { isStoreCorrupt, noteCorruptStore, readStoredJson } from '../store/corrupt'
 import type { Recipe } from '../types'
 import {
   PUBLICATIONS_KEY,
@@ -242,19 +243,43 @@ export async function pubkeyRkeyForDeviceDid(deviceDid: string): Promise<string>
 // Publications registry (localStorage)
 // ---------------------------------------------------------------------------
 
+/** One registry entry is usable only when all of its fields check out. */
+function isPublication(o: unknown): o is Publication {
+  if (typeof o !== 'object' || o === null) return false
+  const p = o as Record<string, unknown>
+  return (
+    typeof p.did === 'string' &&
+    typeof p.uri === 'string' &&
+    typeof p.rkey === 'string' &&
+    typeof p.cid === 'string' &&
+    typeof p.pdsUrl === 'string' &&
+    typeof p.updatedAt === 'string'
+  )
+}
+
+/**
+ * Load the publications registry (H9). Absent reads as empty; corrupt
+ * JSON — or a top-level value that is not an object — is quarantined
+ * (bytes preserved, see src/store/corrupt.ts) and reads as empty.
+ * Entries that fail validation are dropped individually: one bad
+ * entry never wipes the other publications.
+ */
 export function loadPublications(
   kv: PublicKv = localStorage,
 ): Record<string, Publication> {
-  try {
-    const raw = kv.getItem(PUBLICATIONS_KEY)
-    if (!raw) return {}
-    const obj: unknown = JSON.parse(raw)
-    return typeof obj === 'object' && obj !== null
-      ? (obj as Record<string, Publication>)
-      : {}
-  } catch {
+  const read = readStoredJson(kv, PUBLICATIONS_KEY)
+  if (read.status === 'absent') return {}
+  if (read.status === 'corrupt') return {}
+  const obj = read.value
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    noteCorruptStore(kv, PUBLICATIONS_KEY, read.raw, 'not a JSON object')
     return {}
   }
+  const out: Record<string, Publication> = {}
+  for (const [rkey, pub] of Object.entries(obj as Record<string, unknown>)) {
+    if (isPublication(pub)) out[rkey] = pub
+  }
+  return out
 }
 
 export function getPublication(
@@ -264,14 +289,41 @@ export function getPublication(
   return loadPublications(kv)[recipeId] ?? null
 }
 
+/**
+ * Record a publication. When the stored registry is corrupt the write
+ * is SKIPPED (warned, not thrown): the registry is a non-authoritative
+ * cache — the PDS putRecord already succeeded, and failing the publish
+ * after the record went live would report the opposite of the truth.
+ * The corruption banner surfaces the damage; restore or discarding
+ * the damaged copy heals the registry. (The publications registry is
+ * NOT part of the encrypted backup, so restore cannot heal it — a
+ * re-publish after discarding rebuilds the entries.)
+ */
 function savePublication(pub: Publication, kv: PublicKv): void {
+  // Load first: the load is what detects (and records) corruption, so
+  // the check below sees it even when no earlier call loaded the store.
   const all = loadPublications(kv)
+  if (isStoreCorrupt(PUBLICATIONS_KEY)) {
+    console.warn(
+      'publication not recorded: the saved publications list is damaged — ' +
+        'the recipe is still live on the PDS; discard the damaged copy and re-publish to record it',
+    )
+    return
+  }
   all[pub.rkey] = pub
   kv.setItem(PUBLICATIONS_KEY, JSON.stringify(all))
 }
 
+/** Drop a registry entry. Skipped (not thrown) when the registry is corrupt: the entry is unreadable either way, and the PDS delete already succeeded. */
 function dropPublication(recipeId: string, kv: PublicKv): void {
   const all = loadPublications(kv)
+  if (isStoreCorrupt(PUBLICATIONS_KEY)) {
+    console.warn(
+      'publication entry not dropped: the saved publications list is damaged — ' +
+        'the PDS record is already gone',
+    )
+    return
+  }
   if (recipeId in all) {
     delete all[recipeId]
     kv.setItem(PUBLICATIONS_KEY, JSON.stringify(all))

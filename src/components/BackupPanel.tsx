@@ -13,7 +13,13 @@ import { shareOrDownloadFile } from '../backup/fileShare'
 import { friendlyError } from '../friendlyError'
 
 interface Props {
-  identity: Identity
+  /**
+   * The device identity, or null when it is damaged (H8): creating a
+   * backup needs an identity to back up, but restoring one does not —
+   * the restore replaces the damaged key. Export also works without
+   * one (recipes + friends by name/DID only).
+   */
+  identity: Identity | null
   onClose: () => void
   /** The cookbook changed (a restore landed) — refresh the list. */
   onRestored: () => void
@@ -92,6 +98,10 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
   }
 
   const doCreateBackup = async () => {
+    if (!identity) {
+      setError('There is no device identity to back up right now.')
+      return
+    }
     setBusy(true)
     setResult(null)
     setError(null)
@@ -192,6 +202,12 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
           shares, and all recipes. Protected by a passphrase only you
           know — it is never stored on this device, and without it the
           backup cannot be opened. There is no recovery.
+          {!identity && (
+            <>
+              {' '}Creating a backup needs a working device identity, so
+              it is unavailable until the identity is restored below.
+            </>
+          )}
         </p>
         <label className="field-label" htmlFor="backup-passphrase">Backup passphrase</label>
         <input
@@ -217,7 +233,7 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
           <button
             className="primary"
             data-testid="create-backup"
-            disabled={busy || !createPass || !createConfirm}
+            disabled={busy || !identity || !createPass || !createConfirm}
             onClick={() => void doCreateBackup()}
           >
             {busy ? 'Working…' : 'Create encrypted backup'}

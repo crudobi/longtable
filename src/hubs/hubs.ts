@@ -22,6 +22,11 @@
  */
 import type { KeyValueStore } from '../identity/identity'
 import { secretKv } from '../secrets/secretStore'
+import {
+  assertStoreWritable,
+  noteCorruptStore,
+  readStoredJson,
+} from '../store/corrupt'
 
 export interface HubConfig {
   id: string
@@ -214,32 +219,52 @@ function isHubConfig(o: unknown): o is HubConfig {
   )
 }
 
+/**
+ * Load the hub registry (H9). Absent reads as the seeded default hub.
+ * Corrupt JSON — or a value with no valid hub entry at all — is
+ * quarantined (bytes preserved, see src/store/corrupt.ts) and reads
+ * as the seeded default. Entries that fail validation are dropped
+ * individually: one bad hub entry no longer wipes every hub (the old
+ * `.every(isHubConfig)` check discarded the whole registry for a
+ * single bad entry).
+ */
 function loadRegistry(kv: KeyValueStore): HubRegistry {
-  try {
-    const raw = kv.getItem(HUBS_KEY)
-    if (raw) {
-      const obj: unknown = JSON.parse(raw)
-      if (
-        typeof obj === 'object' && obj !== null &&
-        Array.isArray((obj as HubRegistry).hubs) &&
-        (obj as HubRegistry).hubs.length > 0 &&
-        (obj as HubRegistry).hubs.every(isHubConfig)
-      ) {
-        const reg = obj as HubRegistry
-        if (migrateLegacyDefaultHub(reg)) saveRegistry(reg, kv)
-        if (!reg.hubs.some((h) => h.id === reg.activeId)) {
-          reg.activeId = reg.hubs[0].id
-        }
-        return reg
-      }
-    }
-  } catch {
-    /* fall through to the seeded default */
+  const read = readStoredJson(kv, HUBS_KEY)
+  if (read.status === 'absent') {
+    return { hubs: [{ ...DEFAULT_HUB }], activeId: DEFAULT_HUB_ID }
   }
-  return { hubs: [{ ...DEFAULT_HUB }], activeId: DEFAULT_HUB_ID }
+  if (read.status === 'corrupt') {
+    return { hubs: [{ ...DEFAULT_HUB }], activeId: DEFAULT_HUB_ID }
+  }
+  const obj = read.value
+  if (typeof obj !== 'object' || obj === null || !Array.isArray((obj as HubRegistry).hubs)) {
+    noteCorruptStore(kv, HUBS_KEY, read.raw, 'not a hub registry object')
+    return { hubs: [{ ...DEFAULT_HUB }], activeId: DEFAULT_HUB_ID }
+  }
+  const reg = obj as HubRegistry
+  const hubs = reg.hubs.filter(isHubConfig)
+  if (hubs.length === 0) {
+    noteCorruptStore(kv, HUBS_KEY, read.raw, 'no valid hub entries')
+    return { hubs: [{ ...DEFAULT_HUB }], activeId: DEFAULT_HUB_ID }
+  }
+  const clean: HubRegistry = { hubs, activeId: reg.activeId }
+  if (migrateLegacyDefaultHub(clean)) saveRegistry(clean, kv)
+  if (!clean.hubs.some((h) => h.id === clean.activeId)) {
+    clean.activeId = clean.hubs[0].id
+  }
+  return clean
 }
 
+/**
+ * Persist the registry. Refuses (throws CorruptStoreError) when the
+ * stored registry is corrupt: a hub change that saved over the
+ * damaged bytes would drop every configured hub. Backup restore does
+ * not cover hubs (they are re-enterable settings) — a corrupt
+ * registry heals by discarding the damaged copy from the app's
+ * corruption banner, which restores the seeded default.
+ */
 function saveRegistry(reg: HubRegistry, kv: KeyValueStore): void {
+  assertStoreWritable(HUBS_KEY)
   try {
     kv.setItem(HUBS_KEY, JSON.stringify(reg))
   } catch {
