@@ -12,6 +12,17 @@ import {
   type FriendRecord,
 } from '../friends/friends'
 import {
+  acceptManualOffer,
+  completeManualOffer,
+  createManualOffer,
+  extractManualBlob,
+  isManualSdpSupported,
+  manualOfferLink,
+  MANUAL_OFFER_HASH_PARAM,
+  type ManualSdpSession,
+} from '../friends/manualSdp'
+import { getIceServers } from '../hubs/hubs'
+import {
   getDisplayName,
   importReceivedShares,
   listReceivedShares,
@@ -47,6 +58,35 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
   const scan = currentScanCapability()
   const pairingRef = useRef(false)
 
+  // Manual-SDP fallback (E3): pair with no hub in the path. The offer
+  // and answer are copy/paste blobs (or a link carrying the offer in
+  // its hash); the hello exchange underneath is the same signed
+  // handshake as the signaling path. Sessions live in refs — they
+  // hold a live RTCPeerConnection and are not render state.
+  const [manualSupported] = useState(() => isManualSdpSupported())
+  const [manualMode, setManualMode] = useState<'idle' | 'offer' | 'answer'>('idle')
+  const [manualOfferText, setManualOfferText] = useState('')
+  const [manualOfferUrl, setManualOfferUrl] = useState('')
+  const [manualAnswerInput, setManualAnswerInput] = useState('')
+  const [manualOfferInput, setManualOfferInput] = useState('')
+  const [manualAnswerText, setManualAnswerText] = useState('')
+  const [manualBusy, setManualBusy] = useState(false)
+  const manualOfferRef = useRef<ManualSdpSession | null>(null)
+  const manualAnswerRef = useRef<ManualSdpSession | null>(null)
+
+  const clearManual = useCallback(() => {
+    manualOfferRef.current?.close()
+    manualAnswerRef.current?.close()
+    manualOfferRef.current = null
+    manualAnswerRef.current = null
+    setManualMode('idle')
+    setManualOfferText('')
+    setManualOfferUrl('')
+    setManualAnswerInput('')
+    setManualOfferInput('')
+    setManualAnswerText('')
+  }, [])
+
   const reload = useCallback(async () => {
     // Import on open: channel docs may already hold shares the live
     // update subscription has not imported yet (its App-level effect can
@@ -61,6 +101,27 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
   useEffect(() => {
     void reload()
   }, [reload])
+
+  // A manual-offer link opens the app with the offer in the URL hash
+  // (`#lt-manual-offer=<blob>`). Pick it up into the manual-answer
+  // box when the panel opens, then clear the hash so the blob — which
+  // carries the pair secret — does not linger in the URL bar.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const hash = window.location.hash
+    if (!hash.includes(`#${MANUAL_OFFER_HASH_PARAM}=`)) return
+    setManualOfferInput(extractManualBlob(hash))
+    setManualMode('answer')
+    try {
+      window.history.replaceState(
+        null,
+        '',
+        window.location.pathname + window.location.search,
+      )
+    } catch {
+      // The hash stays, but the blob is still usable from the box.
+    }
+  }, [])
 
   const myName = name.trim() || 'A Longtable cook'
 
@@ -112,6 +173,93 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
       setError(friendlyError(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  // Manual-SDP offerer: mint an invite + offer blob. Pairing itself
+  // starts only once the guest's answer is pasted back (the 90 s
+  // pairing clock covers the hello exchange, not the human copy/paste).
+  const createManual = async () => {
+    setError(null)
+    setStatus(null)
+    setManualBusy(true)
+    try {
+      const inv = await createFriendInvite(identity, myName)
+      const session = await createManualOffer(inv, getIceServers())
+      manualOfferRef.current = session
+      setManualOfferText(session.offerText ?? '')
+      setManualOfferUrl(
+        session.offerText ? manualOfferLink(session.offerText) : '',
+      )
+      setManualMode('offer')
+    } catch (e) {
+      setError(friendlyError(e))
+    } finally {
+      setManualBusy(false)
+    }
+  }
+
+  // Manual-SDP offerer, step 2: apply the pasted answer, then pair.
+  const completeManual = async () => {
+    const session = manualOfferRef.current
+    if (!session) return
+    setError(null)
+    setStatus(null)
+    setManualBusy(true)
+    try {
+      await completeManualOffer(session, manualAnswerInput)
+      const rec = await session.pair(identity, myName, undefined, undefined, {
+        singleUse: true,
+      })
+      setStatus(
+        `You are now friends with ${rec.name || shortDid(rec.did)} (paired without a hub).`,
+      )
+      await joinFriendChannel(rec)
+      await importReceivedShares(identity)
+      clearManual()
+      await reload()
+      onChanged()
+    } catch (e) {
+      setError(friendlyError(e))
+      clearManual()
+    } finally {
+      setManualBusy(false)
+    }
+  }
+
+  // Manual-SDP guest: take a pasted offer (blob or link), mint the
+  // answer blob to copy back, and pair in the background — the
+  // channel opens when the offerer applies the answer.
+  const answerManual = async () => {
+    setError(null)
+    setStatus(null)
+    setManualBusy(true)
+    try {
+      const session = await acceptManualOffer(manualOfferInput, getIceServers())
+      manualAnswerRef.current = session
+      setManualAnswerText(session.answerText ?? '')
+      setManualMode('answer')
+      setManualBusy(false)
+      void session
+        .pair(identity, myName, undefined, undefined, { singleUse: true })
+        .then(async (rec) => {
+          setStatus(
+            `You are now friends with ${rec.name || shortDid(rec.did)} (paired without a hub).`,
+          )
+          await joinFriendChannel(rec)
+          const n = await importReceivedShares(identity)
+          if (n > 0) setStatus((s) => `${s ?? ''} ${n} shared recipe(s) received.`)
+          clearManual()
+          await reload()
+          onChanged()
+        })
+        .catch((e: unknown) => {
+          setError(friendlyError(e))
+          clearManual()
+        })
+    } catch (e) {
+      setError(friendlyError(e))
+      setManualBusy(false)
     }
   }
 
@@ -211,6 +359,133 @@ export function FriendsPanel({ identity, onClose, onOpenRecipe, onChanged }: Pro
           <p className="muted" data-testid="friend-join-scan-unavailable">
             {scan.reason} Pasting the code still works.
           </p>
+        )}
+
+        <h3>Pair without a hub</h3>
+        <p className="muted">
+          No hub reachable? Pair by hand instead: one device creates an
+          offer, the other answers it, and the two connect directly —
+          the same signed pairing as the invite code, with no server in
+          the path. Treat the offer and answer like the invite code:
+          they carry the pairing secret, so send them only to your friend.
+        </p>
+        {!manualSupported ? (
+          <p className="muted" data-testid="manual-unsupported">
+            Manual pairing needs WebRTC, which this browser does not provide.
+          </p>
+        ) : (
+          <>
+            {manualMode !== 'answer' && (
+              <>
+                <button
+                  data-testid="manual-offer-create"
+                  disabled={manualBusy || manualMode === 'offer'}
+                  onClick={() => void createManual()}
+                >
+                  {manualMode === 'offer' ? 'Offer created — send it to your friend' : 'Create a manual offer'}
+                </button>
+                {manualMode === 'offer' && (
+                  <>
+                    <label className="field-label" htmlFor="manual-offer-text">Your offer — send this to your friend</label>
+                    <textarea
+                      id="manual-offer-text"
+                      rows={3}
+                      readOnly
+                      value={manualOfferText}
+                      data-testid="manual-offer-text"
+                      aria-label="Manual offer"
+                      onFocus={(e) => e.target.select()}
+                    />
+                    <label className="field-label" htmlFor="manual-offer-link">…or as a link (the offer rides in the link, not on a server)</label>
+                    <textarea
+                      id="manual-offer-link"
+                      rows={3}
+                      readOnly
+                      value={manualOfferUrl}
+                      data-testid="manual-offer-link"
+                      aria-label="Manual offer link"
+                      onFocus={(e) => e.target.select()}
+                    />
+                    <label className="field-label" htmlFor="manual-answer-input">Paste their answer back here</label>
+                    <textarea
+                      id="manual-answer-input"
+                      rows={3}
+                      value={manualAnswerInput}
+                      onChange={(e) => setManualAnswerInput(e.target.value)}
+                      placeholder="Paste the answer blob"
+                      data-testid="manual-answer-input"
+                      aria-label="Manual answer to complete pairing"
+                    />
+                    <div className="modal-actions">
+                      <button
+                        className="primary"
+                        data-testid="manual-answer-complete"
+                        disabled={manualBusy || !manualAnswerInput.trim()}
+                        onClick={() => void completeManual()}
+                      >
+                        {manualBusy ? 'Pairing…' : 'Pair with this answer'}
+                      </button>
+                      <button
+                        className="ghost"
+                        data-testid="manual-offer-cancel"
+                        disabled={manualBusy}
+                        onClick={clearManual}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+            {manualMode !== 'offer' && (
+              <>
+                <label className="field-label" htmlFor="manual-offer-input">…or paste a friend's manual offer (blob or link)</label>
+                <textarea
+                  id="manual-offer-input"
+                  rows={3}
+                  value={manualOfferInput}
+                  onChange={(e) => setManualOfferInput(e.target.value)}
+                  placeholder="Paste the offer blob or link"
+                  data-testid="manual-offer-input"
+                  aria-label="Manual offer to answer"
+                />
+                <div className="modal-actions">
+                  <button
+                    className="primary"
+                    data-testid="manual-answer-create"
+                    disabled={manualBusy || !manualOfferInput.trim()}
+                    onClick={() => void answerManual()}
+                  >
+                    {manualBusy ? 'Pairing…' : 'Create answer'}
+                  </button>
+                  {manualMode === 'answer' && (
+                    <button
+                      className="ghost"
+                      data-testid="manual-answer-cancel"
+                      disabled={manualBusy}
+                      onClick={clearManual}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+                {manualMode === 'answer' && manualAnswerText && (
+                  <>
+                    <p className="muted">Waiting for the other device… send them your answer:</p>
+                    <textarea
+                      rows={3}
+                      readOnly
+                      value={manualAnswerText}
+                      data-testid="manual-answer-text"
+                      aria-label="Manual answer"
+                      onFocus={(e) => e.target.select()}
+                    />
+                  </>
+                )}
+              </>
+            )}
+          </>
         )}
 
         <h3>Your friends</h3>

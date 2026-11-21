@@ -22,6 +22,27 @@ export function base64ToU8(b64: string): Uint8Array {
   return u8
 }
 
+/**
+ * URL-safe base64 (RFC 4648 §5) — the encoding for copy/paste blobs
+ * that also travel in URL hashes (manual SDP offer/answer, E3). Same
+ * alphabet as base64 with `+` → `-`, `/` → `_`, and padding omitted,
+ * so the blob survives a URL fragment, a QR payload, and a paste
+ * without percent-encoding. Decoding re-adds padding and rejects
+ * anything outside the URL-safe alphabet.
+ */
+export function u8ToBase64Url(u8: Uint8Array): string {
+  return u8ToBase64(u8).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
+}
+
+export function base64UrlToU8(s: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]*$/.test(s)) {
+    throw new Error('Not a valid base64url string.')
+  }
+  const padded = s.replaceAll('-', '+').replaceAll('_', '/')
+  const pad = (4 - (padded.length % 4)) % 4
+  return base64ToU8(padded + '='.repeat(pad))
+}
+
 export function utf8ToU8(str: string): Uint8Array {
   return new TextEncoder().encode(str)
 }

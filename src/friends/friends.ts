@@ -24,6 +24,12 @@
  * No account, no email, no hub account: the hub is signaling-only, exactly
  * as in Phase 1. Friend records and the pair secret live in the Android
  * Keystore (src/secrets/secretStore.ts) on native, in localStorage on web.
+ *
+ * Hub-less pairing (E3, PLAN.md §2/§4.0): when no hub is reachable the
+ * same handshake runs over a direct RTCPeerConnection whose SDP is
+ * exchanged by hand — see manualSdp.ts. The transport changes; the
+ * hello, its verification, the channel binding, and the single-use
+ * enforcement do not: all three live here and both paths call them.
  */
 import * as Y from 'yjs'
 import sodium from 'libsodium-wrappers'
@@ -354,7 +360,7 @@ export function parseFriendInvite(text: string): FriendInvitePayload {
 // Pairing handshake (ephemeral Y.Doc in the one-time pairing room)
 // ---------------------------------------------------------------------------
 
-interface Hello {
+export interface Hello {
   did: string
   name: string
   /** base64 detached signature over the v2 hello message (see helloMessage). */
@@ -409,6 +415,156 @@ export function helloNameMessage(
   name: string,
 ): Uint8Array {
   return utf8ToU8(`longtable-pair:v3:name:${room}:${did}:${pairId}:${name}`)
+}
+
+// ---------------------------------------------------------------------------
+// Shared hello build / verify / finalize (E3)
+// ---------------------------------------------------------------------------
+//
+// The signaling path (runPairing, below) and the manual-SDP fallback
+// (manualSdp.ts) are two transports for ONE pairing: the same hello,
+// the same verification, the same friend record. These three helpers
+// are the shared core, so a fix to verification can never land on one
+// path and miss the other. Neither transport invents its own.
+
+export interface VerifyHelloContext {
+  room: string
+  pairId: string
+  expectedPeerDid: string | null
+  expectedPeerName?: string | null
+}
+
+export type VerifyHelloResult =
+  | { ok: true; did: string; name: string; channelVersion?: number }
+  | { ok: false; reason: string }
+
+/** Build my own hello: v2 signature over room+did+pairId, plus the M3 name signature. */
+export async function buildMyHello(
+  identity: Identity,
+  myName: string,
+  room: string,
+  pairId: string,
+): Promise<Hello> {
+  const sig = await signDetached(
+    identity,
+    helloMessage(room, identity.did, pairId),
+  )
+  // M3: sign my own display name into the hello as well.
+  const nameSig = await signDetached(
+    identity,
+    helloNameMessage(room, identity.did, pairId, myName),
+  )
+  return {
+    did: identity.did,
+    name: myName,
+    sig: u8ToBase64(sig),
+    nameSig: u8ToBase64(nameSig),
+    // v2 channel binding (S8): this side derives DID-bound rooms/docs.
+    channelVersion: 2,
+  }
+}
+
+/**
+ * Judge one peer hello. Returns the verified peer (did, bound name,
+ * channel version) or a reason — never throws for a bad hello, so the
+ * caller can skip it and keep waiting (M4). Checks, in order: the
+ * expected DID (a racer, or the wrong guest), the expected name (M3),
+ * the v2 hello signature (proves possession of the pair secret), and
+ * for a v2 peer the signed display name (a swapped name is rejected).
+ */
+export async function verifyPeerHello(
+  hello: Hello,
+  ctx: VerifyHelloContext,
+): Promise<VerifyHelloResult> {
+  // Wrong device: a racer, or the wrong guest — keep waiting for the
+  // expected one (M4: skip, never throw mid-pairing).
+  if (ctx.expectedPeerDid && hello.did !== ctx.expectedPeerDid) {
+    return { ok: false, reason: 'unexpected peer DID' }
+  }
+  // M3: the guest knows the name on the invite they scanned.
+  if (ctx.expectedPeerName != null && hello.name !== ctx.expectedPeerName) {
+    return { ok: false, reason: 'unexpected peer name' }
+  }
+  // A malformed signature (bad base64, wrong length) verifies as
+  // false, never throws — the caller skips it like any bad hello.
+  const verifies = async (
+    did: string,
+    msg: Uint8Array,
+    sigB64: string,
+  ): Promise<boolean> => {
+    try {
+      return await verifyDetached(did, msg, base64ToU8(sigB64))
+    } catch {
+      return false
+    }
+  }
+  if (
+    !(await verifies(
+      hello.did,
+      helloMessage(ctx.room, hello.did, ctx.pairId),
+      hello.sig,
+    ))
+  ) {
+    return { ok: false, reason: 'hello signature does not verify' }
+  }
+  // M3: a v2 peer's display name must be signed. An unsigned or
+  // mis-signed name from a v2 peer is a swapped name — skip it.
+  if (hello.channelVersion === 2) {
+    if (typeof hello.name !== 'string' || typeof hello.nameSig !== 'string') {
+      return { ok: false, reason: 'v2 peer sent no signed name' }
+    }
+    if (
+      !(await verifies(
+        hello.did,
+        helloNameMessage(ctx.room, hello.did, ctx.pairId, hello.name),
+        hello.nameSig,
+      ))
+    ) {
+      return { ok: false, reason: 'name signature does not verify' }
+    }
+  }
+  return {
+    ok: true,
+    did: hello.did,
+    name: typeof hello.name === 'string' ? hello.name : '',
+    channelVersion: hello.channelVersion,
+  }
+}
+
+/**
+ * Persist a verified peer as a friend record. The v2 channel binding
+ * (S8) applies only when the peer advertised v2: both sides compute
+ * the same symmetric tag from the pair secret and the two DIDs; an
+ * older peer sends no channelVersion and the pairing stays on the
+ * legacy derivation, so mixed-version pairings still connect (on the
+ * old, shared-room derivation). The friend record carries the pair
+ * secret, so the Keystore flush is awaited before returning — the
+ * pairing must survive a kill right after it completes. M2: in
+ * single-use mode this invite is spent now.
+ */
+export async function finalizePairing(
+  peer: { did: string; name: string; channelVersion?: number },
+  invite: FriendInvitePayload,
+  pairId: string,
+  myDid: string,
+  kv: KeyValueStore = secretKv,
+  opts: RunPairingOptions = {},
+): Promise<FriendRecord> {
+  const rec: FriendRecord = {
+    did: peer.did,
+    name: peer.name,
+    pairSecret: invite.pairSecret,
+    pairId,
+    signaling: invite.signaling,
+    addedAt: new Date().toISOString(),
+  }
+  if (peer.channelVersion === 2) {
+    rec.channelTag = channelTagFor(pairId, myDid, peer.did)
+  }
+  saveFriend(rec, kv)
+  await flushSecrets()
+  if (opts.singleUse) markInviteUsed(pairId, invite.room, peer.did, kv)
+  return rec
 }
 
 // y-webrtc is lazy-loaded on first use (it pulls in WebRTC shims that
@@ -497,23 +653,9 @@ export async function runPairing(
   const doc = new Y.Doc()
   const provider = await connectEphemeral(invite.room, doc, invite.signaling)
   try {
-    const sig = await signDetached(
-      identity,
-      helloMessage(invite.room, identity.did, pairId),
-    )
-    // M3: sign my own display name into the hello as well.
-    const nameSig = await signDetached(
-      identity,
-      helloNameMessage(invite.room, identity.did, pairId, myName),
-    )
-    const mine: Hello = {
-      did: identity.did,
-      name: myName,
-      sig: u8ToBase64(sig),
-      nameSig: u8ToBase64(nameSig),
-      // v2 channel binding (S8): this side derives DID-bound rooms/docs.
-      channelVersion: 2,
-    }
+    // My hello, signed (v2 + M3 name) — the same hello the manual-SDP
+    // fallback sends over its data channel (see manualSdp.ts).
+    const mine = await buildMyHello(identity, myName, invite.room, pairId)
     doc.transact(() => {
       doc.getMap(HELLO_MAP).set(identity.did, JSON.stringify(mine))
     })
@@ -541,79 +683,28 @@ export async function runPairing(
           skippedBad.add(badKey)
           skippedCount++
         }
-        // Wrong device: a racer, or the wrong guest — keep waiting
-        // for the expected one (M4: skip, never throw mid-pairing).
-        if (expectedPeerDid && hello.did !== expectedPeerDid) {
-          skip()
-          continue
-        }
-        // M3: the guest knows the name on the invite they scanned.
-        if (
-          opts.expectedPeerName != null &&
-          hello.name !== opts.expectedPeerName
-        ) {
-          skip()
-          continue
-        }
-        let ok = false
-        try {
-          ok = await verifyDetached(
-            hello.did,
-            helloMessage(invite.room, hello.did, pairId),
-            base64ToU8(hello.sig),
-          )
-        } catch {
-          ok = false
-        }
-        if (!ok) {
-          skip()
-          continue
-        }
-        // M3: a v2 peer's display name must be signed. An unsigned or
-        // mis-signed name from a v2 peer is a swapped name — skip it.
-        if (hello.channelVersion === 2) {
-          if (typeof hello.name !== 'string' || typeof hello.nameSig !== 'string') {
-            skip()
-            continue
-          }
-          let nameOk = false
-          try {
-            nameOk = await verifyDetached(
-              hello.did,
-              helloNameMessage(invite.room, hello.did, pairId, hello.name),
-              base64ToU8(hello.nameSig),
-            )
-          } catch {
-            nameOk = false
-          }
-          if (!nameOk) {
-            skip()
-            continue
-          }
-        }
-        const rec: FriendRecord = {
-          did: hello.did,
-          name: typeof hello.name === 'string' ? hello.name : '',
-          pairSecret: invite.pairSecret,
+        // Bad hellos are SKIPPED, never fatal (M4) — the shared
+        // verifier (also used by the manual-SDP fallback) judges each
+        // hello; an unverifiable, wrong-DID, wrong-name, or
+        // name-unbound hello is ignored and polling continues.
+        const verified = await verifyPeerHello(hello, {
+          room: invite.room,
           pairId,
-          signaling: invite.signaling,
-          addedAt: new Date().toISOString(),
+          expectedPeerDid,
+          expectedPeerName: opts.expectedPeerName,
+        })
+        if (!verified.ok) {
+          skip()
+          continue
         }
-        // v2 channel binding (S8): only when the peer advertised v2.
-        // Both sides compute the same symmetric tag from the pair secret
-        // and the two DIDs; an older peer sends no channelVersion and the
-        // pairing stays on the legacy derivation, so mixed-version
-        // pairings still connect (on the old, shared-room derivation).
-        if (hello.channelVersion === 2) {
-          rec.channelTag = channelTagFor(pairId, identity.did, hello.did)
-        }
-        saveFriend(rec, kv)
-        // The friend record carries the pair secret: await the Keystore
-        // flush so the pairing survives a kill right after it completes.
-        await flushSecrets()
-        // M2: this invite is spent now (single-use mode only).
-        if (opts.singleUse) markInviteUsed(pairId, invite.room, hello.did, kv)
-        return rec
+        return await finalizePairing(
+          verified,
+          invite,
+          pairId,
+          identity.did,
+          kv,
+          opts,
+        )
       }
       if (Date.now() - t0 > timeoutMs) {
         throw new Error(
