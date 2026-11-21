@@ -754,8 +754,10 @@ export default function App() {
 
   if (!ready) {
     return (
-      <div className="view">
-        <p className="empty">Loading your recipes…</p>
+      <div className="app">
+        <div className="view">
+          <p className="empty">Loading your recipes…</p>
+        </div>
       </div>
     )
   }

@@ -32,6 +32,14 @@ body {
   background: var(--paper);
   border-left: 1px solid var(--line);
   border-right: 1px solid var(--line);
+  /* Wave 6D (API 36 edge-to-edge): the app targets SDK 36, so Android
+     draws the WebView under the status/gesture bars and index.html already
+     sets viewport-fit=cover — env(safe-area-inset-*) carries the real
+     insets here. 0 where there is no bar (desktop, older Android). */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
 }
 
 .view {
@@ -372,7 +380,9 @@ ol.edit-list {
 .dialog {
   background: var(--paper);
   border-radius: 16px 16px 0 0;
-  padding: 20px 20px 28px;
+  /* Wave 6D: bottom sheet is fixed to the viewport bottom — keep its
+     actions above the gesture bar. */
+  padding: 20px calc(20px + env(safe-area-inset-right, 0px)) calc(28px + env(safe-area-inset-bottom, 0px)) calc(20px + env(safe-area-inset-left, 0px));
   width: 100%;
   max-width: 640px;
 }
@@ -419,7 +429,8 @@ ol.edit-list {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  /* Wave 6D: keep the modal clear of the status/gesture bars. */
+  padding: calc(16px + env(safe-area-inset-top, 0px)) calc(16px + env(safe-area-inset-right, 0px)) calc(16px + env(safe-area-inset-bottom, 0px)) calc(16px + env(safe-area-inset-left, 0px));
   z-index: 50;
 }
 
