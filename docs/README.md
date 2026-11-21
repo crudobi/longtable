@@ -12,6 +12,9 @@ This documentation is the contract surface for third-party developers.
 | [importers.md](importers.md) | The Importer API v1: how to write an importer module that the app loads and offers in its Import panel. |
 | [public-protocol.md](public-protocol.md) | The public recipe protocol: lexicons, the device-key binding, the signature schemes, and the AppView API — enough to read, write, and verify public recipes without this app. |
 | [localhost-api.md](localhost-api.md) | The localhost API: an opt-in, token-guarded HTTP API on the user's own device for scripting and local integrations (list / search / create / update / delete / import). |
+| [install.md](install.md) | Installing the GitHub release on a phone: APK (not AAB), checksum verification, unknown-sources and Play Protect, upgrading and uninstalling. |
+| [privacy-policy.md](privacy-policy.md) | The app's privacy policy: what data leaves the device, and when — local-first storage, no accounts, no analytics, no ads. |
+| [data-safety.md](data-safety.md) | Groundwork for a future Play data-safety declaration (not a filed declaration): the privacy-policy facts mapped onto the form's questions. |
 | [accepted-risks.md](accepted-risks.md) | Accepted risks and by-design decisions: what the app deliberately does not do, and why (forward secrecy, frameable PWA, localhost-API plaintext reads, canonical-hash coverage). |
 | [release-rollback.md](release-rollback.md) | Release rollback: the Play staged-rollout + halt procedure, and what "roll back" means when there is no downgrade. |
 | [../lexicons/](../lexicons/) | The `kitchen.longtable.*` lexicon JSON schemas (the normative record shapes). |
