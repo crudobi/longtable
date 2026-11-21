@@ -287,8 +287,10 @@ async function attachSignaling(): Promise<void> {
     env: {
       ...process.env,
       PORT: String(serverPort),
-      TLS_CERT: '/nonexistent',
-      TLS_KEY: '/nonexistent',
+      // Sec L15: plaintext is an explicit opt-out now — the old
+      // /nonexistent-cert trick that forced the silent ws fallback
+      // no longer starts the server.
+      SIGNAL_PLAINTEXT: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })

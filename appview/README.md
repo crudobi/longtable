@@ -85,8 +85,33 @@ recipes whose device's binding was deleted or stopped verifying
 (deleting a device's binding is that device's revocation; publishing
 from a new device only ADDS a binding and never drops another device's
 recipes — H-N1). Stats keep
-`{indexed, rejected, signatureRejected, sweepSkipped, mediaPurged, lastReconcileAt}`; any
+`{indexed, rejected, signatureRejected, validationRejected, budgetExceeded, sweepSkipped, mediaPurged, lastReconcileAt}`; any
 verification failure increments `rejected` and indexes nothing.
+
+Before any signature is checked, each recipe record must also pass
+lexicon validation (Int M1): `$type` must be exactly
+`kitchen.longtable.recipe`, the lexicon-required fields (`name`,
+`ingredients`, `instructions`, `createdAt`, `longtableId`) must be
+present with the right types, and every field must be within its
+lexicon cap (name ≤ 300 chars, description ≤ 3000, ingredients ≤ 100
+× 1000 chars, instructions ≤ 200 × 5000 chars, prep/cook minutes
+integers 0–10080, yield ≤ 100, tags ≤ 20 × 64, images ≤ 10, device
+signature ≤ 256 chars). A record outside the lexicon is rejected,
+counted (`validationRejected`) and never indexed — the old
+coerce-anything behavior (`recordToRow` never rejecting) is gone.
+The repo rkey must also be the record's own `longtableId` (S16): the
+device signature binds `longtableId`, not the rkey, and the client
+publishes `rkey === longtableId` (`recipe.id` in both) — without the
+assert, one signed record could be indexed under any number of
+rkeys. A record whose rkey differs is rejected the same way.
+
+One huge repo cannot head-of-line-block the shared queue (S15):
+a reconcile stops after 5000 records or 30 s (`MAX_RECONCILE_RECORDS`
+/ `MAX_RECONCILE_MS` in `ingest.mjs`, overridable per ingestor) and
+leaves the rest for the next periodic sweep — and it SKIPS the
+sweep-delete when it stops early, because `seen` is incomplete and a
+sweep would delete rows the budget never examined
+(`budgetExceeded: true` in the result, counted in stats).
 
 Two exceptions to the sweep, both fail-closed the other way. First, NO
 pubkey binding at all (`missing-binding`: no binding record at any
@@ -204,17 +229,24 @@ with `Retry-After` past the cap); `/media/:did/:cid` only serves a
 blob an indexed recipe of that DID references (otherwise the cache
 was an open blob-fetch oracle); `/author/` is bounded at 100 rows;
 `/search` bounds `q` to 500 chars and the ingredient list to 20
-entries (400 past the bounds).
+entries (400 past the bounds). Cached blobs are re-verified against
+their CID hash on every serve (Sec L12 — a corrupt or tampered cache
+entry is dropped and refetched, never served); eviction is LRU (a
+cache hit refreshes the entry's mtime, so the oldest-*read* entries
+go first), orphaned `.tmp` files are swept at startup, and their
+bytes count toward the cache bound, so they can never push the cache
+past its cap uncounted (Int L1).
 
 ## HTTP API
 
 | Route | Response |
 | --- | --- |
 | `GET /health` | `{ok: true}` |
-| `GET /stats` | `{indexed, rejected, signatureRejected, lastReconcileAt, total, fts5}` |
-| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt, longtableId, deviceDid, deviceSignature, deviceKey}]}` ranked by FTS rank — device-verified rows only (S2); list items are unverified by the client until opened (S10) |
+| `GET /stats` | `{indexed, rejected, signatureRejected, validationRejected, budgetExceeded, lastReconcileAt, total, unverified, fts5, media}` |
+| `GET /search?q=<name terms>` | `{results: [{uri, did, rkey, name, ingredients, tags, updatedAt, longtableId, deviceDid, deviceSignature, deviceKey}], total, limit, offset}` ranked by FTS rank — device-verified rows only (S2); list items are unverified by the client until opened (S10). `q` matches the recipe name OR its steps (instructions, Int L10a) |
 | `GET /search?ingredients=egg,flour` | recipes containing **all** listed ingredients (AND) |
 | `GET /search?q=...&ingredients=...` | both filters combined |
+| `GET /search?q=...&limit=20&offset=40` | paged results (Int L2): `limit` 1–100 (default 100), `offset` ≥ 0 (default 0); `total` is the full matching count so clients can page to the end instead of guessing at a silent top-100 |
 | `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs, `deviceDid`, `deviceSignature`, `deviceKey`) or 404 — a row with NULL signature fields is a 404, not served (S2) |
 | `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same fields as `/search` (incl. `longtableId`), device-verified rows only (S2); bounded at 100 rows |
 | `GET /media/:did/:cid` | the recipe photo blob (`image/*` passthrough, anything else as `application/octet-stream` + attachment, nosniff + sandbox CSP — H2), `cache-control: public, max-age=31536000, immutable`; 404 unless an indexed recipe of that DID references the blob (M12 media gating) |

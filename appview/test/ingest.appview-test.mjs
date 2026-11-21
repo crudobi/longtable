@@ -51,7 +51,7 @@ describe('ingestor reconcile (fake verify seam)', () => {
 
   it('indexes recipes from the verified state and ignores other collections', async () => {
     state.records = [
-      { collection: 'kitchen.longtable.recipe', rkey: 'a', cid: 'cid-a', record: signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']) },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-alpha-soup', cid: 'cid-a', record: signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']) },
       { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bindingRecord(device, DID) },
       { collection: 'app.bsky.feed.post', rkey: 'p', cid: 'cid-p', record: { text: 'hi' } },
     ]
@@ -62,7 +62,7 @@ describe('ingestor reconcile (fake verify seam)', () => {
     expect(ingestor.stats.indexed).toBe(1)
     expect(ingestor.stats.lastReconcileAt).toBeTruthy()
     // The indexed row carries the signature fields for client verification.
-    const row = index.getRecipe(DID, 'a')
+    const row = index.getRecipe(DID, 'lt-alpha-soup')
     expect(row.deviceDid).toBe(device.deviceDid)
     expect(row.deviceSignature).toBeTruthy()
     expect(row.deviceKey).toBe(device.devicePublicKey)
@@ -71,8 +71,8 @@ describe('ingestor reconcile (fake verify seam)', () => {
   it('delete-via-reconcile-diff: a record that vanishes from the repo leaves the index', async () => {
     const binding = { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk', record: bindingRecord(device, DID) }
     state.records = [
-      { collection: 'kitchen.longtable.recipe', rkey: 'a', cid: 'cid-a', record: signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']) },
-      { collection: 'kitchen.longtable.recipe', rkey: 'b', cid: 'cid-b', record: signedRecipeRecord(device, DID, 'Beta Stew', ['2 potatoes']) },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-alpha-soup', cid: 'cid-a', record: signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg']) },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-beta-stew', cid: 'cid-b', record: signedRecipeRecord(device, DID, 'Beta Stew', ['2 potatoes']) },
       binding,
     ]
     await ingestor.reconcileRepo(DID)
@@ -142,12 +142,12 @@ describe('ingestClaim (forge-injection hook)', () => {
 
   it('rejects a claim whose CID differs even at the same collection/rkey', async () => {
     state.records = [
-      { collection: 'kitchen.longtable.recipe', rkey: 'r1', cid: 'cid-something-else', record: genuine },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-genuine-borscht', cid: 'cid-something-else', record: genuine },
     ]
     const res = await ingestor.ingestClaim({
       did: DID,
       collection: 'kitchen.longtable.recipe',
-      rkey: 'r1',
+      rkey: 'lt-genuine-borscht',
       record: genuine,
     })
     expect(res.indexed).toBe(false)
@@ -157,11 +157,11 @@ describe('ingestClaim (forge-injection hook)', () => {
 
   it('accepts a claim that is genuinely in the verified repo (CID equality)', async () => {
     const cid = (await cidForRecord(genuine)).toString()
-    state.records = [{ collection: 'kitchen.longtable.recipe', rkey: 'r1', cid, record: genuine }, bindingEntry]
+    state.records = [{ collection: 'kitchen.longtable.recipe', rkey: 'lt-genuine-borscht', cid, record: genuine }, bindingEntry]
     const res = await ingestor.ingestClaim({
       did: DID,
       collection: 'kitchen.longtable.recipe',
-      rkey: 'r1',
+      rkey: 'lt-genuine-borscht',
       record: genuine,
     })
     expect(res.verified).toBe(true)
@@ -176,7 +176,7 @@ describe('ingestClaim (forge-injection hook)', () => {
     const res = await ingestor.ingestClaim({
       did: DID,
       collection: 'kitchen.longtable.recipe',
-      rkey: 'r1',
+      rkey: 'lt-genuine-borscht',
       record: genuine,
     })
     expect(res.indexed).toBe(false)
@@ -206,7 +206,11 @@ describe('device-signature gate (C2)', () => {
   }
 
   function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
-    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+    // S16: the repo rkey IS the record's longtableId in production
+    // (publish.ts puts recipe.id in both) — the fixture entry uses
+    // the record's own id as its rkey, so the fixture stays a
+    // spec-compliant record under the ingest assert.
+    return { collection: 'kitchen.longtable.recipe', rkey: rec?.longtableId ?? rkey, cid, record: rec }
   }
 
   it('drops a recipe when the repo has no pubkey binding, and counts it', async () => {
@@ -327,13 +331,13 @@ describe('device-signature gate (C2)', () => {
     tampered.ingredients = [...tampered.ingredients, '1 cup motor oil']
     const cid = (await cidForRecord(tampered)).toString()
     state.records = [
-      { collection: 'kitchen.longtable.recipe', rkey: 'r1', cid, record: tampered },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-genuine-borscht', cid, record: tampered },
       bindingEntryFor(device),
     ]
     const res = await ingestor.ingestClaim({
       did: DID,
       collection: 'kitchen.longtable.recipe',
-      rkey: 'r1',
+      rkey: 'lt-genuine-borscht',
       record: tampered,
     })
     expect(res.indexed).toBe(false)
@@ -359,7 +363,11 @@ describe('per-device bindings (H-N1)', () => {
   afterEach(() => index.close())
 
   function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
-    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+    // S16: the repo rkey IS the record's longtableId in production
+    // (publish.ts puts recipe.id in both) — the fixture entry uses
+    // the record's own id as its rkey, so the fixture stays a
+    // spec-compliant record under the ingest assert.
+    return { collection: 'kitchen.longtable.recipe', rkey: rec?.longtableId ?? rkey, cid, record: rec }
   }
 
   it('two devices publish and both recipes stay indexed through flip-flopping reconciles', async () => {
@@ -404,10 +412,10 @@ describe('per-device bindings (H-N1)', () => {
       perDeviceBindingEntry(other, DID, 'cid-pk-b'),
     ]
     await ingestor.reconcileRepo(DID)
-    expect(index.getRecipe(DID, 'a').deviceKey).toBe(device.devicePublicKey)
-    expect(index.getRecipe(DID, 'a').deviceDid).toBe(device.deviceDid)
-    expect(index.getRecipe(DID, 'b').deviceKey).toBe(other.devicePublicKey)
-    expect(index.getRecipe(DID, 'b').deviceDid).toBe(other.deviceDid)
+    expect(index.getRecipe(DID, 'lt-alpha-soup').deviceKey).toBe(device.devicePublicKey)
+    expect(index.getRecipe(DID, 'lt-alpha-soup').deviceDid).toBe(device.deviceDid)
+    expect(index.getRecipe(DID, 'lt-beta-stew').deviceKey).toBe(other.devicePublicKey)
+    expect(index.getRecipe(DID, 'lt-beta-stew').deviceDid).toBe(other.deviceDid)
   })
 
   it('migration: the legacy self binding still verifies its recipes', async () => {
@@ -420,7 +428,7 @@ describe('per-device bindings (H-N1)', () => {
     expect(res.bindings).toBe(1)
     expect(res.bindingReason).toBeNull()
     expect(index.count()).toBe(1)
-    expect(index.getRecipe(DID, 'a').deviceKey).toBe(device.devicePublicKey)
+    expect(index.getRecipe(DID, 'lt-alpha-soup').deviceKey).toBe(device.devicePublicKey)
   })
 
   it('self plus a per-device binding for the same device deduplicate to one binding', async () => {
@@ -531,7 +539,11 @@ describe('binding-failure sweep rule (N1 / M-N5)', () => {
   }
 
   function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
-    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+    // S16: the repo rkey IS the record's longtableId in production
+    // (publish.ts puts recipe.id in both) — the fixture entry uses
+    // the record's own id as its rkey, so the fixture stays a
+    // spec-compliant record under the ingest assert.
+    return { collection: 'kitchen.longtable.recipe', rkey: rec?.longtableId ?? rkey, cid, record: rec }
   }
 
   async function indexVerified() {
@@ -605,7 +617,11 @@ describe('periodic reconcile sweep (N1 / S2)', () => {
   }
 
   function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
-    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+    // S16: the repo rkey IS the record's longtableId in production
+    // (publish.ts puts recipe.id in both) — the fixture entry uses
+    // the record's own id as its rkey, so the fixture stays a
+    // spec-compliant record under the ingest assert.
+    return { collection: 'kitchen.longtable.recipe', rkey: rec?.longtableId ?? rkey, cid, record: rec }
   }
 
   it('reconcileAllDids re-indexes a DID whose binding healed, without a new author commit', async () => {
@@ -652,7 +668,7 @@ describe('periodic reconcile sweep (N1 / S2)', () => {
       bindingEntryFor(device),
     ]
     await ingestor.reconcileAllDids()
-    const row = index.getRecipe(DID, 'a')
+    const row = index.getRecipe(DID, 'lt-alpha-soup')
     expect(row.deviceKey).toBe(device.devicePublicKey)
     expect(row.deviceDid).toBe(device.deviceDid)
     expect(row.deviceSignature).toBeTruthy()
@@ -739,12 +755,12 @@ describe('ingestClaim queue routing (S12)', () => {
     const recB = signedRecipeRecord(device, DID, 'Beta Stew', ['2 potatoes'])
     const cidB = (await cidForRecord(recB)).toString()
     const v1 = [
-      { collection: 'kitchen.longtable.recipe', rkey: 'a', cid: 'cid-a', record: recA },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-alpha-soup', cid: 'cid-a', record: recA },
       binding,
     ]
     const v2 = [
       ...v1,
-      { collection: 'kitchen.longtable.recipe', rkey: 'b', cid: cidB, record: recB },
+      { collection: 'kitchen.longtable.recipe', rkey: 'lt-beta-stew', cid: cidB, record: recB },
     ]
     let version = 'v1'
     const provider = async (did) => {
@@ -765,7 +781,7 @@ describe('ingestClaim queue routing (S12)', () => {
     expect(
       ingestor.handleFrame(
         { op: 1, t: '#commit' },
-        { repo: DID, ops: [{ action: 'create', path: 'kitchen.longtable.recipe/a', cid: null }] },
+        { repo: DID, ops: [{ action: 'create', path: 'kitchen.longtable.recipe/lt-alpha-soup', cid: null }] },
       ),
     ).toBe(true)
     // ...let it start (snapshot v1) before the repo moves on...
@@ -776,7 +792,7 @@ describe('ingestClaim queue routing (S12)', () => {
     const claimed = await ingestor.ingestClaim({
       did: DID,
       collection: 'kitchen.longtable.recipe',
-      rkey: 'b',
+      rkey: 'lt-beta-stew',
       record: recB,
     })
     await ingestor.pending

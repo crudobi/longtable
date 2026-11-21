@@ -21,6 +21,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import https from 'node:https'
 import net from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -69,13 +70,36 @@ const tlsProxies = tlsCfg.proxies ?? null
 // self-signed one into the data dir. Devices must trust it (or the CA that
 // signed the provided cert) — see README.
 function ensureTls() {
+  // Sec L15 — fail closed on configured-but-missing TLS paths. The
+  // old certDir branch returned paths it never checked, so an
+  // operator typo (or a deleted cert dir) silently handed the
+  // signaling child missing files — and the signaling server used to
+  // downgrade to ws:// on that. Now a configured path that does not
+  // exist is a startup error, not a downgrade. (The mint-a-cert
+  // branch below is the only path that creates files, and it runs
+  // only when the operator configured neither certDir nor cert/key.)
   if (tlsCfg.certDir) {
     const dir = rel(tlsCfg.certDir)
-    return { cert: path.join(dir, 'server.crt'), key: path.join(dir, 'server.key'), certDir: dir }
+    const cert = path.join(dir, 'server.crt')
+    const key = path.join(dir, 'server.key')
+    if (!fs.existsSync(cert) || !fs.existsSync(key)) {
+      console.error(
+        `[hub] tls.certDir is configured (${dir}) but server.crt/server.key are missing there — ` +
+          'refusing to start with no TLS certificate. Fix the paths or remove tls.certDir to mint a self-signed cert.',
+      )
+      process.exit(2)
+    }
+    return { cert, key, certDir: dir }
   }
   if (tlsCfg.cert && tlsCfg.key) {
     const cert = rel(tlsCfg.cert)
     const key = rel(tlsCfg.key)
+    if (!fs.existsSync(cert) || !fs.existsSync(key)) {
+      console.error(
+        `[hub] tls.cert/tls.key are configured but missing: ${cert} / ${key} — refusing to start. Fix the paths.`,
+      )
+      process.exit(2)
+    }
     const dir = path.join(DATA_DIR, 'tls')
     fs.mkdirSync(dir, { recursive: true })
     fs.copyFileSync(cert, path.join(dir, 'server.crt'))
@@ -126,6 +150,11 @@ function writeStatusInner() {
     name,
     pid: process.pid,
     startedAt: new Date().toISOString(),
+    // Blocker #14: heartbeat — rewritten every 15 s by the supervisor
+    // itself, so /healthz can tell a live supervisor (fresh heartbeat)
+    // from a dead one serving a stale file. Consumers must not treat
+    // the file's mere existence as "up": only a fresh heartbeat is.
+    heartbeatAt: new Date().toISOString(),
     endpoints: {
       web: `http://${publicHost}:${webPort}/`,
       signaling: `wss://${publicHost}:${signalingPort}`,
@@ -288,13 +317,20 @@ const webTlsEnv =
   cfg.web?.tls === true
     ? { WEB_TLS_CERT: tls.cert, WEB_TLS_KEY: tls.key }
     : {}
+// Blocker #14: the web child serves the hub health endpoint (/healthz)
+// from the supervisor's status file — it needs the path, not a guess.
+const hubStatusFile = path.join(DATA_DIR, 'hub-status.json')
 startChild('web', process.execPath, [path.join(HUB_DIR, 'web-server.mjs')], {
-  env: { WEB_PORT: String(webPort), WEB_ROOT: webRoot, ...webTlsEnv },
+  env: { WEB_PORT: String(webPort), WEB_ROOT: webRoot, HUB_STATUS_FILE: hubStatusFile, ...webTlsEnv },
 })
 startChild('signaling', process.execPath, [path.join(BUNDLE_ROOT, 'signaling', 'server.mjs')], {
   env: { PORT: String(signalingPort), TLS_CERT: tls.cert, TLS_KEY: tls.key },
 })
-if (turnEnabled && turnserverAvailable()) {
+// Blocker #14: whether the TURN child actually started decides
+// whether the readiness gate below waits for it — a missing
+// turnserver binary is a warning, not a readiness failure.
+const turnStarted = turnEnabled && turnserverAvailable()
+if (turnStarted) {
   startChild('turn', 'turnserver', ['-c', writeTurnConfig()])
 } else if (turnEnabled) {
   console.warn('[hub] WARNING: turnserver binary not found — TURN relay disabled (direct/LAN sync still works). Install coturn to enable it.')
@@ -329,6 +365,13 @@ if (tlsProxies) {
 
 const status = writeStatus()
 
+// Blocker #14: supervisor heartbeat — rewrite the status file every
+// 15 s so /healthz (served by the web child from this file) can tell
+// a live supervisor from a dead one. writeStatus is already guarded
+// (rel N2: a failed write never crashes the supervisor), and the
+// timer is unref'd so it never keeps the process alive on its own.
+setInterval(() => writeStatus(), 15_000).unref()
+
 // ------------------------------------------------------------ readiness ----
 function httpOk(port, pathName, expectBody = null) {
   return new Promise((resolve) => {
@@ -361,12 +404,49 @@ function tcpOk(port) {
     sock.once('error', () => resolve(false))
   })
 }
+// Blocker #14: same shape as httpOk, over TLS. rejectUnauthorized is
+// off on purpose — this is a loopback readiness probe against the
+// hub's own (usually self-signed) cert, not a trust decision; the
+// check is "does the proxy answer with the backend's bytes", and the
+// body match below is what proves it is the right backend.
+function httpsOk(port, pathName, expectBody = null) {
+  return new Promise((resolve) => {
+    const req = https.get(
+      { host: '127.0.0.1', port, path: pathName, timeout: 1500, rejectUnauthorized: false },
+      (res) => {
+        let body = ''
+        res.on('data', (c) => {
+          body += c
+        })
+        res.on('end', () => {
+          if (res.statusCode !== 200) return resolve(false)
+          resolve(expectBody ? body.includes(expectBody) : true)
+        })
+      },
+    )
+    req.on('error', () => resolve(false))
+    req.on('timeout', () => {
+      req.destroy()
+      resolve(false)
+    })
+  })
+}
 
+// Blocker #14: readiness used to cover web/signaling/appview/pds
+// only — TURN and the TLS proxies were never waited for, so the hub
+// could report "up" while the relay or the https front door was
+// still down. TURN gets a TCP connect (coturn speaks no HTTP);
+// the TLS proxies get the same body-matched GETs as their backends,
+// through TLS, so a proxy answering with the wrong backend (or a
+// stale one) does not read as ready.
 const checks = [
   ['web', () => httpOk(webPort, '/', '<title>Longtable</title>')],
   ['signaling', () => tcpOk(signalingPort)],
   ['appview', () => httpOk(appviewPort, '/health', '"ok":true')],
   ...(pdsEnabled ? [['pds', () => httpOk(pdsPort, '/')]] : []),
+  ...(turnStarted ? [['turn', () => tcpOk(turnPort)]] : []),
+  ...(tlsProxies ? [['tls-appview', () => httpsOk(tlsProxies.appviewPort, '/health', '"ok":true')]] : []),
+  ...(tlsProxies && pdsEnabled ? [['tls-pds', () => httpsOk(tlsProxies.pdsPort, '/')]] : []),
 ]
 const deadline = Date.now() + 120_000
 for (const [id, check] of checks) {

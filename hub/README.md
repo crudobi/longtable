@@ -168,6 +168,31 @@ children (web, signaling, AppView, TURN, PDS) with backoff; the unit
 covers the supervisor process. `./longtable-hub status` / `logs`
 still work against the same data dir.
 
+## Health endpoint
+
+The hub as a whole exposes one health endpoint (production blocker
+#14): `GET /healthz` on the web port.
+
+```sh
+curl http://localhost:8080/healthz
+# {"ok":true,"name":"longtable-hub","heartbeatAt":"...","heartbeatAgeMs":1200,
+#  "children":{"web":{"pid":1234,"restarts":0}, ...}, "endpoints":{...}}
+```
+
+`ok` is true only while the supervisor itself is alive: the
+supervisor rewrites `hub-status.json` every 15 s with a fresh
+`heartbeatAt`, and `/healthz` answers 200 only when that heartbeat
+is under 60 s old. A stale heartbeat, a missing/unparseable status
+file, or a web server running without a hub all answer 503 — the
+endpoint never reports "up" from a stale file while the supervisor
+is dead (the web child would keep serving the app shell otherwise).
+AppView, signaling and the PDS keep their own `/health` endpoints;
+`/healthz` is the hub-level roll-up. At startup the supervisor also
+waits for every child before reporting up — web, signaling, AppView,
+PDS, plus TURN (TCP connect, only when the relay actually started)
+and both TLS proxies (body-matched HTTPS GETs through the proxy, so
+a proxy answering with the wrong backend does not read as ready).
+
 ## Honest notes
 
 - **The bundled PDS is a dev-grade testnet.** It is the real ATProto PDS

@@ -25,6 +25,26 @@ import { createMediaCache, safeMediaContentType } from './media.mjs'
 export const DEFAULT_RATE_LIMIT = { windowMs: 60_000, maxRequests: 300 }
 export const MAX_SEARCH_Q_CHARS = 500
 export const MAX_SEARCH_INGREDIENTS = 20
+// Int L2: /search pages through matches instead of a silent top-100.
+// limit defaults to 100 (the old cap) and is clamped to 1..100;
+// offset defaults to 0. Both must be plain integers — anything else
+// is a 400, not a silent reinterpretation.
+export const MAX_SEARCH_LIMIT = 100
+export const DEFAULT_SEARCH_LIMIT = 100
+
+function parseSearchPage(url) {
+  const limitRaw = url.searchParams.get('limit')
+  const offsetRaw = url.searchParams.get('offset')
+  const limit = limitRaw === null ? DEFAULT_SEARCH_LIMIT : Number(limitRaw)
+  const offset = offsetRaw === null ? 0 : Number(offsetRaw)
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH_LIMIT) {
+    return { error: `limit must be an integer between 1 and ${MAX_SEARCH_LIMIT}` }
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    return { error: 'offset must be a non-negative integer' }
+  }
+  return { limit, offset }
+}
 
 export function createRateLimiter({ windowMs, maxRequests } = DEFAULT_RATE_LIMIT) {
   const windows = new Map() // ip -> { start, count }
@@ -202,7 +222,15 @@ export function createAppView({
         if (ingredients.length > MAX_SEARCH_INGREDIENTS) {
           return sendJson(res, 400, { error: `at most ${MAX_SEARCH_INGREDIENTS} ingredients` })
         }
-        return sendJson(res, 200, { results: index.search({ q, ingredients }).filter(isVerifiedRow) })
+        // Int L2: paged results + total. The verified-only filter
+        // runs in SQL (not as a post-filter) so LIMIT/OFFSET apply
+        // after it — a page never comes back short because an
+        // unverified row sat in it.
+        const page = parseSearchPage(url)
+        if (page.error) return sendJson(res, 400, { error: page.error })
+        const results = index.search({ q, ingredients, limit: page.limit, offset: page.offset, verifiedOnly: true })
+        const total = index.searchCount({ q, ingredients, verifiedOnly: true })
+        return sendJson(res, 200, { results, total, limit: page.limit, offset: page.offset })
       }
       if (req.method === 'GET' && path.startsWith('/recipe/')) {
         const parts = path.split('/').filter(Boolean) // ['recipe', did, rkey]

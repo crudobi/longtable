@@ -8,10 +8,14 @@
  *
  * Search:
  *  - name search uses the FTS5 virtual table `recipes_fts` (ranked, bm25).
+ *    `q` matches the name OR the instructions (steps) — Int L10(a).
  *  - ingredient search is AND semantics over `ingredients_text` in the same
  *    FTS5 table (token-prefix match per ingredient token).
  *  - If FTS5 is unavailable in the local node:sqlite build, both fall back
  *    to LIKE-based matching with identical API semantics (ftsEnabled=false).
+ *  - search() takes { limit, offset } (Int L2 pagination; limit is
+ *    clamped to 100) and searchCount() returns the matching total, so
+ *    callers can page through a result set instead of a silent top-100.
  */
 import { DatabaseSync } from 'node:sqlite'
 
@@ -40,8 +44,21 @@ export function escapeLikePattern(str) {
 /** Build an FTS5 column-scoped prefix-match expression, or null if no terms. */
 function ftsColumnExpr(column, terms) {
   if (terms.length === 0) return null
-  // Each term is already reduced to [a-z0-9], so it is safe to embed.
+  // Each term is already reduced to letters/digits, so it is safe to embed.
   return terms.map((t) => `${column}:${t}*`).join(' ')
+}
+
+/**
+ * Build an FTS5 MATCH expression for `q` over the name OR the steps
+ * (Int L10a): every term must match the name or the instructions_text
+ * column, terms AND together. The groups join with an explicit AND —
+ * FTS5 rejects two parenthesised groups separated by bare whitespace
+ * ("syntax error near (", verified against node:sqlite) — and the
+ * multi-word AND semantics are the ones the name search already had.
+ */
+function ftsNameOrStepsExpr(terms) {
+  if (terms.length === 0) return null
+  return terms.map((t) => `(name:${t}* OR instructions_text:${t}*)`).join(' AND ')
 }
 
 function asArray(v) {
@@ -181,7 +198,7 @@ export class RecipeIndex {
     try {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS recipes_fts USING fts5(
-          uri UNINDEXED, name, ingredients_text, tags_text
+          uri UNINDEXED, name, ingredients_text, tags_text, instructions_text
         );
       `)
       // Prove MATCH actually works, not just CREATE (some builds differ).
@@ -190,14 +207,74 @@ export class RecipeIndex {
     } catch {
       this.ftsEnabled = false
     }
+    // Int L10(a): an index DB built before the instructions_text
+    // column existed still has the old 3-column FTS table (CREATE IF
+    // NOT EXISTS is a no-op for it) — rebuild it from the recipes
+    // table so ?q= matches steps on old databases too. Fresh DBs
+    // already have the column and skip this entirely.
+    if (this.ftsEnabled) {
+      const ftsCols = this.db
+        .prepare('PRAGMA table_info(recipes_fts)')
+        .all()
+        .map((c) => c.name)
+      if (!ftsCols.includes('instructions_text')) {
+        this.db.exec('DROP TABLE recipes_fts')
+        this.db.exec(`
+          CREATE VIRTUAL TABLE recipes_fts USING fts5(
+            uri UNINDEXED, name, ingredients_text, tags_text, instructions_text
+          );
+        `)
+        for (const row of this.db
+          .prepare('SELECT uri, name, ingredients, tags, instructions FROM recipes')
+          .all()) {
+          let ingredients = []
+          let tags = []
+          let instructions = []
+          try {
+            ingredients = JSON.parse(row.ingredients)
+          } catch {
+            /* keep [] */
+          }
+          try {
+            tags = JSON.parse(row.tags)
+          } catch {
+            /* keep [] */
+          }
+          try {
+            instructions = JSON.parse(row.instructions)
+          } catch {
+            /* keep [] */
+          }
+          this.#insertFts(
+            row.uri,
+            row.name,
+            (Array.isArray(ingredients) ? ingredients : []).join(' '),
+            (Array.isArray(tags) ? tags : []).join(' '),
+            (Array.isArray(instructions) ? instructions : []).join(' '),
+          )
+        }
+      }
+    }
+  }
+
+  #insertFts(uri, name, ingredientsText, tagsText, instructionsText) {
+    if (!this.ftsEnabled) return
+    this.db.prepare('DELETE FROM recipes_fts WHERE uri = ?').run(uri)
+    this.db
+      .prepare(
+        'INSERT INTO recipes_fts (uri, name, ingredients_text, tags_text, instructions_text) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(uri, name, ingredientsText, tagsText, instructionsText)
   }
 
   #syncFts(row) {
-    if (!this.ftsEnabled) return
-    this.db.prepare('DELETE FROM recipes_fts WHERE uri = ?').run(row.uri)
-    this.db
-      .prepare('INSERT INTO recipes_fts (uri, name, ingredients_text, tags_text) VALUES (?, ?, ?, ?)')
-      .run(row.uri, row.name, row.ingredients.join(' '), row.tags.join(' '))
+    this.#insertFts(
+      row.uri,
+      row.name,
+      row.ingredients.join(' '),
+      row.tags.join(' '),
+      row.instructions.join(' '),
+    )
   }
 
   /**
@@ -403,13 +480,22 @@ export class RecipeIndex {
   }
 
   /**
-   * Search. `q` matches the recipe name (FTS-ranked when available);
-   * `ingredients` is a list of ingredient strings, ALL of which must match.
-   * Both combine (AND). Returns summary rows, max 100.
+   * Build the WHERE/JOIN fragments for a search, shared by search()
+   * and searchCount() so the total always matches the page. Returns
+   * { joinSql, whereSql, params, orderSql, ftsJoin } where `ftsJoin`
+   * marks the FTS MATCH query shape (JOIN + rank ordering).
    */
-  search({ q, ingredients } = {}) {
+  #searchQuery({ q, ingredients, verifiedOnly = false } = {}) {
     const ingList = asArray(ingredients).map((s) => String(s).trim()).filter(Boolean)
     const qTerms = q ? ftsTerms(q) : []
+    // S2: the serving rule as SQL — a row counts as a result only
+    // when it carries all three device-signature fields. The HTTP
+    // layer passes verifiedOnly so LIMIT/OFFSET apply after the
+    // filter, not before it (filtering in JS would shift page
+    // boundaries); direct index callers keep the old unfiltered view.
+    const verifiedSql = verifiedOnly
+      ? 'recipes.device_did IS NOT NULL AND recipes.device_signature IS NOT NULL AND recipes.device_key IS NOT NULL'
+      : null
 
     if (this.ftsEnabled && (qTerms.length > 0 || ingList.length > 0)) {
       const ingClauses = []
@@ -421,19 +507,23 @@ export class RecipeIndex {
         ingParams.push(ftsColumnExpr('ingredients_text', terms))
       }
       if (qTerms.length > 0) {
-        // JOIN so results come back ranked by FTS bm25 rank on the name match.
-        const sql = `SELECT recipes.* FROM recipes
-          JOIN recipes_fts ON recipes_fts.uri = recipes.uri
-          WHERE recipes_fts MATCH ?
-          ${ingClauses.length ? 'AND ' + ingClauses.join(' AND ') : ''}
-          ORDER BY recipes_fts.rank ASC LIMIT 100`
-        return this.db
-          .prepare(sql)
-          .all(ftsColumnExpr('name', qTerms), ...ingParams)
-          .map(rowToSummary)
+        // JOIN so results come back ranked by FTS bm25 rank on the match.
+        // Int L10(a): q matches the name OR the steps.
+        return {
+          ftsJoin: true,
+          joinSql: 'JOIN recipes_fts ON recipes_fts.uri = recipes.uri',
+          whereSql: ['recipes_fts MATCH ?', ...ingClauses, ...(verifiedSql ? [verifiedSql] : [])].join(' AND '),
+          params: [ftsNameOrStepsExpr(qTerms), ...ingParams],
+          orderSql: 'ORDER BY recipes_fts.rank ASC',
+        }
       }
-      const sql = `SELECT * FROM recipes ${ingClauses.length ? 'WHERE ' + ingClauses.join(' AND ') : ''} ORDER BY name ASC LIMIT 100`
-      return this.db.prepare(sql).all(...ingParams).map(rowToSummary)
+      return {
+        ftsJoin: false,
+        joinSql: '',
+        whereSql: [...ingClauses, ...(verifiedSql ? [verifiedSql] : [])].join(' AND '),
+        params: ingParams,
+        orderSql: 'ORDER BY name ASC',
+      }
     }
 
     // Fallback (no FTS5): LIKE with identical API semantics.
@@ -442,15 +532,56 @@ export class RecipeIndex {
     const clauses = []
     const params = []
     if (q) {
-      clauses.push("lower(name) LIKE ? ESCAPE '\'")
-      params.push(`%${escapeLikePattern(String(q).toLowerCase())}%`)
+      // Int L10(a): ?q= matches steps too, like the FTS path.
+      const pat = `%${escapeLikePattern(String(q).toLowerCase())}%`
+      clauses.push("(lower(name) LIKE ? ESCAPE '\\' OR lower(instructions) LIKE ? ESCAPE '\\')")
+      params.push(pat, pat)
     }
     for (const ing of ingList) {
-      clauses.push("lower(ingredients) LIKE ? ESCAPE '\'")
+      clauses.push("lower(ingredients) LIKE ? ESCAPE '\\'")
       params.push(`%${escapeLikePattern(ing.toLowerCase())}%`)
     }
-    const sql = `SELECT * FROM recipes ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY name ASC LIMIT 100`
-    return this.db.prepare(sql).all(...params).map(rowToSummary)
+    if (verifiedSql) clauses.push(verifiedSql)
+    return { ftsJoin: false, joinSql: '', whereSql: clauses.join(' AND '), params, orderSql: 'ORDER BY name ASC' }
+  }
+
+  /**
+   * Search. `q` matches the recipe name or its steps (FTS-ranked when
+   * available); `ingredients` is a list of ingredient strings, ALL of
+   * which must match. Both combine (AND). `limit` (default 100, clamped
+   * to 100) + `offset` (default 0) page through the matches — Int L2.
+   * Returns summary rows.
+   */
+  search({ q, ingredients, limit = 100, offset = 0, verifiedOnly = false } = {}) {
+    const lim = Math.min(100, Math.max(1, Math.trunc(Number(limit)) || 100))
+    const off = Math.max(0, Math.trunc(Number(offset)) || 0)
+    const query = this.#searchQuery({ q, ingredients, verifiedOnly })
+    const where = query.whereSql ? `WHERE ${query.whereSql}` : ''
+    if (query.ftsJoin) {
+      const sql = `SELECT recipes.* FROM recipes ${query.joinSql} ${where} ${query.orderSql} LIMIT ? OFFSET ?`
+      return this.db
+        .prepare(sql)
+        .all(...query.params, lim, off)
+        .map(rowToSummary)
+    }
+    const sql = `SELECT * FROM recipes ${where} ${query.orderSql} LIMIT ? OFFSET ?`
+    return this.db.prepare(sql).all(...query.params, lim, off).map(rowToSummary)
+  }
+
+  /**
+   * Total rows matching a search (same filters as search()) — Int L2.
+   * The HTTP layer returns this alongside the page so clients can
+   * page to the end instead of guessing at a silent top-100.
+   */
+  searchCount({ q, ingredients, verifiedOnly = false } = {}) {
+    const query = this.#searchQuery({ q, ingredients, verifiedOnly })
+    const where = query.whereSql ? `WHERE ${query.whereSql}` : ''
+    if (query.ftsJoin) {
+      const sql = `SELECT COUNT(*) AS n FROM recipes ${query.joinSql} ${where}`
+      return Number(this.db.prepare(sql).get(...query.params).n)
+    }
+    const sql = `SELECT COUNT(*) AS n FROM recipes ${where}`
+    return Number(this.db.prepare(sql).get(...query.params).n)
   }
 
   close() {
