@@ -44,9 +44,10 @@ rm -f "$STAGE/appview/"*.db "$STAGE/appview/"*.db-journal
 rm -rf "$STAGE/appview/media" "$STAGE/appview/test"
 # Never ship npm .bin shims either: they are symlinks to dev CLIs the
 # hub never executes, and a tarball must contain no symlinks at all
-# (an absolute one once escaped the bundle — Wave 1).
-rm -rf "$STAGE/appview/node_modules/.bin" "$STAGE/signaling/node_modules/.bin" \
-  "$STAGE/services/atproto-testnet/node_modules/.bin"
+# (an absolute one once escaped the bundle — Wave 1). Nested
+# dependencies carry their own .bin dirs, so strip every .bin under
+# any node_modules in the stage, not just the top-level three.
+find "$STAGE" -type d -name '.bin' -path '*node_modules*' -prune -exec rm -rf {} +
 
 echo "[pack] tarring…"
 tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$STAGE_PARENT" "$NAME"
