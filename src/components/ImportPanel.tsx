@@ -96,12 +96,13 @@ export function ImportPanel({ onClose, onImported }: Props) {
     setResult(null)
     setError(null)
     try {
-      const { recipes } = await runImporter(selected.id, input)
+      const { recipes, warnings } = await runImporter(selected.id, input)
       await onImported(recipes)
       setResult(
-        recipes.length === 1
+        (recipes.length === 1
           ? `Imported “${recipes[0].title}”.`
-          : `Imported ${recipes.length} recipes: ${recipes.map((r) => `“${r.title}”`).join(', ')}.`,
+          : `Imported ${recipes.length} recipes: ${recipes.map((r) => `“${r.title}”`).join(', ')}.`) +
+          (warnings.length > 0 ? ` ${warnings.join(' ')}` : ''),
       )
       setText('')
       setFileText(null)

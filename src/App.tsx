@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { getRepo } from './store/repo'
 import {
   createRecipe,
+  createRecipesAtomic,
   getOrCreateIndex,
   getRecipe,
   listRecipes,
@@ -291,20 +292,16 @@ export default function App() {
    * The local delete always proceeds — deleting here is the user's act —
    * but if a remote removal fails, the user is told plainly that the
    * shared/public copy may still be live; it is never swallowed quietly.
+   * Returns the flow's warnings (H13) so the API host can surface them.
    */
-  const performDelete = useCallback(async (id: string) => {
-    const remoteProblems: string[] = []
-    await performDeleteFlow(id, {
+  const performDelete = useCallback(async (id: string): Promise<string[]> => {
+    const warnings = await performDeleteFlow(id, {
       identity: identityRef.current,
-      onRemoteProblem: (label) => {
-        remoteProblems.push(label)
-      },
     })
-    if (remoteProblems.length > 0) {
-      setError(
-        `Deleted from this device — but ${remoteProblems.join(' and ')} couldn't be taken down, because the other side didn't answer. ${remoteProblems.length === 1 ? 'It' : 'They'} may still be out there; your local copy is gone either way.`,
-      )
+    if (warnings.length > 0) {
+      setError(warnings.join(' '))
     }
+    return warnings
   }, [])
 
   const handleDelete = useCallback(
@@ -335,8 +332,8 @@ export default function App() {
    * view and the localhost API host.
    */
   const applyVisibility = useCallback(
-    async (id: string, recipe: Recipe, tier: VisibilityTier) => {
-      await applyVisibilityFlow(id, recipe, tier, {
+    async (id: string, recipe: Recipe, tier: VisibilityTier): Promise<string[]> => {
+      return applyVisibilityFlow(id, recipe, tier, {
         identity: identityRef.current,
       })
     },
@@ -361,9 +358,15 @@ export default function App() {
       }
       try {
         setError(null)
-        await applyVisibility(id, recipe, tier)
+        const warnings = await applyVisibility(id, recipe, tier)
         await refresh()
         await openDetail(id)
+        if (warnings.length > 0) {
+          // H13: a flip that leaves a remote copy live (or recalls
+          // friends' copies only on sync) says so, like the delete
+          // flow does — the tier changed, but the caller is told.
+          setError(warnings.join(' '))
+        }
         if (tier === 'friends-only') setFriendShareId(id)
       } catch (e) {
         if (e instanceof VisibilitySessionError) {
@@ -469,7 +472,7 @@ export default function App() {
         applyDelete: (id) => performDeleteRef.current(id),
         applyVisibility: async (id, recipe, tier) => {
           try {
-            await applyVisibilityRef.current(id, recipe, tier)
+            return await applyVisibilityRef.current(id, recipe, tier)
           } catch (e) {
             if (e instanceof VisibilitySessionError) {
               throw new LocalApiError(
@@ -496,15 +499,20 @@ export default function App() {
 
   /**
    * Bulk import (Import panel): recipes arrive fully validated by the
-   * importer registry, so creation here is a straight loop — then one
-   * refresh. No navigation: the panel reports the imported titles.
+   * importer registry, so creation here is atomic, best-effort (H11) —
+   * a mid-loop store failure rolls back what was already created and
+   * says so, instead of leaving a partial import behind. No navigation:
+   * the panel reports the imported titles.
    */
   const handleImportRecipes = useCallback(
     async (inputs: RecipeInput[]) => {
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
-      for (const input of inputs) {
-        await createRecipe(repo, index, input)
+      try {
+        await createRecipesAtomic(repo, index, inputs)
+      } catch (e) {
+        setError(friendlyError(e))
+        return
       }
       await refresh()
     },

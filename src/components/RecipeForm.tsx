@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { filesToDataUrls } from '../importers/photoImport'
+import type { UrlImportResult } from '../importers/urlImport'
 import { UrlImportDialog } from './UrlImportDialog'
 import { friendlyError } from '../friendlyError'
 import type { RecipeInput } from '../types'
@@ -32,6 +33,7 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
   const [stepDraft, setStepDraft] = useState('')
   const [photoBusy, setPhotoBusy] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [importWarnings, setImportWarnings] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
 
@@ -58,12 +60,17 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
     }
   }
 
-  const applyImport = (partial: Partial<RecipeInput>) => {
+  const applyImport = (result: UrlImportResult) => {
+    const partial = result.recipe
     if (partial.title) setTitle(partial.title)
     if (partial.ingredients && partial.ingredients.length > 0)
       setIngredients(partial.ingredients)
     if (partial.steps && partial.steps.length > 0) setSteps(partial.steps)
     if (partial.photos && partial.photos.length > 0) setPhotos((xs) => [...xs, ...partial.photos!])
+    // H10: photos the page import had to leave out stay visible next to
+    // the prefilled form until the recipe is saved, so the user knows
+    // the photo is missing instead of wondering where it went.
+    setImportWarnings(result.photoWarnings)
   }
 
   const save = async () => {
@@ -117,6 +124,11 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
       </button>
       {importOpen && (
         <UrlImportDialog onImport={applyImport} onClose={() => setImportOpen(false)} />
+      )}
+      {importWarnings.length > 0 && (
+        <p className="status" data-testid="import-photo-warnings">
+          {importWarnings.join(' ')}
+        </p>
       )}
 
       <label className="field">

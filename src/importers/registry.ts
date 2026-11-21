@@ -133,14 +133,17 @@ export function sanitizePluginMessage(raw: string): string | null {
 
 /**
  * Run an importer and validate its output. Resolves with the recipes as
- * app-ready `RecipeInput[]`; rejects with an `ImporterError` whose message
- * is safe to show the user. Nothing is saved by this function — the caller
- * creates the recipes only after the whole run validates.
+ * app-ready `RecipeInput[]` plus any non-fatal `warnings` the importer
+ * reported (H10: dropped photos); rejects with an `ImporterError` whose
+ * message is safe to show the user. Nothing is saved by this function —
+ * the caller creates the recipes only after the whole run validates.
+ * Warnings ride on the importer's raw output and are stripped by
+ * validation — they are never stored in a recipe.
  */
 export async function runImporter(
   id: string,
   input: ImporterInput,
-): Promise<{ importer: RecipeImporter; recipes: RecipeInput[] }> {
+): Promise<{ importer: RecipeImporter; recipes: RecipeInput[]; warnings: string[] }> {
   const importer = registry.get(id)
   if (!importer) throw new ImporterError('That importer is not available.')
   if (!importer.accepts.includes(input.kind)) {
@@ -171,6 +174,13 @@ export async function runImporter(
   if (raw.length === 0) {
     throw new ImporterError(`${importer.name} found no recipes in that source. Nothing was imported.`)
   }
+  const warnings: string[] = []
+  for (const item of raw) {
+    const w = (item as { warnings?: unknown } | null | undefined)?.warnings
+    if (Array.isArray(w)) {
+      for (const s of w) if (typeof s === 'string' && s.trim()) warnings.push(s)
+    }
+  }
   const recipes = raw.map((r, i) => validateImportedRecipe(r, importer.name, i))
-  return { importer, recipes }
+  return { importer, recipes, warnings }
 }

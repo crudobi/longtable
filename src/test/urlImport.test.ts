@@ -91,9 +91,15 @@ describe('importRecipeFromUrl', () => {
       'fetch',
       vi.fn().mockResolvedValue({ ok: true, text: async () => JSON_LD_PAGE } as Response),
     )
-    const r = await importRecipeFromUrl('example.com/pancakes')
+    const { recipe: r, photoWarnings } = await importRecipeFromUrl('example.com/pancakes')
     expect(r.title).toBe('Fluffy Pancakes')
     expect(r.ingredients).toHaveLength(2)
+    // The stub fetch cannot serve photo bytes (no arrayBuffer), so the
+    // page's photo is dropped with a warning instead of stored — the
+    // recipe still imports (H10).
+    expect(photoWarnings).toHaveLength(1)
+    expect(photoWarnings[0]).toMatch(/left out/)
+    expect(r.photos).toEqual([])
   })
 
   it('rejects empty input', async () => {

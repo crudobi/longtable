@@ -55,7 +55,7 @@
  */
 import sodium from 'libsodium-wrappers'
 import type { RecipeInput } from '../types'
-import { AtprotoError, type AtprotoBlob } from './atproto'
+import { AtprotoClient, AtprotoError, type AtprotoBlob } from './atproto'
 import { utf8ToU8 } from '../identity/codec'
 import { cryptoReady, publicKeyFromDid, type KeyValueStore } from '../identity/identity'
 import {
@@ -72,6 +72,9 @@ import {
   recipeSignatureMessage,
   type RecipeRecord,
 } from './publish'
+import { blobMatchesCid } from './blobCid'
+import { MAX_PHOTO_BYTES } from '../importers/photoImport'
+import { resolveAuthorPdsUrl } from './binding'
 
 export type { RecipeRecord }
 
@@ -515,19 +518,27 @@ export async function fetchPublicRecipe(
  * Convert a public record into a local RecipeInput for "Save a copy".
  * `fetchBlobDataUrl(cid)` resolves one image blob to a data URL (the
  * caller wires it to the author's PDS via com.atproto.sync.getBlob);
- * blobs that fail to load are skipped, never fatal.
+ * blobs that fail to load are skipped, never fatal. `onPhotoSkipped`
+ * is called for each skipped blob with the reason, so the caller can
+ * tell the user a photo was left out instead of silently dropping it.
  */
 export async function publicRecordToInput(
   record: PublicRecipe | RecipeRecord,
   fetchBlobDataUrl?: (cid: string, blob: AtprotoBlob) => Promise<string>,
+  onPhotoSkipped?: (cid: string, reason: string) => void,
 ): Promise<RecipeInput> {
   const photos: string[] = []
   if (fetchBlobDataUrl) {
     for (const blob of record.images ?? []) {
       try {
         photos.push(await fetchBlobDataUrl(blob.ref.$link, blob))
-      } catch {
-        /* skip an unloadable photo; the text recipe still copies */
+      } catch (e) {
+        // Skip an unloadable photo; the text recipe still copies — but
+        // report it so the copy is not silently photo-less.
+        onPhotoSkipped?.(
+          blob.ref.$link,
+          e instanceof Error ? e.message : String(e),
+        )
       }
     }
   }
@@ -539,6 +550,92 @@ export async function publicRecordToInput(
     prepMinutes: record.prepTimeMinutes,
     cookMinutes: record.cookTimeMinutes,
   }
+}
+
+/** Options for fetchAuthorPhotoBytes. */
+export interface FetchAuthorPhotoOptions {
+  /** First PDS to try — the viewer's own PDS URL (testnet / single-PDS
+   * deployments). Falls back to the author's PDS resolved via PLC. */
+  authorPdsUrl?: string
+  /** PLC directory base URL (default https://plc.directory). */
+  plcUrl?: string
+}
+
+/**
+ * Fetch one photo blob from the AUTHOR's PDS and verify it (M-N2).
+ *
+ * The old save-a-copy path fetched from the VIEWER's PDS, which 404s
+ * for any author on another PDS — and stored whatever bytes came back
+ * without checking them against the CID. This fetches from the author's
+ * PDS (the caller's hint first, then — only when the hint misses — the
+ * PDS resolved from the author's DID document via PLC, exactly like
+ * the binding fetch in binding.ts),
+ * caps the bytes at MAX_PHOTO_BYTES, and hash-checks them against the
+ * CID before returning them. A CID mismatch fails closed immediately
+ * with no fallthrough — a PDS serving wrong bytes for a CID is positive
+ * evidence of a bad PDS, not a wrong address (same rule as a tampered
+ * binding). A 404 on one candidate falls through to the next.
+ */
+export async function fetchAuthorPhotoBytes(
+  authorDid: string,
+  cid: string,
+  fetchFn: FetchFn = (url, init) => fetch(url, init),
+  options: FetchAuthorPhotoOptions = {},
+): Promise<Uint8Array> {
+  // One candidate attempt: fetch the blob, verify size + CID. Returns
+  // the bytes on success, null when the blob is not reachable on this
+  // PDS (fall through to the next candidate). A CID mismatch or an
+  // over-cap blob throws immediately with no fallthrough — a PDS
+  // serving wrong bytes for a CID is positive evidence of a bad PDS,
+  // not a wrong address (same rule as a tampered binding).
+  let lastError: Error | null = null
+  const tryCandidate = async (pdsUrl: string): Promise<Uint8Array | null> => {
+    const client = new AtprotoClient(pdsUrl, { fetchFn })
+    let buf: ArrayBuffer
+    try {
+      buf = await client.getBlob(authorDid, cid)
+    } catch (e) {
+      // A 404 (RecordNotFound / BlobNotFound) means "not on this PDS" —
+      // try the next candidate. Anything else (network, 5xx) is also
+      // retried on the next candidate; the last error is reported if
+      // every candidate fails.
+      lastError = e instanceof Error ? e : new Error(String(e))
+      return null
+    }
+    const bytes = new Uint8Array(buf)
+    if (bytes.byteLength > MAX_PHOTO_BYTES) {
+      throw new Error(
+        `Photo ${cid} is larger than the ${MAX_PHOTO_BYTES / (1024 * 1024)} MB photo limit and was left out.`,
+      )
+    }
+    if (!(await blobMatchesCid(cid, bytes))) {
+      throw new Error(
+        `Photo ${cid} failed its content check — the photo server returned bytes that do not match the photo's address. The photo was left out.`,
+      )
+    }
+    return bytes
+  }
+  // The caller's hint first; the author's PDS via PLC is resolved
+  // LAZILY, only when the hint misses — resolving it eagerly costs a
+  // PLC round trip on every save-a-copy even on single-PDS deployments
+  // (the Wave 3 bindings fix learned the same lesson).
+  const hint = options.authorPdsUrl ? trimSlash(options.authorPdsUrl) : undefined
+  if (hint) {
+    const bytes = await tryCandidate(hint)
+    if (bytes) return bytes
+  }
+  const resolved = await resolveAuthorPdsUrl(authorDid, fetchFn, options.plcUrl)
+  if (resolved && resolved !== hint) {
+    const bytes = await tryCandidate(resolved)
+    if (bytes) return bytes
+  }
+  if (!hint && !resolved) {
+    throw new Error(`Could not find the author's photo server for ${authorDid}.`)
+  }
+  throw (
+    lastError ??
+    new Error(`Photo ${cid} could not be fetched from the author's photo server.`)
+  )
 }
 
 /** Build a data URL for one blob fetched as raw bytes. */

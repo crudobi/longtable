@@ -29,6 +29,8 @@ import {
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
 import { secretKv } from '../secrets/secretStore'
+import { blobMatchesCid } from './blobCid'
+import { MAX_PHOTO_BYTES } from '../importers/photoImport'
 import type { Recipe } from '../types'
 import {
   PUBLICATIONS_KEY,
@@ -348,6 +350,17 @@ function localStorageSafe(): PublicKv {
  * Publish (or republish) a recipe: ensure the pubkey binding, upload its
  * photos as blobs, build + device-sign the record, putRecord it, and save
  * the publication in the local registry. Returns the record URI.
+ *
+ * Photo safety (M2(int)):
+ *   - byte cap: a photo over MAX_PHOTO_BYTES is refused before upload,
+ *     with the size in the error — the PDS never receives it.
+ *   - CID check: the bytes just uploaded are hashed against the CID the
+ *     PDS returned for them; a mismatch aborts the publish (the record
+ *     is never signed over a CID that does not name these bytes).
+ *   - orphan cleanup: any failure after the first upload deletes the
+ *     blobs already uploaded (best-effort — a deleteBlob failure is
+ *     warned, never fatal), so a failed putRecord does not strand blobs
+ *     on the PDS with no record pointing at them.
  */
 export async function publishRecipe(
   client: AtprotoClient,
@@ -359,38 +372,77 @@ export async function publishRecipe(
   await ensurePubkeyBinding(client, session, identity, kv)
 
   const blobs: AtprotoBlob[] = []
-  for (const photo of recipe.photos) {
-    const { bytes, mime } = dataUrlToBytes(photo)
-    blobs.push(await client.uploadBlob(session, bytes, mime))
-  }
+  try {
+    for (const photo of recipe.photos) {
+      const { bytes, mime } = dataUrlToBytes(photo)
+      if (bytes.byteLength > MAX_PHOTO_BYTES) {
+        throw new Error(
+          `Photo is too large to publish (${bytes.byteLength} bytes — the limit is ${MAX_PHOTO_BYTES} bytes).`,
+        )
+      }
+      const blob = await client.uploadBlob(session, bytes, mime)
+      // The PDS names the stored bytes by CID; verify it names THESE
+      // bytes before signing a record over it (M2(int)).
+      if (!(await blobMatchesCid(blob.ref.$link, bytes))) {
+        await deleteUploadedBlobs(client, session, [blob]).catch(() => undefined)
+        throw new Error(
+          'The publishing server stored the photo under a content address that does not match the photo — the recipe was not published.',
+        )
+      }
+      blobs.push(blob)
+    }
 
-  const unsigned = buildRecipeRecord(recipe, session.did, blobs)
-  const deviceSignature = await signRecipeRecord(identity, session.did, unsigned)
-  const record: RecipeRecord = {
-    ...unsigned,
-    deviceDid: identity.did,
-    deviceSignature,
-  }
-  const { uri, cid } = await client.putRecord(session, {
-    repo: session.did,
-    collection: RECIPE_COLLECTION,
-    rkey: recipe.id,
-    record: { ...record } as Record<string, unknown>,
-  })
-  const finalUri = uri || `at://${session.did}/${RECIPE_COLLECTION}/${recipe.id}`
-  savePublication(
-    {
-      did: session.did,
-      uri: finalUri,
+    const unsigned = buildRecipeRecord(recipe, session.did, blobs)
+    const deviceSignature = await signRecipeRecord(identity, session.did, unsigned)
+    const record: RecipeRecord = {
+      ...unsigned,
+      deviceDid: identity.did,
+      deviceSignature,
+    }
+    const { uri, cid } = await client.putRecord(session, {
+      repo: session.did,
+      collection: RECIPE_COLLECTION,
       rkey: recipe.id,
-      cid: cid ?? '',
-      pdsUrl: session.pdsUrl || client.pdsUrl,
-      updatedAt: new Date().toISOString(),
-    },
-    kv as PublicKv,
-  )
-  saveSession(session, kv as PublicKv)
-  return finalUri
+      record: { ...record } as Record<string, unknown>,
+    })
+    const finalUri = uri || `at://${session.did}/${RECIPE_COLLECTION}/${recipe.id}`
+    savePublication(
+      {
+        did: session.did,
+        uri: finalUri,
+        rkey: recipe.id,
+        cid: cid ?? '',
+        pdsUrl: session.pdsUrl || client.pdsUrl,
+        updatedAt: new Date().toISOString(),
+      },
+      kv as PublicKv,
+    )
+    saveSession(session, kv as PublicKv)
+    return finalUri
+  } catch (e) {
+    // Orphan cleanup (M2(int)): anything uploaded before the failure is
+    // deleted best-effort, then the original failure is rethrown — the
+    // caller sees the publish failure, not a cleanup failure.
+    if (blobs.length > 0) {
+      await deleteUploadedBlobs(client, session, blobs)
+    }
+    throw e
+  }
+}
+
+/** Delete uploaded blobs, best-effort: failures are warned, never thrown. */
+async function deleteUploadedBlobs(
+  client: AtprotoClient,
+  session: AtprotoSession,
+  blobs: AtprotoBlob[],
+): Promise<void> {
+  for (const blob of blobs) {
+    try {
+      await client.deleteBlob(session, blob.ref.$link)
+    } catch (e) {
+      console.warn('orphan blob cleanup failed', blob.ref.$link, e)
+    }
+  }
 }
 
 /**

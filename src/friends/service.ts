@@ -40,10 +40,12 @@ import {
   setKeyFriends,
   unpublishShare,
   type ReceivedShare,
+  type ShelfTombstone,
 } from './shelf'
 import { getRepo, type YjsStore } from '../store/repo'
 import {
   createRecipe,
+  deleteRecipe,
   getOrCreateIndex,
   getRecipe,
   updateRecipe,
@@ -142,23 +144,31 @@ export async function republishIfShared(
   }
 }
 
-/** Stop sharing a recipe everywhere (delete path): strip all channels. */
+/**
+ * Stop sharing a recipe everywhere (delete path): strip all channels.
+ * Returns the DIDs the recipe was unshared from — the delete flow
+ * reports them (H13): those friends' copies are recalled by tombstone
+ * when they next sync, not instantly.
+ */
 export async function unshareRecipeEverywhere(
   recipeId: string,
   identity: Identity,
   kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
-): Promise<void> {
+): Promise<string[]> {
   const keyRec = getRecipeKey(recipeId, kv)
-  if (!keyRec) return
+  if (!keyRec) return []
   const myName = getDisplayName(kv)
+  const sharedWith: string[] = []
   for (const did of keyRec.friends) {
     const friend = getFriend(did, kv)
     if (!friend) continue
     const doc = await getChannelDoc(friend, repo)
     await unpublishShare(doc, identity, myName, recipeId, did)
+    sharedWith.push(did)
   }
   dropRecipeKey(recipeId, kv)
+  return sharedWith
 }
 
 // ---------------------------------------------------------------------------
@@ -317,23 +327,8 @@ export async function importReceivedShares(
     // Failures are reported via onFailure and the loop continues.
     try {
       const doc = await getChannelDoc(friend, repo)
-      const { received, failures } = await processChannel(doc, identity)
-      for (const f of failures) onFailure?.(f)
-      for (const share of received) {
-        // Per-share isolation (S9): a share whose decrypted recipe fails
-        // validation is skipped and reported, never aborts the import.
-        try {
-          await upsertReceived(index, share, mapping, repo)
-          count++
-        } catch (e) {
-          onFailure?.({
-            shareId: share.shareId,
-            reason: `share could not be saved: ${
-              e instanceof Error ? e.message : String(e)
-            }`,
-          })
-        }
-      }
+      const { imported } = await importChannelDoc(doc, identity, index, mapping, repo, onFailure)
+      count += imported
     } catch (e) {
       onFailure?.({
         shareId: `friend:${friend.did}`,
@@ -345,6 +340,69 @@ export async function importReceivedShares(
   }
   saveReceivedMap(kv, mapping)
   return count
+}
+
+/**
+ * Apply verified delete tombstones (H6): for each tombstone whose recipe
+ * I hold as a received copy, delete the local copy and drop its mapping
+ * entry. The copy is deleted even if I edited it locally — the owner's
+ * delete recalls the copy, edits and all. Returns how many copies were
+ * removed. Tombstones for recipes I never received are no-ops.
+ */
+export async function applyTombstones(
+  tombstones: ShelfTombstone[],
+  mapping: Record<string, ReceivedMapping>,
+  index: IndexHandle,
+  repo: YjsStore,
+): Promise<number> {
+  let removed = 0
+  for (const t of tombstones) {
+    const key = receivedKey(t.ownerDid, t.recipeId)
+    const existing = mapping[key]
+    if (!existing) continue
+    await deleteRecipe(repo, index, existing.localId)
+    delete mapping[key]
+    removed++
+  }
+  return removed
+}
+
+/**
+ * Import one channel doc: verify + decrypt what's addressed to me, upsert
+ * local copies (per-share isolation, S9), then apply that doc's verified
+ * delete tombstones (H6). Extracted from importReceivedShares so the
+ * doc-level logic is unit-testable without a live channel provider.
+ * Tombstones run AFTER this run's shares: a recipe that is live-shared
+ * again is never deleted by its (stale) tombstone.
+ */
+export async function importChannelDoc(
+  doc: Y.Doc,
+  identity: Identity,
+  index: IndexHandle,
+  mapping: Record<string, ReceivedMapping>,
+  repo: YjsStore,
+  onFailure?: (f: { shareId: string; reason: string }) => void,
+): Promise<{ imported: number; tombstonesApplied: number }> {
+  const { received, failures, tombstones } = await processChannel(doc, identity)
+  for (const f of failures) onFailure?.(f)
+  let count = 0
+  for (const share of received) {
+    // Per-share isolation (S9): a share whose decrypted recipe fails
+    // validation is skipped and reported, never aborts the import.
+    try {
+      await upsertReceived(index, share, mapping, repo)
+      count++
+    } catch (e) {
+      onFailure?.({
+        shareId: share.shareId,
+        reason: `share could not be saved: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      })
+    }
+  }
+  const tombstonesApplied = await applyTombstones(tombstones, mapping, index, repo)
+  return { imported: count, tombstonesApplied }
 }
 
 async function upsertReceived(

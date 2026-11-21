@@ -29,6 +29,7 @@ import {
   type PublishableRecipe,
 } from '../public/publish'
 import { publicRecordToInput, searchAppView } from '../public/discover'
+import { cidForBytes } from '../public/blobCid'
 import {
   identityFromSeed,
   publicKeyFromDid,
@@ -54,7 +55,6 @@ function makeFakePds(opts: { expireAccess1?: boolean } = {}) {
   const records = new Map<string, { record: Record<string, unknown>; cid: string }>()
   const blobs = new Map<string, { bytes: Uint8Array; mime: string }>()
   const calls: FakeCall[] = []
-  let blobN = 0
   let recN = 0
 
   const json = (obj: unknown, status = 200) =>
@@ -137,7 +137,11 @@ function makeFakePds(opts: { expireAccess1?: boolean } = {}) {
         }
         const bytes = init.body as Uint8Array
         const mime = headers['Content-Type'] ?? 'application/octet-stream'
-        const cid = `bafyblob${++blobN}`
+        // A real PDS names the stored bytes by their content hash —
+        // the publish path verifies the returned CID against the
+        // uploaded bytes (M2(int)), so the fake must return a real
+        // CID too, not a placeholder.
+        const cid = await cidForBytes(new Uint8Array(bytes))
         blobs.set(cid, { bytes: new Uint8Array(bytes), mime })
         return json({
           blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length },

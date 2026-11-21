@@ -180,8 +180,16 @@ Body: a recipe in the [recipe shape](#the-recipe-shape), optionally
 with a `visibility` field. Creates it and answers **201**:
 
 ```json
-{ "id": "…", "title": "Tomato Soup", "visibility": "private" }
+{ "id": "…", "title": "Tomato Soup", "visibility": "private", "warnings": [] }
 ```
+
+Making it `public` in the same call needs `"confirm": true` in the
+body — the API's version of the app's make-public confirm dialog.
+Without it the create is refused with **422** and nothing is written.
+Every create/update/delete/import response carries a `warnings`
+array: plain-language notes about the result (a remote copy that
+could not be taken down, a photo an importer had to leave out). A
+warning never means the call failed.
 
 #### `PUT /v1/recipes/<id>`
 
@@ -189,7 +197,9 @@ Body: the full recipe shape (this is a full update, not a patch —
 fields you omit are cleared). If the body carries a `visibility`
 different from the current tier, the tier change runs through the
 app's real visibility flow (publishing/unpublishing included).
-Answers **200** `{ "id": "…", "visibility": "…" }`. Unknown id → 404.
+Flipping a recipe to `public` needs `"confirm": true` in the body,
+as for creating one public. Answers **200**
+`{ "id": "…", "visibility": "…", "warnings": [] }`. Unknown id → 404.
 
 Editing a recipe that is already public or shared republishes the new
 version exactly as an in-app edit would.
@@ -198,8 +208,15 @@ version exactly as an in-app edit would.
 
 Deletes the recipe. If it was public, the public record is removed
 first; if it was shared with friends, the shares are withdrawn first —
-the same flow as deleting in the app. Answers **200**
-`{ "id": "…", "deleted": true }`. Unknown id → 404.
+the same flow as deleting in the app. Deleting is permanent, so it
+needs `"confirm": true` in the request body — without it the call is
+refused with **422** and nothing is deleted. (Send the body as JSON,
+`{ "confirm": true }`.) Answers **200**
+`{ "id": "…", "deleted": true, "warnings": [] }`. Unknown id → 404.
+The `warnings` array says in plain language what the delete could
+not take down — a public copy left live because no publishing account
+is signed in, or friends' copies that are only recalled when their
+devices next sync.
 
 #### `POST /v1/import`
 
@@ -218,7 +235,7 @@ anything is wrong, nothing is imported and you get **422** with the
 reason. On success, **201**:
 
 ```json
-{ "importer": "longtable-json", "imported": ["<id>", …], "count": 1 }
+{ "importer": "longtable-json", "imported": ["<id>", …], "count": 1, "warnings": [] }
 ```
 
 #### `GET /v1/friends`
@@ -253,7 +270,8 @@ Validation failures are **422** with a message naming the field.
 - **`public`** is honored only when a publishing account is signed in
   on the device (in the app, under Publishing). Otherwise the request
   is refused with **422** *before anything is written* — you never get
-  a surprise private copy of a failed publish. When honored, the
+  a surprise private copy of a failed publish. Going public also
+  needs `"confirm": true` in the body (see above). When honored, the
   recipe is published through the same signed flow the app uses
   (pubkey binding + device signature; see
   [public-protocol.md](public-protocol.md)).
@@ -273,7 +291,7 @@ Validation failures are **422** with a message naming the field.
 | 404 | No such recipe id, or no such endpoint. |
 | 405 | That method isn't supported for that path. |
 | 413 | Request body over 16 MB. |
-| 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in), or an import found nothing valid. |
+| 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in), a destructive call arrived without `"confirm": true`, or an import found nothing valid. |
 | 500 | Something went wrong on the device. Nothing was changed; try again. |
 | 502 | A visibility change failed at the publishing server. The message says what the server said, in plain language. |
 | 503 | The app is still starting up, or has no device identity yet. Try again in a moment. |

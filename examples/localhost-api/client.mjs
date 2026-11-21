@@ -21,7 +21,7 @@
 //   node client.mjs get <recipe-id>
 //   node client.mjs create <recipe.json>
 //   node client.mjs update <recipe-id> <recipe.json>
-//   node client.mjs delete <recipe-id>
+//   node client.mjs delete <recipe-id>   (sends {"confirm": true}: deleting is permanent)
 //   node client.mjs import <importer-id> <text-file>
 //
 // Every command prints the API's JSON response. On an API error it
@@ -93,7 +93,9 @@ switch (cmd) {
     out = await api('PUT', `/v1/recipes/${args[0]}`, readJson(args[1]));
     break;
   case 'delete':
-    out = await api('DELETE', `/v1/recipes/${args[0]}`);
+    // Deleting is permanent: the API requires an explicit confirm,
+    // the equivalent of the app's delete dialog.
+    out = await api('DELETE', `/v1/recipes/${args[0]}`, { confirm: true });
     break;
   case 'import':
     out = await api('POST', '/v1/import', {

@@ -15,6 +15,7 @@
 import { getRepo, type YjsStore } from '../store/repo'
 import {
   createRecipe as storeCreateRecipe,
+  createRecipesAtomic,
   deleteRecipe as storeDeleteRecipe,
   getOrCreateIndex,
   getRecipe as storeGetRecipe,
@@ -61,15 +62,21 @@ export interface LocalApiHost {
   createRecipe(input: RecipeInput): Promise<{ id: string }>
   /** Full content update (router has already validated the shape). */
   updateRecipe(id: string, input: RecipeInput): Promise<void>
-  deleteRecipe(id: string): Promise<void>
+  /**
+   * Delete with the UI's side paths. Returns the flow's warnings (H13:
+   * remote copies that could not be taken down, the tombstone recall
+   * limit) — the router includes them in the 200 body.
+   */
+  deleteRecipe(id: string): Promise<{ warnings: string[] }>
   /** Whether public publishing can run right now (signed-in session). */
   canPublish(): boolean
   /**
    * Move a recipe between the 'private' and 'public' tiers through the
    * app's byte-path flow. 'friends-only' is deliberately NOT offered:
-   * it needs a person picking which friends, in the app.
+   * it needs a person picking which friends, in the app. Returns the
+   * flow's warnings (H13), as for deleteRecipe.
    */
-  setVisibility(id: string, tier: 'private' | 'public'): Promise<void>
+  setVisibility(id: string, tier: 'private' | 'public'): Promise<{ warnings: string[] }>
   importRecipes(inputs: RecipeInput[]): Promise<string[]>
   /** Names + DIDs only — never pair secrets or shelf internals. */
   listFriends(): { name: string; did: string }[]
@@ -79,16 +86,21 @@ export interface LocalApiHostHooks {
   /** Content update with the UI's side paths (friends/PDS republish).
    *  Defaults to the bare store update. */
   applyUpdate?: (id: string, input: RecipeInput) => Promise<void>
-  /** Delete with the UI's side paths (unshare + unpublish first).
-   *  Defaults to the bare store delete. */
-  applyDelete?: (id: string) => Promise<void>
-  /** The UI's visibility byte-path flow. Without it, tier changes are
-   *  rejected with a plain error. */
+  /**
+   * Delete with the UI's side paths (unshare + unpublish first).
+   * Defaults to the bare store delete. Returns the flow's warnings
+   * (H13) — the router surfaces them to the caller.
+   */
+  applyDelete?: (id: string) => Promise<string[]>
+  /**
+   * The UI's visibility byte-path flow. Without it, tier changes are
+   * rejected with a plain error. Returns the flow's warnings (H13).
+   */
   applyVisibility?: (
     id: string,
     recipe: Recipe,
     tier: 'private' | 'public',
-  ) => Promise<void>
+  ) => Promise<string[]>
   /** Whether a publishing session exists (App passes its session check). */
   canPublish?: () => boolean
   getIdentityDid?: () => Promise<string | null>
@@ -183,13 +195,15 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
     },
 
     async deleteRecipe(id) {
+      let warnings: string[] = []
       if (hooks.applyDelete) {
-        await hooks.applyDelete(id)
+        warnings = await hooks.applyDelete(id)
       } else {
         const idx = await index()
         await storeDeleteRecipe(repo(), idx, id)
       }
       hooks.onChanged?.()
+      return { warnings }
     },
 
     canPublish() {
@@ -210,20 +224,28 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
         throw new LocalApiError(404, 'No recipe with that id exists in this cookbook.')
       }
       try {
-        await hooks.applyVisibility(id, recipe, tier)
+        const warnings = await hooks.applyVisibility(id, recipe, tier)
+        hooks.onChanged?.()
+        return { warnings }
       } catch (e) {
         if (e instanceof LocalApiError) throw e
         throw new LocalApiError(502, friendlyError(e, 'the publishing server'))
       }
-      hooks.onChanged?.()
     },
 
     async importRecipes(inputs) {
       const idx = await index()
-      const ids: string[] = []
-      for (const input of inputs) {
-        const summary = await storeCreateRecipe(repo(), idx, input)
-        ids.push(summary.id)
+      // H11: atomic, best-effort — a mid-loop store failure rolls back
+      // what was already created and says so, instead of leaving a
+      // partial import behind a "nothing was changed" 500.
+      let ids: string[]
+      try {
+        ids = await createRecipesAtomic(repo(), idx, inputs)
+      } catch (e) {
+        throw new LocalApiError(
+          500,
+          e instanceof Error ? e.message : 'The import failed and nothing was imported.',
+        )
       }
       hooks.onChanged?.()
       return ids
