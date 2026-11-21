@@ -68,7 +68,12 @@ One-off sharing: one y-webrtc room per shared recipe
 text) carries the room and the hub's signaling endpoint. Entry points:
 `shareRecipe`, `joinShare`, `parseSharePayload`, `rejoinShares`,
 `onShareUpdate`, `destroyAllShareProviders`, `peerCount`. Concurrent
-edits merge through Yjs; there is no server copy.
+edits merge through Yjs; there is no server copy. Scalar fields merge;
+list fields (ingredients, steps, photos) replace wholesale via
+`replaceArray` in `src/store/recipes.ts`, so concurrent edits to the
+same list can drop one side. Per-element list merging is explicitly
+declined as a feature: the claim correction in the README is the fix
+for that finding, not a merge implementation.
 
 ## friends — `src/friends/`
 
@@ -92,6 +97,11 @@ Friend pairing and friends-only sharing (Phase 2).
   `publishShare`, `unpublishShare`, `processChannel` (receiver side:
   verify manifest → find my envelope → decrypt; every failure is an
   explicit, named result — `no key envelope addressed to me` etc.).
+  No forward secrecy on add (accepted residual, Sec L4 — see
+  [accepted-risks.md](accepted-risks.md)): a friend added to a recipe
+  receives a sealed-box envelope holding that recipe's *existing* key,
+  so they can read the shared content as it stands; the key is rotated
+  only on unfriend, never on add.
 - `service.ts` — the app-facing orchestration: `shareRecipeWithFriends`,
   `republishIfShared`, `unshareRecipeEverywhere`, `unfriendAndRekey`
   (rotate the recipe key, republish to remaining friends, unpublish from

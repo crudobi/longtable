@@ -24,6 +24,7 @@ import {
 import {
   applyVisibilityFlow,
   performDeleteFlow,
+  TOMBSTONE_NOTICE,
   VisibilitySessionError,
 } from './recipeFlows'
 import type { SharePayload } from './p2p/share'
@@ -380,7 +381,12 @@ export default function App() {
     async (id: string) => {
       const summary = summaries.find((s) => s.id === id)
       const name = summary?.title || 'this recipe'
-      if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return
+      if (
+        !window.confirm(
+          `Delete "${name}"? This cannot be undone. ${TOMBSTONE_NOTICE}`,
+        )
+      )
+        return
       await performDelete(id)
       await refresh()
       setView({ name: 'list' })

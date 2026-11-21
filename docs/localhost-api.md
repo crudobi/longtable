@@ -82,6 +82,14 @@ on is a deliberate act.
   app, and choosing *friends-only* through the API is refused — picking
   friends is something you do in the app (see
   [Visibility](#visibility-rules)).
+- Reads return full plaintext, by design (Sec L6). `GET /v1/recipes`
+  and `GET /v1/recipes/<id>` return the whole recipe — title,
+  ingredients, steps, and photos — for every visibility tier,
+  including private and friends-only recipes you own. There is no
+  per-recipe or per-tier authorization beyond the token: anyone holding
+  the token reads everything, exactly as the app itself does. That is
+  why the token is the whole access control, and why it must be
+  treated like a password for the cookbook.
 - Anyone with your unlocked device — or USB debugging access to it —
   and the token can use the API. That's the same trust you place in
   the device itself.
@@ -229,10 +237,17 @@ importers the Import panel uses) over source text:
 
 Registered importers that accept text input include `longtable-json`
 (Longtable/JSON recipes), `mealie-json` (a Mealie `recipe.json`
-export), and `markdown-recipe` (a Markdown recipe). The import is
-**atomic**: every recipe the importer returns is validated first; if
-anything is wrong, nothing is imported and you get **422** with the
-reason. On success, **201**:
+export), and `markdown-recipe` (a Markdown recipe). Validation is
+all-or-nothing: every recipe the importer returns is validated first;
+if anything is wrong, nothing is imported and you get **422** with the
+reason. Creation is **not** atomic — it is best-effort with rollback
+(`createRecipesAtomic` in `src/store/recipes.ts`): if creating a
+recipe fails midway, the recipes already created are deleted again
+where possible, and the **500** error names the failing recipe and
+whether the rollback held or left stranded recipes behind. There is no
+transaction around the whole import; a 500 after a partial import
+means "check the recipe list", not "nothing changed". On success,
+**201**:
 
 ```json
 { "importer": "longtable-json", "imported": ["<id>", …], "count": 1, "warnings": [] }
@@ -292,7 +307,7 @@ Validation failures are **422** with a message naming the field.
 | 405 | That method isn't supported for that path. |
 | 413 | Request body over 16 MB. |
 | 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in), a destructive call arrived without `"confirm": true`, or an import found nothing valid. |
-| 500 | Something went wrong on the device. Nothing was changed; try again. |
+| 500 | Something went wrong on the device while handling that request. Some changes may already have been applied — check the recipe list before trying again. |
 | 502 | A visibility change failed at the publishing server. The message says what the server said, in plain language. |
 | 503 | The app is still starting up, or has no device identity yet. Try again in a moment. |
 | 504 | The app didn't answer in time — it may be suspended in the background. Bring Longtable to the front and retry. |
