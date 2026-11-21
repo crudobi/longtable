@@ -8,7 +8,8 @@
  * data (recipes, friends, shares, identity) is local and hub-independent:
  * switching hubs changes endpoints, never data.
  *
- * The registry lives in localStorage under HUBS_KEY as
+ * The registry lives in the Android Keystore (src/secrets/secretStore.ts)
+ * on native — in localStorage on web — under HUBS_KEY as
  *   { hubs: HubConfig[], activeId: string }
  * On first run it is seeded with the built-in default hub (the Phase 1–3
  * dev endpoints), so behavior is unchanged until the user
@@ -20,6 +21,7 @@
  * each other, and the death of one hub does not end the session (E8).
  */
 import type { KeyValueStore } from '../identity/identity'
+import { secretKv } from '../secrets/secretStore'
 
 export interface HubConfig {
   id: string
@@ -190,24 +192,14 @@ export interface HubRegistry {
 }
 
 /**
- * The default store: localStorage where it exists (the app), else a
- * process-local memory map (unit tests run under node, where touching
- * `localStorage` throws). Endpoint resolution must never crash a caller
- * that only wanted the default hub.
+ * The default store: the secure store (src/secrets/secretStore.ts).
+ * It routes the registry (which carries TURN credentials) to the
+ * Keystore on Android and to localStorage on web, and it never throws
+ * when localStorage is absent (unit tests run under node) — endpoint
+ * resolution must never crash a caller that only wanted the default hub.
  */
-const memoryFallback = new Map<string, string>()
 export function defaultKv(): KeyValueStore {
-  try {
-    if (typeof localStorage !== 'undefined') return localStorage
-  } catch {
-    /* fall through */
-  }
-  return {
-    getItem: (k) => (memoryFallback.has(k) ? memoryFallback.get(k)! : null),
-    setItem: (k, v) => {
-      memoryFallback.set(k, v)
-    },
-  }
+  return secretKv
 }
 
 function isHubConfig(o: unknown): o is HubConfig {

@@ -7,7 +7,8 @@
  * uploadBlob, and sync getBlob.
  *
  * Auth model: the session ({did, handle, pdsUrl, accessJwt, refreshJwt})
- * is persisted in localStorage under SESSION_KEY by the app layer. Authed
+ * is persisted in the Android Keystore (src/secrets/secretStore.ts) on
+ * native — in localStorage on web — under SESSION_KEY by the app layer. Authed
  * calls that meet a 401 / ExpiredToken refresh the session ONCE (via
  * com.atproto.server.refreshSession with the refreshJwt) and retry; the
  * refreshed tokens are written back into the passed session object and
@@ -15,6 +16,7 @@
  */
 import type { KeyValueStore } from '../identity/identity'
 import { getActiveHub, updateHub } from '../hubs/hubs'
+import { secretKv } from '../secrets/secretStore'
 
 export const SESSION_KEY = 'longtable:atproto-session'
 export const PUBLICATIONS_KEY = 'longtable:publications:v1'
@@ -74,7 +76,7 @@ function trimSlash(url: string): string {
 // Session + settings stores
 // ---------------------------------------------------------------------------
 
-export function loadSession(kv: PublicKv = localStorage): AtprotoSession | null {
+export function loadSession(kv: PublicKv = secretKv): AtprotoSession | null {
   try {
     const raw = kv.getItem(SESSION_KEY)
     if (!raw) return null
@@ -101,16 +103,16 @@ export function loadSession(kv: PublicKv = localStorage): AtprotoSession | null 
   }
 }
 
-export function saveSession(session: AtprotoSession, kv: PublicKv = localStorage): void {
+export function saveSession(session: AtprotoSession, kv: PublicKv = secretKv): void {
   kv.setItem(SESSION_KEY, JSON.stringify(session))
 }
 
-export function clearSession(kv: PublicKv = localStorage): void {
+export function clearSession(kv: PublicKv = secretKv): void {
   if (typeof kv.removeItem === 'function') kv.removeItem(SESSION_KEY)
   else kv.setItem(SESSION_KEY, '')
 }
 
-export function loadAppViewUrl(kv: PublicKv = localStorage): string {
+export function loadAppViewUrl(kv: PublicKv = secretKv): string {
   try {
     // An explicitly saved URL (the Discover settings field) wins; otherwise
     // the active hub supplies the AppView endpoint (Phase 4 multi-hub).
@@ -120,7 +122,7 @@ export function loadAppViewUrl(kv: PublicKv = localStorage): string {
   }
 }
 
-export function saveAppViewUrl(url: string, kv: PublicKv = localStorage): void {
+export function saveAppViewUrl(url: string, kv: PublicKv = secretKv): void {
   const clean = trimSlash(url)
   kv.setItem(APPVIEW_URL_KEY, clean)
   // Keep the active hub in sync so the hub list shows where discovery

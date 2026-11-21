@@ -7,10 +7,9 @@
  * Ed25519→Curve25519 conversion derives the X25519 keys used for sealed-box
  * key wrapping, so a friend only ever needs your DID to encrypt to you.
  *
- * The secret key lives in localStorage (app-private storage on Android,
- * same trust level as the rest of the app's local data). Future hardening:
- * Android Keystore via a Capacitor plugin — the DID and all wire formats
- * stay identical, only the key's home changes.
+ * The secret key lives in the Android Keystore (src/secrets/secretStore.ts)
+ * on native, in localStorage on web/PWA where no Keystore exists. The DID
+ * and all wire formats stay identical, only the key's home changes.
  *
  * Structured for Phase 3+: a did:plc / ATProto binding can be layered on
  * later by publishing this same public key in a `kitchen.longtable.pubkey`
@@ -19,6 +18,7 @@
  */
 import sodium from 'libsodium-wrappers'
 import { base58btcDecode, base58btcEncode, base64ToU8, u8ToBase64 } from './codec'
+import { flushSecrets, secretKv } from '../secrets/secretStore'
 
 /** Minimal key/value store (localStorage in the app, in-memory in tests). */
 export interface KeyValueStore {
@@ -80,7 +80,7 @@ export async function generateIdentity(): Promise<Identity> {
  * The secret is stored base64-encoded under SECRET_KEY in `kv`.
  */
 export async function getOrCreateIdentity(
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): Promise<Identity> {
   await cryptoReady()
   const raw = kv.getItem(SECRET_KEY)
@@ -96,6 +96,10 @@ export async function getOrCreateIdentity(
   }
   const identity = await generateIdentity()
   kv.setItem(SECRET_KEY, u8ToBase64(identity.secretKey))
+  // First launch mints the device identity: await the Keystore flush so
+  // the key is durable before anything else proceeds. (With an explicit
+  // test kv this flushes an empty queue - a no-op.)
+  await flushSecrets()
   return identity
 }
 

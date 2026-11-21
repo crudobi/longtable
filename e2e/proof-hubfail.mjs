@@ -268,7 +268,7 @@ async function addHubViaUi(driver, hub) {
     waitFor(
       driver,
       async () => {
-        const raw = await evalJs(driver, 'localStorage.getItem("longtable:hubs:v1") || ""')
+        const raw = await evalJs(driver, 'window.__ltSecrets.readSecret("longtable:hubs:v1") || ""')
         return String(raw).includes(hub.signaling) ? String(raw) : null
       },
       6000,
@@ -288,7 +288,7 @@ async function addHubViaUi(driver, hub) {
 }
 
 async function hubRegistry(driver) {
-  const raw = await evalJs(driver, 'localStorage.getItem("longtable:hubs:v1") || "null"')
+  const raw = await evalJs(driver, 'window.__ltSecrets.readSecret("longtable:hubs:v1") || "null"')
   return JSON.parse(String(raw))
 }
 
@@ -307,7 +307,7 @@ async function removeDefaultHub(driver) {
     waitFor(
       driver,
       async () => {
-        const raw = await evalJs(driver, 'localStorage.getItem("longtable:hubs:v1") || ""')
+        const raw = await evalJs(driver, 'window.__ltSecrets.readSecret("longtable:hubs:v1") || ""')
         return String(raw).includes('wss://10.0.2.2:4444') ? null : true
       },
       5000,
@@ -505,8 +505,10 @@ async function floorDiagnostics(driver, payload) {
     parts.push(`joinError=${(await err.isExisting()) ? await err.getText() : '(none)'}`)
     const modal = await driver.$('[data-testid="join-modal"]')
     parts.push(`joinModalOpen=${await modal.isExisting()}`)
-    const shares = await evalJs(driver, 'localStorage.getItem("longtable:shares") || "null"')
-    parts.push(`shares=${String(shares).slice(0, 160)}`)
+    // Presence only: the shares JSON carries room secrets, which
+    // must never land in a diagnostics dump.
+    const sharesPresent = await evalJs(driver, 'window.__ltSecrets.readSecret("longtable:shares") !== null')
+    parts.push(`sharesPresent=${sharesPresent}`)
     const cards = await driver.$$('[data-testid="recipe-item"]')
     const titles = []
     for (const c of cards) titles.push(await c.getText())

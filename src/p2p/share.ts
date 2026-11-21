@@ -16,8 +16,11 @@
  * no secret and still join passwordless: they stay exactly as open as
  * they always were (see parseSharePayload).
  *
- * Shares persist in localStorage and are rejoined on every launch, so peers
- * reconnect after app restarts (this is also what heals a partition).
+ * Shares persist in the secure store (Keystore on Android, localStorage
+ * on web — see src/secrets/secretStore.ts) and are rejoined on every
+ * launch, so peers reconnect after app restarts (this is also what
+ * heals a partition). Share records carry the room secret, so they are
+ * crown-jewel secrets, not plain preferences.
  * A share ends only through leaveShare(), which destroys the provider and
  * deletes the record — deleting the recipe or narrowing its visibility
  * without leaving would resurrect the room on the next launch.
@@ -26,6 +29,7 @@ import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
 import { getOrCreateIndex, RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
+import { secretKv } from '../secrets/secretStore'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -176,7 +180,7 @@ export function validateSharedDoc(doc: Y.Doc): string {
 
 function loadShares(): ShareRecord[] {
   try {
-    const raw = localStorage.getItem(SHARES_KEY)
+    const raw = secretKv.getItem(SHARES_KEY)
     if (!raw) return []
     const arr: unknown = JSON.parse(raw)
     return Array.isArray(arr) ? (arr as ShareRecord[]) : []
@@ -189,7 +193,7 @@ function saveShare(rec: ShareRecord): void {
   const shares = loadShares().filter((s) => s.recipeId !== rec.recipeId)
   shares.push(rec)
   try {
-    localStorage.setItem(SHARES_KEY, JSON.stringify(shares))
+    secretKv.setItem(SHARES_KEY, JSON.stringify(shares))
   } catch {
     /* storage full or unavailable — sharing still works for this session */
   }
@@ -199,7 +203,7 @@ function saveShare(rec: ShareRecord): void {
 function deleteShareRecord(recipeId: string): void {
   const shares = loadShares().filter((s) => s.recipeId !== recipeId)
   try {
-    localStorage.setItem(SHARES_KEY, JSON.stringify(shares))
+    secretKv.setItem(SHARES_KEY, JSON.stringify(shares))
   } catch {
     /* storage unavailable — the provider is already dead (leaveShare
        destroys it before this runs), and rejoinShares re-reads storage,

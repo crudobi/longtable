@@ -39,6 +39,15 @@ import { DiscoverPanel } from './components/DiscoverPanel'
 import { ImportPanel } from './components/ImportPanel'
 import { friendlyError } from './friendlyError'
 import { DEBUG_HOOKS_ENABLED } from './debugHooks'
+import {
+  flushSecrets,
+  initSecrets,
+  isSecureStoreAvailable,
+  lastInitReport,
+  readSecureStoreRaw,
+  secretKv,
+  secretsStatus,
+} from './secrets/secretStore'
 import { HubSettingsModal } from './components/HubSettingsModal'
 import { LocalApiSettingsModal } from './components/LocalApiSettingsModal'
 import { createLocalApiHost, LocalApiError } from './localapi/host'
@@ -110,6 +119,24 @@ export default function App() {
 
   useEffect(() => {
     void (async () => {
+      // Wave 3 (Keystore): move legacy localStorage secrets into the
+      // Android Keystore BEFORE anything reads them (identity load
+      // below). Reports per-key outcomes; degraded mode keeps the app
+      // working from localStorage when the Keystore is unavailable.
+      try {
+        const report = await initSecrets()
+        // Outcomes only (per-key outcome + legacyCleared boolean) — no
+        // secret values ever reach the log.
+        console.log('[longtable] secret migration', JSON.stringify(report))
+        if (!report.secureAvailable) {
+          console.warn(
+            '[longtable] keystore unavailable — secrets stay in localStorage',
+            report.perKey,
+          )
+        }
+      } catch (e) {
+        console.warn('secret migration failed', e)
+      }
       // One-time Phase 0 (Automerge) recovery migration: imports any
       // recipes orphaned by the Phase 1 storage swap. Flag-guarded and
       // dynamically imported, so it is inert after the first run.
@@ -395,6 +422,36 @@ export default function App() {
         searchAppView(loadAppViewUrl(), { q, ingredients }),
     }
   }, [identity, loadRecipeById])
+
+  // Wave 3 debug hooks (e2e proof): window.__ltSecrets, installed once
+  // at mount — same pattern as __ltPublic. Gated by
+  // DEBUG_HOOKS_ENABLED (src/debugHooks.ts): CI proof builds only; the
+  // published artifact never installs this. readSecret answers from
+  // the in-memory mirror (the app's read path); readSecureStore reads
+  // the Keystore directly (the migration proof's backing check).
+  // Values are exposed only to the proof harness in debug builds —
+  // the proof scripts report presence booleans and digests, never
+  // values. flush() drains the async Keystore persist queue before
+  // a proof force-stops the app.
+  useEffect(() => {
+    if (!DEBUG_HOOKS_ENABLED) return
+    const w = window as unknown as { __ltSecrets?: unknown }
+    w.__ltSecrets = {
+      available: () => isSecureStoreAvailable(),
+      initReport: () => lastInitReport(),
+      status: () => secretsStatus(),
+      readSecret: (key: string) => secretKv.getItem(key),
+      readSecureStore: (key: string) => readSecureStoreRaw(key),
+      localStorageHas: (key: string) => {
+        try {
+          return localStorage.getItem(key) !== null
+        } catch {
+          return false
+        }
+      },
+      flush: () => flushSecrets(),
+    }
+  }, [])
 
   // Localhost API (E9): register the host the API router executes
   // against — wired to the very flows the UI uses, so an API write

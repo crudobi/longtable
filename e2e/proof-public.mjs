@@ -258,7 +258,7 @@ async function main() {
     await (await A.$('[data-testid="field-app-password"]')).setValue(AUTHOR.password)
     await (await A.$('[data-testid="atproto-signin"]')).click()
     const signedIn = await pollUntil(
-      () => evalJs(A, '!!localStorage.getItem("longtable:atproto-session")'),
+      () => evalJs(A, '!!window.__ltSecrets.readSecret("longtable:atproto-session")'),
       30000,
       500,
     )

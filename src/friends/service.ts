@@ -28,6 +28,7 @@ import {
   removeFriend,
   type FriendRecord,
 } from './friends'
+import { secretKv } from '../secrets/secretStore'
 import {
   dropRecipeKey,
   ensureRecipeKey,
@@ -52,11 +53,11 @@ import {
 const NAME_KEY = 'longtable:display-name'
 const RECEIVED_KEY = 'longtable:received-shares'
 
-export function getDisplayName(kv: KeyValueStore = localStorage): string {
+export function getDisplayName(kv: KeyValueStore = secretKv): string {
   return kv.getItem(NAME_KEY) ?? ''
 }
 
-export function setDisplayName(name: string, kv: KeyValueStore = localStorage): void {
+export function setDisplayName(name: string, kv: KeyValueStore = secretKv): void {
   kv.setItem(NAME_KEY, name)
 }
 
@@ -73,7 +74,7 @@ export async function shareRecipeWithFriends(
   recipeId: string,
   friendDids: string[],
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   const index = await getOrCreateIndex(repo)
@@ -121,7 +122,7 @@ export async function shareRecipeWithFriends(
 export async function republishIfShared(
   recipeId: string,
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   const keyRec = getRecipeKey(recipeId, kv)
@@ -145,7 +146,7 @@ export async function republishIfShared(
 export async function unshareRecipeEverywhere(
   recipeId: string,
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   const keyRec = getRecipeKey(recipeId, kv)
@@ -174,7 +175,7 @@ export async function unshareRecipeEverywhere(
 export async function unfriendAndRekey(
   friendDid: string,
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   const ex = getFriend(friendDid, kv)
@@ -260,7 +261,7 @@ export interface ReceivedShareInfo {
 }
 
 export async function listReceivedShares(
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<ReceivedShareInfo[]> {
   const mapping = loadReceived(kv)
@@ -290,7 +291,7 @@ export async function listReceivedShares(
  */
 export async function importReceivedShares(
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
   onFailure?: (f: { shareId: string; reason: string }) => void,
 ): Promise<number> {
@@ -383,7 +384,7 @@ export interface StrangerAttemptReport {
  */
 export function installFriendsDebugHooks(
   identity: Identity,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): void {
   const w = window as unknown as { __ltFriends?: unknown }
