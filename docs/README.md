@@ -17,6 +17,7 @@ This documentation is the contract surface for third-party developers.
 | [data-safety.md](data-safety.md) | Groundwork for a future Play data-safety declaration (not a filed declaration): the privacy-policy facts mapped onto the form's questions. |
 | [accepted-risks.md](accepted-risks.md) | Accepted risks and by-design decisions: what the app deliberately does not do, and why (forward secrecy, frameable PWA, localhost-API plaintext reads, canonical-hash coverage). |
 | [release-rollback.md](release-rollback.md) | Release rollback: the Play staged-rollout + halt procedure, and what "roll back" means when there is no downgrade. |
+| [keystore-recovery.md](keystore-recovery.md) | Upload-keystore recovery: where the signing key and its backups live, how to restore and verify, and what total loss costs. |
 | [../lexicons/](../lexicons/) | The `kitchen.longtable.*` lexicon JSON schemas (the normative record shapes). |
 | [../examples/third-party-client/](../examples/third-party-client/) | A runnable third-party client that finds a public recipe through an AppView and verifies it end-to-end using only official ATProto libraries. |
 | [../examples/localhost-api/](../examples/localhost-api/) | A dependency-free command-line client for the localhost API, written from localhost-api.md alone. |

@@ -116,9 +116,13 @@ leaks into a build — and runs, in order:
 18. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
-    verify`, `bundletool dump manifest` (package + git-derived
+    verify`, a signer pin (the release APK's signer-certificate
+    SHA-256 digest must equal the pinned upload-key fingerprint in
+    `run-pipeline.sh` — a build signed by any other key fails the run
+    closed), `bundletool dump manifest` (package + git-derived
     versionCode/versionName), and `aapt2 dump badging` of the release
     APK, plus a privacy-secrets scan of the extracted AAB/APK.
+    Keystore backup + recovery: `docs/keystore-recovery.md`.
     Runs ONLY when HEAD carries an exact git tag and SKIPS
     cleanly (recorded as `signed_release: "skipped"`) on untagged
     commits — the A3 fail-closed rule (release builds refuse untagged
