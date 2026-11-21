@@ -12,9 +12,13 @@ interface Props {
   onCancel: () => void
 }
 
-function parseMinutes(raw: string): number | undefined {
+export function parseMinutes(raw: string): number | undefined {
   const n = Number(raw)
-  return raw.trim() !== '' && Number.isFinite(n) && n >= 0 ? n : undefined
+  // Whole minutes only (H-N3): a fractional value stored + signed here is
+  // served truncated by the AppView (asIntOrNull), so the served record
+  // never verifies and the published recipe is unopenable forever.
+  // Matches the validator's rounding (importers/contract.ts cleanMinutes).
+  return raw.trim() !== '' && Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined
 }
 
 export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {

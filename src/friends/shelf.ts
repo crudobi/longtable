@@ -294,7 +294,14 @@ export async function buildManifest(
 
 export async function verifyManifest(m: ShelfManifest): Promise<boolean> {
   if (typeof m.sig !== 'string') return false
-  return verifyDetached(m.did, manifestBytes(m), base64ToU8(m.sig))
+  try {
+    // base64ToU8 throws on a non-base64 sig (atob) — that is an
+    // unverifiable manifest, never a throw (S7): the caller records a
+    // failure and keeps importing the other friends' shares.
+    return await verifyDetached(m.did, manifestBytes(m), base64ToU8(m.sig))
+  } catch {
+    return false
+  }
 }
 
 export function readManifest(doc: Y.Doc, did: string): ShelfManifest | null {
@@ -434,54 +441,86 @@ export async function processChannel(
   const failures: ProcessFailure[] = []
   for (const manifest of allManifests(doc)) {
     if (manifest.did === identity.did) continue
-    if (!(await verifyManifest(manifest))) {
-      for (const share of manifest.shares) {
+    // One poisoned manifest must never abort the other friends' imports
+    // (S7): everything per-manifest runs inside this try, and any throw
+    // lands in failures under the manifest's DID — never propagates.
+    try {
+      if (!Array.isArray(manifest.shares)) {
         failures.push({
-          shareId: share.shareId,
-          reason: `manifest signature from ${manifest.did} did not verify`,
-        })
-      }
-      continue
-    }
-    for (const ref of manifest.shares) {
-      const payload = readPayload(doc, ref.shareId)
-      if (!payload) {
-        failures.push({ shareId: ref.shareId, reason: 'payload missing from shelf' })
-        continue
-      }
-      const envelope = readEnvelope(doc, ref.shareId, identity.did)
-      if (!envelope) {
-        failures.push({
-          shareId: ref.shareId,
-          reason: 'no key envelope addressed to me (not authorized)',
+          shareId: `manifest:${manifest.did}`,
+          reason: `manifest from ${manifest.did} lists no shares array`,
         })
         continue
       }
-      if (envelope.keyId !== payload.keyId || envelope.keyId !== ref.keyId) {
-        failures.push({
-          shareId: ref.shareId,
-          reason: 'key id mismatch between manifest, payload, and envelope',
-        })
+      if (!(await verifyManifest(manifest))) {
+        for (const raw of manifest.shares) {
+          const shareId =
+            raw &&
+            typeof raw === 'object' &&
+            typeof (raw as { shareId?: unknown }).shareId === 'string'
+              ? (raw as { shareId: string }).shareId
+              : `manifest:${manifest.did}`
+          failures.push({
+            shareId,
+            reason: `manifest signature from ${manifest.did} did not verify`,
+          })
+        }
         continue
       }
-      try {
-        const keyB64 = await unwrapKey(identity, envelope.sealedKey)
-        const recipe = await decryptRecipePayload(keyB64, payload.ciphertext)
-        received.push({
-          ownerDid: manifest.did,
-          ownerName: manifest.name,
-          shareId: ref.shareId,
-          recipeId: ref.recipeId,
-          keyId: ref.keyId,
-          updatedAt: payload.updatedAt,
-          recipe,
-        })
-      } catch (e) {
-        failures.push({
-          shareId: ref.shareId,
-          reason: `decryption failed: ${e instanceof Error ? e.message : String(e)}`,
-        })
+      for (const ref of manifest.shares) {
+        if (!ref || typeof ref !== 'object' || typeof ref.shareId !== 'string') {
+          failures.push({
+            shareId: `manifest:${manifest.did}`,
+            reason: `manifest from ${manifest.did} lists a malformed share reference`,
+          })
+          continue
+        }
+        const payload = readPayload(doc, ref.shareId)
+        if (!payload) {
+          failures.push({ shareId: ref.shareId, reason: 'payload missing from shelf' })
+          continue
+        }
+        const envelope = readEnvelope(doc, ref.shareId, identity.did)
+        if (!envelope) {
+          failures.push({
+            shareId: ref.shareId,
+            reason: 'no key envelope addressed to me (not authorized)',
+          })
+          continue
+        }
+        if (envelope.keyId !== payload.keyId || envelope.keyId !== ref.keyId) {
+          failures.push({
+            shareId: ref.shareId,
+            reason: 'key id mismatch between manifest, payload, and envelope',
+          })
+          continue
+        }
+        try {
+          const keyB64 = await unwrapKey(identity, envelope.sealedKey)
+          const recipe = await decryptRecipePayload(keyB64, payload.ciphertext)
+          received.push({
+            ownerDid: manifest.did,
+            ownerName: manifest.name,
+            shareId: ref.shareId,
+            recipeId: ref.recipeId,
+            keyId: ref.keyId,
+            updatedAt: payload.updatedAt,
+            recipe,
+          })
+        } catch (e) {
+          failures.push({
+            shareId: ref.shareId,
+            reason: `decryption failed: ${e instanceof Error ? e.message : String(e)}`,
+          })
+        }
       }
+    } catch (e) {
+      failures.push({
+        shareId: `manifest:${manifest.did}`,
+        reason: `manifest from ${manifest.did} could not be processed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      })
     }
   }
   return { received, failures }

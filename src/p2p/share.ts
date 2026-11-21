@@ -21,7 +21,7 @@
  */
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
-import { RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
+import { RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
@@ -124,6 +124,44 @@ function notifyUpdate(): void {
 
 export function roomForRecipe(recipeId: string): string {
   return `longtable-share-${recipeId}`
+}
+
+/**
+ * Validate the content of a shared recipe doc before it is registered
+ * (S9). A share snapshot is unauthenticated bytes from a QR code or a
+ * pasted string: a crafted code could carry a non-string title, huge
+ * arrays, or thousands of photos that would otherwise be persisted into
+ * IndexedDB and handed straight to the render path. Returns the title to
+ * list (trimmed, capped at RECIPE_LIMITS.titleChars, matching the
+ * importer and store caps). Throws on anything that cannot be safely
+ * listed; an over-long title alone is truncated, not refused, so a
+ * pre-fix recipe with a long title still joins.
+ */
+export function validateSharedDoc(doc: Y.Doc): string {
+  const map = doc.getMap(RECIPE_MAP)
+  const title = map.get('title')
+  if (typeof title !== 'string' || !title.trim()) {
+    throw new Error('That share code does not contain a readable recipe.')
+  }
+  const checkList = (key: string, max: number): void => {
+    const value = map.get(key)
+    if (value === undefined) return
+    if (!(value instanceof Y.Array)) {
+      throw new Error(`That share code has a malformed ${key} list.`)
+    }
+    if (value.length > max) {
+      throw new Error(`That share code has too many ${key} entries (${value.length}).`)
+    }
+    for (const item of value.toArray()) {
+      if (typeof item !== 'string' || item.length > RECIPE_LIMITS.itemChars) {
+        throw new Error(`That share code has a malformed ${key} entry.`)
+      }
+    }
+  }
+  checkList('ingredients', RECIPE_LIMITS.listItems)
+  checkList('steps', RECIPE_LIMITS.listItems)
+  checkList('photos', RECIPE_LIMITS.photos)
+  return title.trim().slice(0, RECIPE_LIMITS.titleChars)
 }
 
 function loadShares(): ShareRecord[] {
@@ -275,7 +313,15 @@ export async function joinShare(payload: SharePayload): Promise<void> {
   if (!payload.snapshot) {
     await waitForContent(doc, 20000)
   }
-  await registerSharedRecipe(repo, payload.recipeId, payload.title)
+  // Content validation (S9): the snapshot / synced content is
+  // unauthenticated bytes. Validate shape + caps before registering — a
+  // failure leaves the recipe unlisted and saves no share record. (When
+  // the payload came through parseSharePayload its snapshot was already
+  // validated on a scratch doc; this covers the no-snapshot path and
+  // programmatic callers that skip parsing.) The VALIDATED doc title is
+  // registered — not payload.title, which used to be trusted verbatim.
+  const title = validateSharedDoc(doc)
+  await registerSharedRecipe(repo, payload.recipeId, title)
   saveShare({
     recipeId: payload.recipeId,
     room: payload.room,
@@ -347,6 +393,11 @@ export function parseSharePayload(text: string): SharePayload {
     const scratch = new Y.Doc()
     try {
       Y.applyUpdate(scratch, base64ToU8(o.snapshot))
+      // Content validation (S9): the snapshot is unauthenticated bytes —
+      // reject unbounded/malformed recipe content here, on the scratch
+      // doc, before joinShare ever touches the real doc (and its
+      // IndexedDB persistence).
+      validateSharedDoc(scratch)
     } catch {
       throw new Error('That code is not a valid Longtable share invitation.')
     } finally {

@@ -50,6 +50,98 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
+/**
+ * Bounds for recipe fields persisted by the store (S9). These match the
+ * importer contract (src/importers/contract.ts: MAX_TITLE 500, MAX_ITEMS
+ * 500, MAX_ITEM 2000, photos capped at 20): anything a friend share or a
+ * share code hands us is held to the same limits as an imported file, so
+ * a malicious or buggy peer cannot persist unbounded strings or huge
+ * arrays into IndexedDB and the render path. Over-long values are
+ * truncated (arrays are cut to the cap, non-string entries dropped);
+ * only a non-string title is rejected — a recipe without a usable title
+ * cannot be listed or opened.
+ */
+export const RECIPE_LIMITS = {
+  titleChars: 500,
+  listItems: 500,
+  itemChars: 2000,
+  photos: 20,
+} as const
+
+/** Whole, non-negative minutes or undefined. Non-numeric, negative, or
+ * non-finite values are dropped (a missing minute is harmless; a NaN
+ * minute is poison). Fractional values round (H-N3): the AppView serves
+ * minutes truncated, so a stored fraction would make a published recipe
+ * permanently unverifiable — no fractional minute ever reaches the store.
+ */
+function cleanMinutesValue(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return undefined
+  }
+  return Math.round(value)
+}
+
+function cleanStringList(items: unknown): string[] {
+  if (!Array.isArray(items)) return []
+  const out: string[] = []
+  for (const item of items) {
+    if (typeof item !== 'string') continue
+    out.push(item.slice(0, RECIPE_LIMITS.itemChars))
+    if (out.length >= RECIPE_LIMITS.listItems) break
+  }
+  return out
+}
+
+/**
+ * Validate + cap a recipe input before persistence. Throws on a
+ * non-string title; truncates everything else to RECIPE_LIMITS; rounds
+ * minutes (H-N3). Applied by createRecipe, so the friends-share upsert
+ * path (service.ts upsertReceived) is covered without trusting the
+ * decrypted payload's shape.
+ */
+export function sanitizeRecipeInput(input: RecipeInput): RecipeInput {
+  if (typeof input.title !== 'string') {
+    throw new Error('Recipe title must be text.')
+  }
+  const out: RecipeInput = {
+    title: input.title.slice(0, RECIPE_LIMITS.titleChars),
+    ingredients: cleanStringList(input.ingredients),
+    steps: cleanStringList(input.steps),
+    photos: cleanStringList(input.photos).slice(0, RECIPE_LIMITS.photos),
+  }
+  if (input.visibility !== undefined) out.visibility = input.visibility
+  const prep = cleanMinutesValue(input.prepMinutes)
+  if (prep !== undefined) out.prepMinutes = prep
+  const cook = cleanMinutesValue(input.cookMinutes)
+  if (cook !== undefined) out.cookMinutes = cook
+  return out
+}
+
+/**
+ * Validate + cap a partial recipe patch before persistence. Same rules
+ * as sanitizeRecipeInput, preserving the patch's "key present" signals:
+ * an explicitly-undefined minutes field still clears the field, and an
+ * invalid minutes value clears it too (dropped, never stored as NaN).
+ */
+export function sanitizeRecipePatch(patch: RecipePatch): RecipePatch {
+  const out: RecipePatch = {}
+  if (patch.title !== undefined) {
+    if (typeof patch.title !== 'string') {
+      throw new Error('Recipe title must be text.')
+    }
+    out.title = patch.title.slice(0, RECIPE_LIMITS.titleChars)
+  }
+  if ('visibility' in patch) out.visibility = patch.visibility
+  if (patch.ingredients !== undefined) out.ingredients = cleanStringList(patch.ingredients)
+  if (patch.steps !== undefined) out.steps = cleanStringList(patch.steps)
+  if (patch.photos !== undefined) {
+    out.photos = cleanStringList(patch.photos).slice(0, RECIPE_LIMITS.photos)
+  }
+  if ('prepMinutes' in patch) out.prepMinutes = cleanMinutesValue(patch.prepMinutes)
+  if ('cookMinutes' in patch) out.cookMinutes = cleanMinutesValue(patch.cookMinutes)
+  return out
+}
+
 function strArray(items: string[]): Y.Array<string> {
   const arr = new Y.Array<string>()
   arr.push(items)
@@ -143,6 +235,10 @@ export async function createRecipe(
   // to "now" for normal creation.
   timestamps?: { createdAt?: string; updatedAt?: string },
 ): Promise<RecipeSummary> {
+  // Central validation/caps (S9): the friends-share upsert path funnels
+  // through here, so unbounded or mistyped fields are rejected/truncated
+  // before they reach IndexedDB or the render path.
+  input = sanitizeRecipeInput(input)
   const id = crypto.randomUUID()
   const createdAt = timestamps?.createdAt ?? nowIso()
   const updatedAt = timestamps?.updatedAt ?? createdAt
@@ -243,6 +339,10 @@ export async function updateRecipe(
   id: string,
   patch: RecipePatch,
 ): Promise<void> {
+  // Defense in depth (H-N3 + S9): fractional minutes are rounded and
+  // oversized/mistyped fields capped/rejected here as well as at the form,
+  // so no write path can persist them.
+  patch = sanitizeRecipePatch(patch)
   const snap = await index.doc()
   const entry = snap?.recipes[id]
   if (!entry) throw new Error(`recipe not found: ${id}`)
