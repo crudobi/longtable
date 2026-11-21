@@ -37,3 +37,9 @@ hub/hub.mjs	^192\.168\.255\.255$
 *	^.+@test\.local$
 # The allow-list itself names the waflurgiooh hostname in its entries and comments; exempt its own mentions so the file does not trip the scan.
 ci/privacy-allowlist	^waflurgiooh$
+# DCO sign-off identity (M18, 2026-11-21): every commit message
+# carries "Signed-off-by: Crud <crudobi@proton.me>" — the public git
+# identity, already in every commit trailer in the public history.
+# The message scan would otherwise fail on every commit. Any OTHER
+# address in a message still fails the scan.
+*	^crudobi@proton\.me$

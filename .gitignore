@@ -2,3 +2,15 @@ node_modules
 dist
 *.local
 __pycache__/
+# Secret-adjacent files (review M22): these must never be committed.
+# The upload keystore + passwords live in the ops CI dir, and hub
+# TURN passwords live in hub data dirs — but a copy landing in the
+# repo must still be uncommittable by construction, not by discipline.
+turn-password.txt
+key.properties
+*.jks
+*.keystore
+.env
+*.pem
+*.p12
+*.key
