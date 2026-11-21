@@ -30,6 +30,12 @@ DATA_DIR="$(node -e '
 mkdir -p "$DATA_DIR"
 PIDFILE="$DATA_DIR/hub.pid"
 LOGFILE="$DATA_DIR/hub.log"
+# The supervisor's stdout goes to hub.log; keep it owner-only (0600).
+# (M9 scrubbed the TURN password value from that output, but the log
+# still carries endpoint details and must not be world-readable.)
+umask 077
+touch "$LOGFILE" 2>/dev/null || true
+chmod 600 "$LOGFILE" 2>/dev/null || true
 
 hub_pid() {
   if [ -f "$PIDFILE" ]; then

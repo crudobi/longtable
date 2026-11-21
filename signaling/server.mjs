@@ -13,9 +13,25 @@
  *  - aggregate counters only (connections, publishes), off unless SIGNAL_STATS=1
  *  - abuse limits (the server is otherwise an open relay): at most 50
  *    concurrent connections per source IP, 100 subscribed topics per
- *    connection, and 200 messages per 10s per connection (excess
- *    dropped, not disconnected — y-webrtc clients are nowhere near
- *    these numbers; they only bite floods)
+ *    connection, 200 messages per 10s per connection, and 5000 messages
+ *    per 10s per source IP in aggregate (M13 — the per-connection cap
+ *    alone still allowed 50 conns x 200 msgs = 1000 msgs/s from one IP).
+ *    Excess is dropped, not disconnected — y-webrtc clients are nowhere
+ *    near these numbers; they only bite floods.
+ *  - no presence leakage (M13): publish relays carry no subscriber
+ *    count, and /health reports topic/connection counts only to
+ *    loopback callers (local health checks / tests); anyone else gets
+ *    {ok:true} only, so a remote prober cannot enumerate live rooms.
+ *
+ * Authentication (accepted risk — S18, documented, not built here):
+ * the server has NO authentication: anyone who can reach the port can
+ * subscribe/publish to any topic, inject SDP/ICE, and probe presence.
+ * That is the design the hub ships with until rooms are bound to the
+ * invite's hub credential (or a per-hub token is checked on upgrade) —
+ * see PROTOCOL.md "Authentication (accepted risk)". Room payloads are
+ * end-to-end encrypted, so the exposure is handshake/availability
+ * abuse, not content compromise. Run the server behind the hub on a
+ * trusted network (or localhost) and firewall the port.
  *  - malformed messages (bad JSON, non-object payloads, non-array
  *    `topics`) are dropped and counted; a single bad message can never
  *    kill the process (S4 — the message handler is guarded and the
@@ -49,6 +65,11 @@ const MAX_CONNS_PER_IP = 50
 const MAX_TOPICS_PER_CONN = 100
 const RATE_LIMIT_MSGS = 200
 const RATE_LIMIT_WINDOW_MS = 10_000
+// M13: aggregate per-IP budget (messages per window across ALL
+// connections from one source IP). Overridable for tests via
+// SIGNAL_MAX_MSGS_PER_IP; the production default is 5000/10s.
+const MAX_MSGS_PER_IP = Number(process.env.SIGNAL_MAX_MSGS_PER_IP || 5000)
+const IP_RATE_WINDOW_MS = 10_000
 const PING_INTERVAL = 30000
 const STATS = process.env.SIGNAL_STATS === '1'
 
@@ -62,6 +83,9 @@ let statPublishes = 0
 let statRateDrops = 0
 let statTopicDrops = 0
 let statMalformedDrops = 0
+let statIpRateDrops = 0
+/** source IP -> { start, count } for the aggregate budget (M13) */
+const msgsByIp = new Map()
 /** source IP -> live connection count (for MAX_CONNS_PER_IP) */
 const connsByIp = new Map()
 
@@ -128,6 +152,17 @@ const onConnection = (conn, req) => {
     // is the backstop for anything they miss. The message is dropped
     // and counted; the connection stays up.
     try {
+    // M13 aggregate budget: all connections from one IP share it, so
+    // opening 50 connections cannot multiply the flood capacity 50x.
+    // Checked before parsing — even malformed floods count.
+    const ipNow = Date.now()
+    const ipWindow = msgsByIp.get(ip)
+    if (!ipWindow || ipNow - ipWindow.start >= IP_RATE_WINDOW_MS) {
+      msgsByIp.set(ip, { start: ipNow, count: 1 })
+    } else if (++ipWindow.count > MAX_MSGS_PER_IP) {
+      statIpRateDrops++
+      return
+    }
     const now = Date.now()
     if (now - rateWindowStart >= RATE_LIMIT_WINDOW_MS) {
       rateWindowStart = now
@@ -196,7 +231,9 @@ const onConnection = (conn, req) => {
           statPublishes++
           // Payload is forwarded opaquely — never inspected or logged.
           // Sender echo is suppressed (clients ignore their own peerId anyway).
-          const out = { type: 'publish', topic: msg.topic, data: msg.data, clients: receivers.size }
+          // M13: no subscriber count — the relay must not tell every
+          // publisher how many peers are in the room (presence leak).
+          const out = { type: 'publish', topic: msg.topic, data: msg.data }
           for (const r of receivers) {
             if (r !== conn) {
               send(r, out)
@@ -259,9 +296,27 @@ const onConnection = (conn, req) => {
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD })
 wss.on('connection', onConnection)
 
+/**
+ * M13: /health detail is loopback-only. Local health checks (the hub,
+ * e2e proofs, an operator on the box) still see topic/connection
+ * counts; a remote caller — the server listens on all interfaces —
+ * gets {ok:true} and nothing enumerable.
+ */
+const isLoopback = req => {
+  const addr = req?.socket?.remoteAddress ?? ''
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+}
+
 const requestHandler = (req, res) => {
   if (req.url === '/health') {
-    const body = JSON.stringify({ ok: true, topics: topics.size })
+    // statConns is cumulative (total connections ever); the live
+    // count is the sum over connsByIp.
+    const liveConnections = [...connsByIp.values()].reduce((a, b) => a + b, 0)
+    const body = JSON.stringify(
+      isLoopback(req)
+        ? { ok: true, topics: topics.size, connections: liveConnections }
+        : { ok: true },
+    )
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(body)
     return
@@ -290,6 +345,6 @@ server.listen(PORT, () => {
 
 if (STATS) {
   setInterval(() => {
-    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes} rateDrops=${statRateDrops} topicDrops=${statTopicDrops} malformedDrops=${statMalformedDrops}`)
+    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes} rateDrops=${statRateDrops} ipRateDrops=${statIpRateDrops} topicDrops=${statTopicDrops} malformedDrops=${statMalformedDrops}`)
   }, 5000).unref()
 }

@@ -32,7 +32,9 @@ node -e '
   c.web.port = 18080;
   c.signaling.port = 14444;
   c.turn.port = 13478;
-  c.turn.password = "stranger-test-password";
+  // L19: the TURN password is generated per run (24 random bytes,
+  // base64url) — never a committed literal, not even a weak test one.
+  c.turn.password = require("crypto").randomBytes(24).toString("base64url");
   c.appview.port = 13210;
   c.pds.plcPort = 12582;
   c.pds.pdsPort = 12583;

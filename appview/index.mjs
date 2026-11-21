@@ -10,6 +10,10 @@
  *   APPVIEW_RECONCILE_INTERVAL_MS
  *                 periodic reconcile sweep interval in ms (default 3600000,
  *                 one hour; N1/S2 healing sweep — see ingest.mjs)
+ *   APPVIEW_FIREHOSE_CURSOR
+ *                 firehose cursor file (default <db dir>/firehose-cursor.json;
+ *                 H3 — the AppView resumes the firehose from the last seen
+ *                 commit seq instead of re-scanning from scratch)
  *
  * Run it in tmux:  tmux new -s lt-appview -d 'cd appview && npm start'
  */
@@ -21,6 +25,7 @@ const app = createAppView({
   pdsUrl: process.env.PDS_URL ?? 'http://localhost:2583',
   plcUrl: process.env.PLC_URL ?? 'http://localhost:2582',
   mediaDir: process.env.APPVIEW_MEDIA || undefined,
+  firehoseCursorPath: process.env.APPVIEW_FIREHOSE_CURSOR || undefined,
 })
 
 await app.listen(port)

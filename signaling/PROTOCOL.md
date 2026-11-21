@@ -35,7 +35,7 @@ Researched 2026-10-11 from `y-webrtc` **10.3.0** npm source (`src/y-webrtc.js`,
 
 | message | when sent | shape |
 |---|---|---|
-| `publish` | relay a client's publish to subscribers of the topic | `{type:'publish', topic, data, clients:N}` where `N` = subscriber count at relay time (the reference server annotates this; clients ignore it) |
+| `publish` | relay a client's publish to subscribers of the topic | `{type:'publish', topic, data}` — no subscriber count. (The reference server annotates `clients:N`; our server used to as well, but the count is a presence leak — every publisher learned how many peers were in the room — so it was removed. Clients ignore it.) |
 | `pong` | reply to `ping` | `{type:'pong'}` |
 
 The reference server relays to **all** subscribers including the sender;
@@ -89,6 +89,42 @@ but must not break them):
   (≤256 chars); malformed messages (bad JSON, non-object payloads,
   non-array `topics`) are dropped and counted, and can never crash the
   server; unknown message types are ignored.
+- Abuse limits: at most 50 concurrent connections per source IP, 100
+  subscribed topics per connection, 200 messages per 10 s per
+  connection, and 5000 messages per 10 s per source IP in aggregate
+  across all its connections (so opening 50 connections cannot
+  multiply the flood capacity 50x). Excess is dropped, not
+  disconnected.
+- Presence: publish relays carry no subscriber count, and `/health`
+  reports topic/connection counts to loopback callers only — a remote
+  caller gets `{ok:true}` and nothing enumerable.
+
+## Authentication (accepted risk — S18)
+
+The server has **no authentication**: anyone who can reach the port
+can subscribe/publish to any topic, inject SDP/ICE, and probe
+presence. This is accepted, not overlooked, for the following reasons:
+
+- Room payloads are end-to-end encrypted (room `password` → AES-GCM
+  client-side; friend shelf traffic is sealed-box on top of that), so
+  an unauthenticated peer cannot read content — only handshake and
+  availability abuse is in scope (joining rooms, injecting handshake
+  messages, enumerating live topics where the server still answers).
+- The intended deployment is the hub on a trusted network (or
+  localhost) with the port firewalled; the hub, not the open internet,
+  is the audience. The review's stated fix is a design decision, not a
+  patch: bind rooms to the invite's hub credential, or check a
+  per-hub token on WebSocket upgrade. Until that design lands, adding
+  a password or token here would be a new auth system with its own
+  enrollment, rotation, and revocation surface — larger than the risk
+  it closes on a trusted-network relay.
+- The residual is bounded by the abuse limits above (per-IP connection
+  and aggregate message budgets) and by the presence gating (no
+  subscriber counts in relays; `/health` counts are loopback-only).
+
+If the signaling port is ever exposed beyond a trusted network, this
+acceptance must be revisited first — that exposure changes the threat
+model the acceptance rests on.
 
 ## Anti-centralization note
 

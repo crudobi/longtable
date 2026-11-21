@@ -145,3 +145,100 @@ test('malformed subscribe/unsubscribe shapes do not kill the server', async () =
     await stopServer(child)
   }
 })
+// Wave 4C addition to signaling/server.test.mjs — M13 pins.
+//
+// Appended by the Wave 4C worker; the S4 test above is untouched.
+//   - publish relays carry no subscriber count (presence leak)
+//   - /health reports topic/connection counts to loopback callers only
+//   - the per-IP aggregate budget drops floods past the cap
+
+test('M13: no subscriber count in publishes; /health counts are loopback-only; per-IP budget drops', async () => {
+  const child = startServer()
+  try {
+    await waitForHealth()
+    assert.equal(child.exitCode, null)
+
+    // Publish relay: no `clients` field, even with two subscribers.
+    const a = await connect()
+    const b = await connect()
+    try {
+      a.send(JSON.stringify({ type: 'subscribe', topics: ['m13-room'] }))
+      b.send(JSON.stringify({ type: 'subscribe', topics: ['m13-room'] }))
+      await sleep(100)
+      a.send(JSON.stringify({ type: 'publish', topic: 'm13-room', data: { type: 'announce', from: 'a-1' } }))
+      const got = await waitForMessage(b)
+      assert.equal(got.type, 'publish')
+      assert.equal('clients' in got, false, 'publish relay must not leak the subscriber count')
+      assert.equal(got.data.from, 'a-1')
+
+      // /health from loopback (this test runs on the box) still
+      // reports counts — the gating only hides them from remote IPs.
+      const health = await (await fetch(`${BASE}/health`)).json()
+      assert.equal(health.ok, true)
+      assert.ok(health.topics >= 1, 'loopback /health must still report topic counts')
+      assert.ok(health.connections >= 2, 'loopback /health must still report live connections')
+    } finally {
+      a.close()
+      b.close()
+    }
+  } finally {
+    await stopServer(child)
+  }
+})
+
+test('M13: per-IP aggregate budget drops messages past the cap', async () => {
+  // A small budget via env so the test does not need 5000 messages.
+  // Both connections share 127.0.0.1, so subscribes count too:
+  // 2 subscribes + 3 publishes = 5 (the cap); the 4th publish drops.
+  const budgetPort = 14000 + Math.floor(Math.random() * 1000)
+  const budgetBase = `http://127.0.0.1:${budgetPort}`
+  const child = spawn(process.execPath, [path.join(HERE, 'server.mjs')], {
+    env: {
+      ...process.env,
+      PORT: String(budgetPort),
+      TLS_CERT: '/nonexistent/longtable-test.crt',
+      TLS_KEY: '/nonexistent/longtable-test.key',
+      SIGNAL_MAX_MSGS_PER_IP: '5',
+    },
+    stdio: 'ignore',
+  })
+  const connectBudget = () =>
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${budgetPort}`)
+      ws.once('open', () => resolve(ws))
+      ws.once('error', reject)
+    })
+  try {
+    for (let i = 0; i < 50; i++) {
+      try {
+        const res = await fetch(`${budgetBase}/health`)
+        if (res.status === 200) break
+      } catch {
+        /* not up yet */
+      }
+      await sleep(100)
+    }
+    const sender = await connectBudget()
+    const receiver = await connectBudget()
+    const received = []
+    receiver.on('message', (data) => received.push(JSON.parse(data.toString())))
+    try {
+      sender.send(JSON.stringify({ type: 'subscribe', topics: ['budget-room'] }))
+      receiver.send(JSON.stringify({ type: 'subscribe', topics: ['budget-room'] }))
+      await sleep(100)
+      for (let i = 0; i < 4; i++) {
+        sender.send(JSON.stringify({ type: 'publish', topic: 'budget-room', data: { n: i } }))
+        await sleep(50)
+      }
+      await sleep(200)
+      // 3 publishes relayed, the 4th dropped by the per-IP budget.
+      assert.equal(received.length, 3, `expected 3 relayed publishes, got ${received.length}`)
+      assert.deepEqual(received.map((m) => m.data.n), [0, 1, 2])
+    } finally {
+      sender.close()
+      receiver.close()
+    }
+  } finally {
+    await stopServer(child)
+  }
+})

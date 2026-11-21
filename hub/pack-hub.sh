@@ -28,7 +28,7 @@ mkdir -p "$STAGE"
 echo "[pack] staging $NAME…"
 # Hub runtime files.
 cp hub/hub.mjs hub/web-server.mjs hub/longtable-hub hub/hub.conf.example.json \
-   hub/README.md hub/TELEMETRY.md hub/pack-hub.sh hub/stranger-test.sh "$STAGE/"
+   hub/longtable-hub.service hub/README.md hub/TELEMETRY.md hub/pack-hub.sh hub/stranger-test.sh "$STAGE/"
 chmod +x "$STAGE/longtable-hub"
 # The built web app.
 cp -r dist "$STAGE/app"
@@ -42,6 +42,12 @@ echo "$VERSION" > "$STAGE/VERSION"
 # Never ship dev state that may have accumulated in the service dirs.
 rm -f "$STAGE/appview/"*.db "$STAGE/appview/"*.db-journal
 rm -rf "$STAGE/appview/media" "$STAGE/appview/test"
+# Never ship npm .bin shims either: they are symlinks to dev CLIs the
+# hub never executes, and a tarball must contain no symlinks at all
+# (an absolute one once escaped the bundle — Wave 1). Nested
+# dependencies carry their own .bin dirs, so strip every .bin under
+# any node_modules in the stage, not just the top-level three.
+find "$STAGE" -type d -name '.bin' -path '*node_modules*' -prune -exec rm -rf {} +
 
 echo "[pack] tarring…"
 tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$STAGE_PARENT" "$NAME"

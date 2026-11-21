@@ -85,7 +85,7 @@ recipes whose device's binding was deleted or stopped verifying
 (deleting a device's binding is that device's revocation; publishing
 from a new device only ADDS a binding and never drops another device's
 recipes — H-N1). Stats keep
-`{indexed, rejected, signatureRejected, sweepSkipped, lastReconcileAt}`; any
+`{indexed, rejected, signatureRejected, sweepSkipped, mediaPurged, lastReconcileAt}`; any
 verification failure increments `rejected` and indexes nothing.
 
 Two exceptions to the sweep, both fail-closed the other way. First, NO
@@ -108,8 +108,15 @@ which never heals a dormant author — so a **startup reconcile** plus an
 `APPVIEW_RECONCILE_INTERVAL_MS`, default 3600000) re-verifies every
 distinct DID in the index through the same serialized queue. The sweep
 is the healing path for a missing binding that later appears and for
-pre-C2 rows (S2, below); the firehose cursor itself is a later step,
-not this sweep — the sweep only revisits DIDs already in the index.
+pre-C2 rows (S2, below). The live firehose itself resumes, too: every
+commit carries a sequence number, and the AppView persists the last
+seen one in `firehose-cursor.json` next to the index DB (H3; override
+with `APPVIEW_FIREHOSE_CURSOR`), subscribing with `?cursor=` on
+restart instead of re-scanning from scratch. A cursor the PDS
+rejects (connection dies immediately having received nothing) is
+dropped once and the AppView reconnects without it, instead of
+reconnect-looping. The sweep only revisits DIDs already in the index;
+the cursor resumes the live feed.
 
 ### What a hostile hub / ingest source can and cannot do
 
@@ -138,7 +145,9 @@ not this sweep — the sweep only revisits DIDs already in the index.
 - **Cannot resurrect or hide deletions.** Because reconcile diffs against
   the full verified state, a record deleted from the repo disappears from
   the index at the next reconcile of that DID, no matter what any
-  intermediary claims.
+  intermediary claims — and its media blobs are purged from the cache
+  at the same time (H1, below), so a deleted/unpublished recipe stops
+  being served, not just unlisted.
 - **Can cause work / delay.** A hostile source can trigger extra reconciles
   (a full-CAR fetch + verify per trigger) and can withhold events (the
   index goes stale until the next event for that DID or a manual
@@ -174,7 +183,28 @@ API semantics and reports `fts5: false` in `/stats`.
 Search semantics: `q` is an FTS match over `name` (token-prefix, bm25
 ranked). `ingredients` is AND semantics over `ingredients_text` — every
 listed ingredient must match (token-prefix per ingredient token, so
-`beets` matches the ingredient `"3 beets"`).
+`beets` matches the ingredient `"3 beets"`). FTS terms are Unicode
+letters/digits (`café` searches as `café`, not `caf`); the LIKE
+fallback escapes user-supplied `%`/`_` so they are literals, never
+wildcards (M5). Row writes and FTS syncs are one transaction, so the
+index and the FTS table cannot disagree (M6).
+
+Media + serving hardening (H1/H2/M12): when a recipe leaves the index
+its cached blobs are purged (`purgeImages` on the reconcile sweep,
+plus a `purgeUnreferenced` orphan backstop after every periodic
+sweep), so unpublishing actually stops serving the bytes. Blobs are
+served through a Content-Type allowlist — `image/jpeg/png/gif/webp/
+avif` pass through, everything else (including PDS-claimed
+`text/html` and `image/svg+xml`) is served as
+`application/octet-stream` with `Content-Disposition: attachment`,
+`X-Content-Type-Options: nosniff`, and a `default-src 'none'; sandbox`
+CSP, so a stored blob can never execute in the AppView origin. The
+public API is rate-limited per source IP (300 requests / 60 s, 429
+with `Retry-After` past the cap); `/media/:did/:cid` only serves a
+blob an indexed recipe of that DID references (otherwise the cache
+was an open blob-fetch oracle); `/author/` is bounded at 100 rows;
+`/search` bounds `q` to 500 chars and the ingredient list to 20
+entries (400 past the bounds).
 
 ## HTTP API
 
@@ -186,7 +216,8 @@ listed ingredient must match (token-prefix per ingredient token, so
 | `GET /search?ingredients=egg,flour` | recipes containing **all** listed ingredients (AND) |
 | `GET /search?q=...&ingredients=...` | both filters combined |
 | `GET /recipe/:did/:rkey` | full indexed record JSON (incl. `images` blob refs, `deviceDid`, `deviceSignature`, `deviceKey`) or 404 — a row with NULL signature fields is a 404, not served (S2) |
-| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same fields as `/search` (incl. `longtableId`), device-verified rows only (S2) |
+| `GET /author/:did` | `{did, results: [...]}` — that author's indexed recipes, summaries carrying the same fields as `/search` (incl. `longtableId`), device-verified rows only (S2); bounded at 100 rows |
+| `GET /media/:did/:cid` | the recipe photo blob (`image/*` passthrough, anything else as `application/octet-stream` + attachment, nosniff + sandbox CSP — H2), `cache-control: public, max-age=31536000, immutable`; 404 unless an indexed recipe of that DID references the blob (M12 media gating) |
 
 Response contract (for clients verifying at read time): every per-recipe
 object carries `deviceDid` (the author's Longtable device DID, a
@@ -219,6 +250,7 @@ DIDs in paths may be sent raw (`did:plc:...`) or URL-encoded.
 | `PDS_URL` | `http://localhost:2583` | PDS base URL (firehose + `getRepo`) |
 | `PLC_URL` | `http://localhost:2582` | PLC directory base URL (DID docs) |
 | `APPVIEW_RECONCILE_INTERVAL_MS` | `3600000` | Periodic reconcile-sweep interval in ms (N1/S2 healing sweep) |
+| `APPVIEW_FIREHOSE_CURSOR` | `<db dir>/firehose-cursor.json` | Persisted firehose sequence file (H3); the AppView resumes the firehose from the last seen commit seq |
 
 Media fetches from the PDS abort after 30 s (`MEDIA_FETCH_TIMEOUT_MS`
 in `media.mjs`, same as `verify.mjs`'s fetch timeout) so a hung PDS

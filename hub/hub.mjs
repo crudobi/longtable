@@ -109,6 +109,19 @@ const children = new Map()
 let shuttingDown = false
 
 function writeStatus() {
+  // M5-rel hardening (rel N2): writeStatus runs inside the child-exit
+  // handler, and an unguarded throw there used to crash the supervisor
+  // itself — which has no restart of its own. A status write must never
+  // be fatal; log and continue.
+  try {
+    return writeStatusInner()
+  } catch (err) {
+    console.error(`[hub] writeStatus failed (non-fatal): ${err?.message ?? err}`)
+    return null
+  }
+}
+
+function writeStatusInner() {
   const status = {
     name,
     pid: process.pid,
@@ -173,7 +186,11 @@ const DENIED_PEER_RANGES = [
   '172.16.0.0-172.31.255.255', // 172.16.0.0/12
   '192.168.0.0-192.168.255.255', // 192.168.0.0/16
   '224.0.0.0-239.255.255.255', // 224.0.0.0/4 (multicast)
+  '192.0.0.0-192.0.0.255', // 192.0.0.0/24 (IETF protocol assignments)
+  '198.18.0.0-198.19.255.255', // 198.18.0.0/15 (benchmarking)
+  '240.0.0.0-255.255.255.255', // 240.0.0.0/4 (reserved; includes 255.255.255.255/32)
   '::1', // v6 loopback
+  'ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // ff00::/8 (v6 multicast)
   'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // fc00::/7 (ULA)
   'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', // fe80::/10 (link-local)
 ]
@@ -203,6 +220,21 @@ function resolveTurnPassword() {
 }
 const turnPassword = turnEnabled ? resolveTurnPassword() : null
 
+// M10 — TURN quotas/caps. The relay credential is shared with every
+// client of the hub by design, so the relay itself is capped: at most
+// 100 concurrent allocations in total (total-quota; user-quota matches
+// it because the hub has exactly one TURN user), 1 MiB/s per session
+// (max-bps, bytes/s) and 50 MiB/s of relay capacity overall
+// (bps-capacity, bytes/s). A single abusive client can still burn its
+// own share, but it cannot take the relay — or the host's uplink —
+// without bound. Rotation: delete data/turn-password.txt (or set a new
+// turn.password) and restart the hub; clients must update their hub
+// entry to the new credential (see README "Rotating the TURN password").
+const TURN_TOTAL_QUOTA = 100
+const TURN_USER_QUOTA = 100
+const TURN_MAX_BPS = 1024 * 1024
+const TURN_BPS_CAPACITY = 50 * 1024 * 1024
+
 function writeTurnConfig() {
   const lines = [
     `listening-port=${turnPort}`,
@@ -214,13 +246,25 @@ function writeTurnConfig() {
     // it ("Bad configuration format", verified against the real binary);
     // loopback is covered by the 127.0.0.0/8 and ::1 denied ranges.
     ...DENIED_PEER_RANGES.map((r) => `denied-peer-ip=${r}`),
+    // M10 quotas/caps (see TURN_* above).
+    `total-quota=${TURN_TOTAL_QUOTA}`,
+    `user-quota=${TURN_USER_QUOTA}`,
+    `max-bps=${TURN_MAX_BPS}`,
+    `bps-capacity=${TURN_BPS_CAPACITY}`,
     `log-file=${path.join(DATA_DIR, 'turn.log')}`,
     'simple-log',
   ]
   if (turnCfg.externalIp) lines.push(`external-ip=${turnCfg.externalIp}`)
   if (turnCfg.relayIp) lines.push(`relay-ip=${turnCfg.relayIp}`)
   const file = path.join(DATA_DIR, 'turnserver.conf')
-  fs.writeFileSync(file, lines.join('\n') + '\n')
+  // L18: the config embeds the plaintext TURN credential, so it is
+  // written 0600 via tmp+rename — never 0644 (the old default mode).
+  const tmp = `${file}.tmp-${process.pid}`
+  fs.writeFileSync(tmp, lines.join('\n') + '\n', { mode: 0o600 })
+  // mode: only applies at creation — a reused tmp name could keep a
+  // wider mode, so pin it explicitly before the rename.
+  fs.chmodSync(tmp, 0o600)
+  fs.renameSync(tmp, file)
   return file
 }
 
@@ -236,8 +280,16 @@ function turnserverAvailable() {
 // -------------------------------------------------------------- startup ----
 console.info(`[hub] starting "${name}" — data dir ${DATA_DIR}`)
 
+// M15: web.tls opts the static host into HTTPS with the hub's own
+// certificate (same cert as signaling). Default is plain HTTP — the
+// historical behavior — because the hub mints a self-signed cert and
+// browsers would warn on it; see README "Web server TLS".
+const webTlsEnv =
+  cfg.web?.tls === true
+    ? { WEB_TLS_CERT: tls.cert, WEB_TLS_KEY: tls.key }
+    : {}
 startChild('web', process.execPath, [path.join(HUB_DIR, 'web-server.mjs')], {
-  env: { WEB_PORT: String(webPort), WEB_ROOT: webRoot },
+  env: { WEB_PORT: String(webPort), WEB_ROOT: webRoot, ...webTlsEnv },
 })
 startChild('signaling', process.execPath, [path.join(BUNDLE_ROOT, 'signaling', 'server.mjs')], {
   env: { PORT: String(signalingPort), TLS_CERT: tls.cert, TLS_KEY: tls.key },
@@ -327,10 +379,13 @@ for (const [id, check] of checks) {
 }
 
 if (turnEnabled) {
+  // M9: the password VALUE is never printed — stdout goes to data/hub.log
+  // (world-readable by default), so printing it there published the
+  // credential. Operators read it from the 0600 file instead.
   if (turnPasswordSource === 'generated') {
     console.info(
       `[hub] TURN password: GENERATED for this hub (turn.password is unset or ` +
-        `still the placeholder) — "${turnPassword}", persisted in ${turnPasswordFile}. ` +
+        `still the placeholder) — ${turnPassword.length} chars, stored 0600 in ${turnPasswordFile}. ` +
         `Clients need it in their hub entry; set turn.password in hub.conf.json to choose your own.`,
     )
   } else {

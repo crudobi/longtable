@@ -22,6 +22,8 @@
  * *claimed* (by a firehose frame, a hub, or a direct ingestClaim call)
  * are never indexed on their own.
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import WebSocket from 'ws'
 import { cborDecodeMulti } from '@atproto/common'
 import { cidForRecord } from '@atproto/repo'
@@ -33,6 +35,37 @@ export const WANTED_COLLECTIONS = [RECIPE_COLLECTION, PUBKEY_COLLECTION]
 /** Cap on a single firehose frame (16 MiB): commit frames are small;
  * the ws default is unlimited, so one oversized frame could OOM us. */
 export const MAX_FIREHOSE_FRAME_BYTES = 16 * 1024 * 1024
+
+/**
+ * H3 — persisted firehose cursor. subscribeRepos accepts a `cursor`
+ * (a commit sequence number) and replays from there, so a restarted
+ * AppView resumes where it left off instead of re-scanning the whole
+ * firehose from scratch. The cursor lives in a small JSON file next
+ * to the index DB (default `<db dir>/firehose-cursor.json`, overridable
+ * via APPVIEW_FIREHOSE_CURSOR); it is written throttled (at most once
+ * per save interval) while frames arrive, and once more on shutdown.
+ * A corrupt/missing file means "no cursor" — the firehose is simply
+ * subscribed without one, exactly as before this change.
+ */
+export function loadFirehoseCursor(cursorPath) {
+  if (!cursorPath) return null
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cursorPath, 'utf8'))
+    const seq = Number(parsed?.seq)
+    return Number.isFinite(seq) && seq >= 0 ? Math.trunc(seq) : null
+  } catch {
+    return null
+  }
+}
+
+export function saveFirehoseCursor(cursorPath, seq) {
+  if (!cursorPath) return
+  const dir = path.dirname(cursorPath)
+  fs.mkdirSync(dir, { recursive: true })
+  const tmp = `${cursorPath}.tmp-${process.pid}`
+  fs.writeFileSync(tmp, JSON.stringify({ seq, updatedAt: new Date().toISOString() }) + '\n')
+  fs.renameSync(tmp, cursorPath)
+}
 
 export function isWantedPath(path) {
   return (
@@ -57,13 +90,57 @@ export async function ingestClaim(claim) {
   return defaultIngestor.ingestClaim(claim)
 }
 
-export function createIngestor({ index, repoStateProvider, pdsUrl, log = console } = {}) {
+export function createIngestor(
+  {
+    index,
+    repoStateProvider,
+    pdsUrl,
+    log = console,
+    // H1: the media cache — the reconcile sweep purges blobs for rows
+    // it deletes (unpublish/delete). Optional; ingest without a cache
+    // (unit tests) simply skips the purge.
+    media = null,
+    // H3: where the firehose cursor persists (null disables it).
+    firehoseCursorPath = null,
+    firehoseCursorSaveIntervalMs = 5000,
+    // H3: a cursor'd connection that dies this fast having received
+    // nothing almost certainly had its cursor rejected (too old) — drop
+    // the cursor once and reconnect without it instead of looping.
+    firehoseCursorStaleCloseMs = 10_000,
+  } = {},
+) {
   if (!index) throw new Error('createIngestor: index is required')
   if (typeof repoStateProvider !== 'function') {
     throw new Error('createIngestor: repoStateProvider function is required')
   }
 
-  const stats = { indexed: 0, rejected: 0, signatureRejected: 0, sweepSkipped: 0, lastReconcileAt: null }
+  const stats = {
+    indexed: 0,
+    rejected: 0,
+    signatureRejected: 0,
+    sweepSkipped: 0,
+    mediaPurged: 0,
+    lastReconcileAt: null,
+  }
+  // H3 cursor state: last seen commit seq (resumed on restart), the
+  // last time it was flushed to disk, and whether a stale cursor was
+  // already dropped once this process (so the fallback cannot loop).
+  let lastSeq = loadFirehoseCursor(firehoseCursorPath)
+  let lastCursorSaveAt = 0
+  let cursorDropped = false
+
+  /** Flush the cursor to disk, throttled unless `force`. Never throws. */
+  function maybeSaveCursor(force = false) {
+    if (!firehoseCursorPath || lastSeq == null) return
+    const now = Date.now()
+    if (!force && now - lastCursorSaveAt < firehoseCursorSaveIntervalMs) return
+    try {
+      saveFirehoseCursor(firehoseCursorPath, lastSeq)
+      lastCursorSaveAt = now
+    } catch (err) {
+      log.warn?.(`[appview] firehose cursor save failed: ${err?.message ?? err}`)
+    }
+  }
   let ws = null
   let reconnectTimer = null
   let reconcileTimer = null
@@ -202,6 +279,16 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     } else {
       for (const uri of index.listUrisByDid(did)) {
         if (!seen.has(uri)) {
+          // H1: the recipe left the index (unpublished / deleted) — its
+          // media must stop being served too, not linger in the cache
+          // under a year-long immutable cache-control.
+          if (media) {
+            try {
+              media.purgeImages(did, index.imagesForUri(uri))
+            } catch (err) {
+              log.warn?.(`[appview] reconcile ${did}: media purge failed for ${uri}: ${err?.message ?? err}`)
+            }
+          }
           index.deleteByUri(uri)
           deleted++
         }
@@ -282,6 +369,15 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
   /** Handle one decoded firehose frame header/body pair. Returns true if it triggered work. */
   function handleFrame(header, body) {
     if (!header || header.op !== 1 || header.t !== '#commit' || !body) return false
+    // H3: every commit carries its sequence number — advance the
+    // persisted cursor (throttled flush; the close path forces one).
+    if (Number.isFinite(body.seq)) {
+      const seq = Math.trunc(body.seq)
+      if (lastSeq == null || seq > lastSeq) {
+        lastSeq = seq
+        maybeSaveCursor()
+      }
+    }
     const ops = Array.isArray(body.ops) ? body.ops : []
     if (!ops.some((op) => isWantedPath(op?.path))) return false
     const did = body.repo
@@ -304,15 +400,24 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
 
   function firehoseUrl() {
     const base = (pdsUrl ?? '').replace(/\/$/, '')
-    return `${base.replace(/^http/, 'ws')}/xrpc/com.atproto.sync.subscribeRepos`
+    const url = `${base.replace(/^http/, 'ws')}/xrpc/com.atproto.sync.subscribeRepos`
+    // H3: resume from the persisted cursor when one exists.
+    return lastSeq == null ? url : `${url}?cursor=${lastSeq}`
   }
 
   function startFirehose() {
     if (ws || closed) return
     const url = firehoseUrl()
+    const cursorUsed = lastSeq != null
     log.info?.(`[appview] subscribing to firehose ${url}`)
     ws = new WebSocket(url, { maxPayload: MAX_FIREHOSE_FRAME_BYTES })
+    let openAt = null
+    let receivedAny = false
+    ws.on('open', () => {
+      openAt = Date.now()
+    })
     ws.on('message', (data) => {
+      receivedAny = true
       try {
         handleMessage(data)
       } catch (err) {
@@ -324,7 +429,28 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     })
     ws.on('close', () => {
       ws = null
+      maybeSaveCursor(true)
       if (!closed) {
+        // H3: a cursor'd connection that dies within the stale window
+        // having received nothing had its cursor rejected — drop the
+        // persisted cursor once and reconnect without it, instead of
+        // reconnect-looping on a cursor the PDS will never accept.
+        if (
+          cursorUsed &&
+          !cursorDropped &&
+          !receivedAny &&
+          openAt !== null &&
+          Date.now() - openAt < firehoseCursorStaleCloseMs
+        ) {
+          cursorDropped = true
+          lastSeq = null
+          try {
+            fs.unlinkSync(firehoseCursorPath)
+          } catch {
+            /* already gone / never persisted */
+          }
+          log.warn?.('[appview] firehose cursor rejected (stale) — reconnecting without a cursor')
+        }
         reconnectTimer = setTimeout(() => startFirehose(), 2000)
         reconnectTimer.unref?.()
       }
@@ -341,7 +467,8 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
    * dormant author, may never come. The startup reconcile in index.mjs
    * and the periodic timer both call this. One DID's failure never
    * aborts the rest. (The firehose cursor itself is Wave 4, not this
-   * sweep: the sweep only revisits DIDs already in the index.)
+   * sweep: the sweep only revisits DIDs already in the index,
+   * while the cursor resumes the live firehose itself.)
    */
   async function reconcileAllDids() {
     const run = queue.then(async () => {
@@ -353,6 +480,21 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
           stats.rejected++
           log.warn?.(`[appview] reconcile-all ${did} failed: ${err?.message ?? err}`)
           results.push({ ok: false, did, error: String(err?.message ?? err) })
+        }
+      }
+      // H1: after the sweep, drop cached blobs no indexed recipe
+      // references anymore (orphans from pre-gating fetches and from
+      // rows swept above whose purge ran per-recipe — this is the
+      // backstop for both).
+      if (media) {
+        try {
+          const purged = media.purgeUnreferenced(index)
+          if (purged > 0) {
+            stats.mediaPurged += purged
+            log.info?.(`[appview] reconcile-all: purged ${purged} unreferenced media blob(s)`)
+          }
+        } catch (err) {
+          log.warn?.(`[appview] reconcile-all: media orphan purge failed: ${err?.message ?? err}`)
         }
       }
       return results
@@ -385,6 +527,7 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
 
   function close() {
     closed = true
+    maybeSaveCursor(true)
     stopPeriodicReconcile()
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (ws) {
@@ -410,6 +553,17 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
     close,
     get pending() {
       return queue
+    },
+    /** H3: last seen firehose commit seq (null when no cursor yet). */
+    get firehoseSeq() {
+      return lastSeq
+    },
+    get firehoseCursorPath() {
+      return firehoseCursorPath
+    },
+    /** H3: flush the cursor to disk now (tests / shutdown paths). */
+    persistFirehoseCursor() {
+      maybeSaveCursor(true)
     },
   }
 }
