@@ -35,6 +35,7 @@ import {
   type Identity,
   type KeyValueStore,
 } from '../identity/identity'
+import { flushSecrets, secretKv } from '../secrets/secretStore'
 import {
   base64ToU8,
   u8ToBase64,
@@ -63,7 +64,7 @@ export interface RecipeKeyRecord {
 
 export type KeyVault = Record<string, RecipeKeyRecord>
 
-export function loadVault(kv: KeyValueStore = localStorage): KeyVault {
+export function loadVault(kv: KeyValueStore = secretKv): KeyVault {
   try {
     const raw = kv.getItem(VAULT_KEY)
     if (!raw) return {}
@@ -74,13 +75,13 @@ export function loadVault(kv: KeyValueStore = localStorage): KeyVault {
   }
 }
 
-export function saveVault(vault: KeyVault, kv: KeyValueStore = localStorage): void {
+export function saveVault(vault: KeyVault, kv: KeyValueStore = secretKv): void {
   kv.setItem(VAULT_KEY, JSON.stringify(vault))
 }
 
 export function getRecipeKey(
   recipeId: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): RecipeKeyRecord | undefined {
   return loadVault(kv)[recipeId]
 }
@@ -88,7 +89,7 @@ export function getRecipeKey(
 /** Get the recipe's current key, creating version 1 on first share. */
 export async function ensureRecipeKey(
   recipeId: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): Promise<RecipeKeyRecord> {
   const vault = loadVault(kv)
   const existing = vault[recipeId]
@@ -102,6 +103,9 @@ export async function ensureRecipeKey(
   }
   vault[recipeId] = rec
   saveVault(vault, kv)
+  // The vault holds crown-jewel keys: await the Keystore flush so the
+  // new key is durable before the caller publishes under it.
+  await flushSecrets()
   return rec
 }
 
@@ -113,7 +117,7 @@ export async function ensureRecipeKey(
 export async function rotateRecipeKey(
   recipeId: string,
   friends: string[],
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): Promise<RecipeKeyRecord> {
   await cryptoReady()
   const vault = loadVault(kv)
@@ -126,6 +130,8 @@ export async function rotateRecipeKey(
   }
   vault[recipeId] = rec
   saveVault(vault, kv)
+  // See ensureRecipeKey: the rotated key must be durable before use.
+  await flushSecrets()
   return rec
 }
 
@@ -133,7 +139,7 @@ export async function rotateRecipeKey(
 export function setKeyFriends(
   recipeId: string,
   friends: string[],
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): void {
   const vault = loadVault(kv)
   const rec = vault[recipeId]
@@ -144,7 +150,7 @@ export function setKeyFriends(
 
 export function dropRecipeKey(
   recipeId: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): void {
   const vault = loadVault(kv)
   delete vault[recipeId]

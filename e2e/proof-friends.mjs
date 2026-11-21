@@ -271,7 +271,7 @@ async function main() {
     await (await A.$('[data-testid="share-friends-confirm"]')).click()
     await modal.waitForExist({ timeout: 15000, reverse: true })
     const vaultOk = await evalJs(A,
-      'Object.values(JSON.parse(localStorage.getItem("longtable:key-vault") || "{}")).some(k => k.friends && k.friends.length === 2)')
+      'Object.values(JSON.parse(window.__ltSecrets.readSecret("longtable:key-vault") || "{}")).some(k => k.friends && k.friends.length === 2)')
     step('share: encrypted publish, key wrapped for exactly B and C', vaultOk === true)
 
     // ---- B and C render the shelf and open the recipe -------------------

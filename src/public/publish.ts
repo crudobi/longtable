@@ -28,6 +28,7 @@ import {
   type KeyValueStore,
 } from '../identity/identity'
 import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
+import { secretKv } from '../secrets/secretStore'
 import type { Recipe } from '../types'
 import {
   PUBLICATIONS_KEY,
@@ -328,17 +329,15 @@ export async function ensurePubkeyBinding(
   return true
 }
 
-/** kv for best-effort session persistence (no-op when localStorage is absent). */
+/**
+ * kv for session persistence: the secure store (Keystore on Android,
+ * localStorage on web). It never throws — when localStorage is absent
+ * (node) it falls back to a process-local map — and it routes the
+ * publications registry (non-secret) to localStorage while the session
+ * (secret) goes to the Keystore.
+ */
 function localStorageSafe(): PublicKv {
-  try {
-    return localStorage
-  } catch {
-    const map = new Map<string, string>()
-    return {
-      getItem: (k) => map.get(k) ?? null,
-      setItem: (k, v) => void map.set(k, v),
-    }
-  }
+  return secretKv
 }
 
 // ---------------------------------------------------------------------------

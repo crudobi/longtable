@@ -2,10 +2,12 @@
  * Localhost API settings (E9 — third-party extensibility).
  *
  * The API is OFF by default. Its settings — enabled flag, port, and the
- * per-install bearer token — live in localStorage next to the other
- * device-local preferences (hub list, friends, publications). This is
- * additive local state, not recipe storage: no recipe data format
- * changes, so no migration is involved.
+ * per-install bearer token — live in the Android Keystore
+ * (src/secrets/secretStore.ts) on native, in localStorage on web where no
+ * Keystore exists. The token is a crown-jewel secret; the flag and port
+ * ride along as one stored value. This is additive local state, not
+ * recipe storage: no recipe data format changes, so no migration is
+ * involved.
  *
  * Security posture (spelled out in docs/localhost-api.md): on Android
  * ANY app on the device can open a loopback connection, so the token +
@@ -14,6 +16,7 @@
  * password for the cookbook.
  */
 import type { KeyValueStore } from '../store/recipes'
+import { secretKv } from '../secrets/secretStore'
 
 export const LOCAL_API_SETTINGS_KEY = 'longtable:localapi'
 export const LOCAL_API_DEFAULT_PORT = 17337
@@ -36,7 +39,7 @@ function validPort(n: unknown): n is number {
 }
 
 export function loadLocalApiSettings(
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): LocalApiSettings {
   try {
     const raw = kv.getItem(LOCAL_API_SETTINGS_KEY)
@@ -54,7 +57,7 @@ export function loadLocalApiSettings(
 
 export function saveLocalApiSettings(
   settings: LocalApiSettings,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): void {
   kv.setItem(LOCAL_API_SETTINGS_KEY, JSON.stringify(settings))
 }

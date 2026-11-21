@@ -153,8 +153,8 @@ try {
     recipeId = (JSON.parse(payload)).recipeId;
     await (await el(driverA, '[data-testid="close-share"]')).click();
     await backToList(driverA);
-    // Flush wait: localStorage share must hit disk before any force-stop.
-    await new Promise((r) => setTimeout(r, 10000));
+    // Flush wait: the share must reach the Keystore before any force-stop.
+    await driverA.executeScript('return window.__ltSecrets.flush();', []);
     return `room ${(JSON.parse(payload)).room}`;
   });
 
@@ -190,11 +190,11 @@ try {
       await new Promise((r) => setTimeout(r, 2000));
     }
     if (!found) throw new Error('B never listed the shared recipe');
-    const bShares = await driverB.executeScript('return localStorage.getItem("longtable:shares");', []);
-    if (!bShares || !bShares.includes(recipeId)) throw new Error('B join did not persist share: ' + bShares);
-    // Let localStorage flush to disk: force-stop before the flush loses the
-    // saved share (Chromium batches LevelDB writes; ~10-15s is safe).
-    await new Promise((r) => setTimeout(r, 15000));
+    const bShares = await driverB.executeScript('return window.__ltSecrets.readSecret("longtable:shares");', []);
+    if (!bShares || !bShares.includes(recipeId)) throw new Error('B join did not persist share');
+    // Let the Keystore flush land: force-stop before the flush loses the
+    // saved share.
+    await driverB.executeScript('return window.__ltSecrets.flush();', []);
     return 'B lists "P2P Pancakes", share persisted+flushed';
   });
 

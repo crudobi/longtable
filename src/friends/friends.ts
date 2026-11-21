@@ -22,7 +22,8 @@
  *      to the legacy derivation via the hello's channelVersion.
  *
  * No account, no email, no hub account: the hub is signaling-only, exactly
- * as in Phase 1. Friend records and the pair secret live in localStorage.
+ * as in Phase 1. Friend records and the pair secret live in the Android
+ * Keystore (src/secrets/secretStore.ts) on native, in localStorage on web.
  */
 import * as Y from 'yjs'
 import sodium from 'libsodium-wrappers'
@@ -33,6 +34,7 @@ import {
   type Identity,
   type KeyValueStore,
 } from '../identity/identity'
+import { flushSecrets, secretKv } from '../secrets/secretStore'
 import { base64ToU8, u8ToBase64, u8ToHex, utf8ToU8 } from '../identity/codec'
 import { getOrCreateDoc, getRepo, type YjsStore } from '../store/repo'
 import { getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
@@ -80,7 +82,7 @@ export interface FriendInvitePayload {
 // Friend record storage
 // ---------------------------------------------------------------------------
 
-export function listFriends(kv: KeyValueStore = localStorage): FriendRecord[] {
+export function listFriends(kv: KeyValueStore = secretKv): FriendRecord[] {
   try {
     const raw = kv.getItem(FRIENDS_KEY)
     if (!raw) return []
@@ -101,14 +103,14 @@ export function listFriends(kv: KeyValueStore = localStorage): FriendRecord[] {
 
 export function getFriend(
   did: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): FriendRecord | undefined {
   return listFriends(kv).find((f) => f.did === did)
 }
 
 export function saveFriend(
   rec: FriendRecord,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): void {
   const friends = listFriends(kv).filter((f) => f.did !== rec.did)
   friends.push(rec)
@@ -117,7 +119,7 @@ export function saveFriend(
 
 export function removeFriend(
   did: string,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
 ): void {
   const friends = listFriends(kv).filter((f) => f.did !== did)
   kv.setItem(FRIENDS_KEY, JSON.stringify(friends))
@@ -236,7 +238,7 @@ export async function runPairing(
   myName: string,
   invite: FriendInvitePayload,
   expectedPeerDid: string | null,
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   timeoutMs = 90000,
 ): Promise<FriendRecord> {
   await cryptoReady()
@@ -301,6 +303,9 @@ export async function runPairing(
           rec.channelTag = channelTagFor(pairId, identity.did, hello.did)
         }
         saveFriend(rec, kv)
+        // The friend record carries the pair secret: await the Keystore
+        // flush so the pairing survives a kill right after it completes.
+        await flushSecrets()
         return rec
       }
       if (Date.now() - t0 > timeoutMs) {
@@ -439,7 +444,7 @@ export function disconnectAllFriendChannels(): void {
 
 /** Rejoin every saved friend's channel (app launch). */
 export async function rejoinFriendChannels(
-  kv: KeyValueStore = localStorage,
+  kv: KeyValueStore = secretKv,
   repo: YjsStore = getRepo(),
 ): Promise<void> {
   for (const friend of listFriends(kv)) {

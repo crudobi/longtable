@@ -139,6 +139,13 @@ dependencies {
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
     implementation "org.jetbrains.kotlin:kotlin-stdlib:2.2.20"
+    // SecureStorePlugin (Wave 3): EncryptedSharedPreferences over a
+    // Keystore MasterKey - the Android Keystore secret storage.
+    // 1.1.0-alpha07: the MasterKey (singular) Builder API used by
+    // SecureStorePlugin arrived in 1.1.0-alpha01; 1.0.0 only has the
+    // deprecated MasterKeys alias-string API, which does not compile
+    // against this plugin's MasterKey-based calls.
+    implementation "androidx.security:security-crypto:1.1.0-alpha07"
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
