@@ -40,10 +40,21 @@ const server = http.createServer((req, res) => {
       res.writeHead(405)
       return res.end()
     }
-    const url = new URL(req.url ?? '/', 'http://localhost')
-    let rel = decodeURIComponent(url.pathname).replace(/^\/+/, '')
+    // Parse the RAW request target, not new URL(...): the WHATWG URL
+    // parser normalizes dot segments (/.. collapses to /) before we
+    // see them, which would hide a traversal from the containment
+    // check below while an encoded separator (..%2f) still smuggles
+    // it through decodeURIComponent. Split off the query ourselves
+    // and decode the raw path, so every `..` reaches the check.
+    const rawPath = (req.url ?? '/').split('?')[0]
+    let rel = decodeURIComponent(rawPath).replace(/^\/+/, '')
     let file = path.join(ROOT, rel)
-    if (!file.startsWith(ROOT)) {
+    // The containment check must be on a whole path segment: a bare
+    // startsWith(ROOT) lets a sibling whose name shares the prefix
+    // (ROOT /x/app vs /x/appview) escape (S5). path.relative is
+    // '..'-led exactly when the resolved path leaves ROOT.
+    const relToRoot = path.relative(ROOT, file)
+    if (relToRoot === '..' || relToRoot.startsWith(`..${path.sep}`)) {
       res.writeHead(403)
       return res.end()
     }

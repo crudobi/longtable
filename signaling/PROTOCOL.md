@@ -85,8 +85,10 @@ but must not break them):
   (not even their size per message — only aggregate counters, off by
   default). Room `password` payloads are end-to-end encrypted; the server
   treats them as opaque base64.
-- Validate defensively: topics must be non-empty strings (≤256 chars);
-  malformed JSON is dropped; unknown message types are ignored.
+- Validate defensively: topics must be an array of non-empty strings
+  (≤256 chars); malformed messages (bad JSON, non-object payloads,
+  non-array `topics`) are dropped and counted, and can never crash the
+  server; unknown message types are ignored.
 
 ## Anti-centralization note
 
