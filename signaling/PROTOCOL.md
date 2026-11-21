@@ -81,10 +81,11 @@ but must not break them):
   topics beyond subscriber sets in memory; empty topics are dropped.
 - Answer `ping` with `pong`; drop dead sockets (WS protocol ping/pong
   watchdog, 30s, same as the reference).
-- **Signaling only**: store nothing about documents, log no payloads
-  (not even their size per message — only aggregate counters, off by
-  default). Room `password` payloads are end-to-end encrypted; the server
-  treats them as opaque base64.
+- **Signaling only**: store nothing about documents, log no payload
+  content — under `SIGNAL_DEBUG` the server logs the topic + byte
+  length only (Sec L20), never any payload bytes; otherwise only
+  aggregate counters, off by default. Room `password` payloads are
+  end-to-end encrypted; the server treats them as opaque base64.
 - Validate defensively: topics must be an array of non-empty strings
   (≤256 chars); malformed messages (bad JSON, non-object payloads,
   non-array `topics`) are dropped and counted, and can never crash the
@@ -125,6 +126,42 @@ presence. This is accepted, not overlooked, for the following reasons:
 If the signaling port is ever exposed beyond a trusted network, this
 acceptance must be revisited first — that exposure changes the threat
 model the acceptance rests on.
+
+## Hub fan-out (accepted risk — Sec L2)
+
+A client announces and subscribes on **every** hub in its hub list —
+signaling and TURN alike — not just one. This is deliberate E8
+failover: if any hub dies, the others are already carrying discovery
+and relay for every live room, so there is no failover delay and no
+reconfiguration at the moment of failure. Narrowing rendezvous to
+"the invite's hub + the active hub" would reintroduce exactly the
+single point of failure E8 exists to remove.
+
+Privacy cost, stated plainly: every hub in the list learns presence
+metadata for every room — which rooms are live, when peers join and
+leave, handshake timing, and TURN relay volume — even for rooms that
+end up connecting through another hub. What a hub does **not** learn
+is content: room payloads are end-to-end encrypted (room `password`
+→ AES-GCM client-side; friend shelf traffic is sealed-box on top of
+that), and the TURN relay forwards encrypted packets only, so a hub
+sees peer IPs and packet sizes, never plaintext. The residual is
+bounded the same way as S18 above — trusted-network deployment,
+firewalled signaling port — and by the per-IP aggregate message
+budget (M13). If a deployment cannot accept every hub learning
+every room's presence, it must narrow the hub list itself (fewer
+hubs, less metadata spread); the fan-out is not configurable per
+room, by design.
+
+## TLS (fail-closed — Sec L15)
+
+The server speaks `wss://`. `TLS_CERT`/`TLS_KEY` must point at
+existing files or the process refuses to start — a missing cert is
+a startup error, never a silent downgrade to `ws://` (the old
+behavior). Plaintext needs an explicit opt-out,
+`SIGNAL_PLAINTEXT=1`, for loopback-only dev/test use. The hub always
+passes its own minted cert paths, so hub-run signaling is always
+`wss://`; the shared e2e fixture cert is only ever a dev default,
+never a production identity.
 
 ## Anti-centralization note
 

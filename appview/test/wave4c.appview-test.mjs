@@ -125,7 +125,7 @@ describe('H1: media purge on unpublish/delete', () => {
       const binding = perDeviceBindingEntry(device, DID)
       const recipe = {
         collection: 'kitchen.longtable.recipe',
-        rkey: 'soup',
+        rkey: 'lt-purge-soup',
         cid: 'cid-soup',
         record: signedRecipeRecord(device, DID, 'Purge Soup', ['1 egg'], {
           images: [{ ref: { $link: CID } }],

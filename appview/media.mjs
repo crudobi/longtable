@@ -247,6 +247,25 @@ export function createMediaCache({
     try {
       const meta = JSON.parse(fs.readFileSync(p.meta, 'utf8'))
       const bytes = fs.readFileSync(p.bytes)
+      // Sec L12: re-verify the CID hash on serve. fetchAndStore
+      // verified these bytes once, but the cache dir is on-disk state
+      // — a bit flip, a partial write, or a tampered file must never
+      // be served as the CID's bytes. On mismatch the corrupt entry
+      // is dropped so the next get() refetches (and re-verifies) it.
+      if (!blobMatchesCid(cid, bytes)) {
+        log.warn?.(`[media] cached blob failed CID re-verification, dropping: ${did}/${cid}`)
+        try {
+          fs.unlinkSync(p.bytes)
+        } catch {
+          /* already gone */
+        }
+        try {
+          fs.unlinkSync(p.meta)
+        } catch {
+          /* already gone */
+        }
+        return null
+      }
       return { bytes, contentType: meta.contentType || 'application/octet-stream' }
     } catch {
       return null
@@ -300,13 +319,22 @@ export function createMediaCache({
     return { entries, total }
   }
 
-  /** Delete orphaned .tmp files older than an hour (interrupted writes). */
-  function sweepStaleTmp() {
+  /**
+   * Delete orphaned .tmp files (interrupted writes — tmp+rename means
+   * a .tmp on disk is never a valid entry). Int L1: the cache is
+   * created once per process start, so a full sweep at creation is
+   * the startup sweep — no fetch is in flight yet, so every .tmp is
+   * an orphan. Mid-run (evictToFit) only .tmp files older than an
+   * hour go: a fresh one may be a concurrent fetchAndStore still
+   * writing. Returns the number of files removed.
+   */
+  function sweepStaleTmp({ all = false } = {}) {
+    let removed = 0
     let subs = []
     try {
       subs = fs.readdirSync(dir, { withFileTypes: true })
     } catch {
-      return
+      return removed
     }
     const cutoff = Date.now() - 3_600_000
     for (const sub of subs) {
@@ -322,15 +350,35 @@ export function createMediaCache({
         if (!f.includes('.tmp-')) continue
         const tmpPath = path.join(subPath, f)
         try {
-          if (fs.statSync(tmpPath).mtimeMs < cutoff) fs.unlinkSync(tmpPath)
+          if (all || fs.statSync(tmpPath).mtimeMs < cutoff) {
+            fs.unlinkSync(tmpPath)
+            removed++
+          }
         } catch {
           /* raced a delete — skip */
         }
       }
     }
+    return removed
   }
 
-  /** Evict oldest entries until `incoming` more bytes fit the total bound. */
+  // Int L1: startup sweep — every .tmp left by an interrupted write
+  // (or a crashed process) goes on cache creation, before any fetch
+  // can be in flight. The .tmp bytes themselves already counted
+  // toward the cache total in cacheEntries (they are on-disk files),
+  // so orphans could never silently grow the cache past its bound
+  // without counting — the sweep just reclaims the space.
+  sweepStaleTmp({ all: true })
+
+  /**
+   * Evict entries until `incoming` more bytes fit the total bound.
+   * Eviction is LRU: entries sort by mtime, and mtime is the last
+   * ACCESS (get() refreshes it on every hit), so the entries evicted
+   * first are the ones nobody has read in the longest — not the ones
+   * fetched longest ago. Orphaned .tmp bytes count toward `total`
+   * (cacheEntries sums every file on disk), so they can never push
+   * the cache past its bound uncounted.
+   */
   function evictToFit(incoming) {
     sweepStaleTmp()
     let { entries, total } = cacheEntries()
@@ -463,6 +511,23 @@ export function createMediaCache({
     const cached = readCached(did, cid)
     if (cached) {
       stats.hits++
+      // Int L1 / LRU eviction: a hit refreshes the entry's mtime, so
+      // evictToFit's oldest-first order evicts least-RECENTLY-used
+      // entries, not least-recently-fetched ones. Best-effort: a
+      // failed utime must never fail a serve.
+      const p = entryPaths(did, cid)
+      try {
+        const now = new Date()
+        fs.utimesSync(p.bytes, now, now)
+        fs.utimesSync(p.meta, now, now)
+      } catch (err) {
+        // A failed refresh must never fail a serve — but it silently
+        // degrades LRU to FIFO, so log it instead of swallowing it.
+        // (An earlier draft called the non-existent fs.utimeSync
+        // here; the silent catch hid it until the LRU test caught
+        // the stale mtime. The correct name is fs.utimesSync.)
+        log.warn?.(`[media] mtime refresh failed for ${did}/${cid}: ${err?.message ?? err}`)
+      }
       return { ...cached, fromCache: true }
     }
     stats.misses++
@@ -483,5 +548,5 @@ export function createMediaCache({
     return fresh ? { ...fresh, fromCache: false } : null
   }
 
-  return { get, delete: deleteBlob, purgeImages, purgeUnreferenced, stats, dir }
+  return { get, delete: deleteBlob, purgeImages, purgeUnreferenced, sweepStaleTmp, stats, dir }
 }

@@ -52,6 +52,17 @@ const PORT = Number(process.env.PORT || 4444)
 // TLS cert/key for wss://. The app's WebView is https://localhost, and browsers
 // block insecure ws:// from secure contexts — so the signaling server must speak
 // wss://. Defaults to the e2e fixture cert (SAN IP:10.0.2.2); override via env.
+//
+// Sec L15 — fail closed, never silently downgrade to ws://. The old
+// code served plain ws whenever the cert files were absent, so a
+// typo'd path or a missing fixture silently dropped the whole room
+// to plaintext (and the default was the fixture cert shared across
+// machines). Now: explicitly-configured TLS paths (TLS_CERT/TLS_KEY)
+// must exist or the process exits instead of starting; the fixture
+// default must exist too; plaintext needs an EXPLICIT opt-out
+// (SIGNAL_PLAINTEXT=1, tests + loopback-only dev). The hub always
+// passes its own minted cert paths (hub.mjs ensureTls), so hub-run
+// signaling never hits any of these branches.
 const LT_ROOT =
   process.env.LT_ROOT ??
   path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
@@ -59,6 +70,24 @@ const FIXTURE_CERTS =
   process.env.FIXTURE_CERTS ?? path.join(LT_ROOT, 'tools/android-emu/fixture-certs')
 const TLS_CERT = process.env.TLS_CERT || path.join(FIXTURE_CERTS, 'server.crt')
 const TLS_KEY = process.env.TLS_KEY || path.join(FIXTURE_CERTS, 'server.key')
+const TLS_CONFIGURED = Boolean(process.env.TLS_CERT || process.env.TLS_KEY)
+const PLAINTEXT = process.env.SIGNAL_PLAINTEXT === '1'
+if (!PLAINTEXT && (!fs.existsSync(TLS_CERT) || !fs.existsSync(TLS_KEY))) {
+  // Synchronous write: process.exit(1) below can truncate an async
+  // console.error to a pipe, and a fail-closed refusal nobody sees
+  // is a silent downgrade of a different kind.
+  fs.writeSync(
+    2,
+    `[signal] TLS certificate not found: ${TLS_CERT} / ${TLS_KEY}\n` +
+      (TLS_CONFIGURED
+        ? 'TLS_CERT/TLS_KEY are set but the files are missing — refusing to serve plain ws://. Fix the paths.\n'
+        : 'No TLS certificate found (the e2e fixture cert is missing) — refusing to serve plain ws://. Set TLS_CERT/TLS_KEY to a real cert, or SIGNAL_PLAINTEXT=1 for loopback-only dev/test use.\n'),
+  )
+  process.exit(1)
+}
+if (PLAINTEXT) {
+  console.warn('[signal] SIGNAL_PLAINTEXT=1 — serving plain ws:// (loopback-only dev/test use, never production)')
+}
 const MAX_PAYLOAD = 1 << 20 // 1 MiB — signaling frames (SDP/ICE) are tiny
 const MAX_TOPIC_LEN = 256
 const MAX_CONNS_PER_IP = 50
@@ -222,7 +251,17 @@ const onConnection = (conn, req) => {
         }
         break
       case 'publish': {
-        if (process.env.SIGNAL_DEBUG) console.log('[signal] publish', msg.topic, 'datatype=', typeof msg.data, 'val=', JSON.stringify(msg.data).slice(0, 200));
+        // Sec L20: SIGNAL_DEBUG logs topic + byte length ONLY. The
+        // old line stringified the first 200 chars of the payload —
+        // publish payloads are handshake material (SDP/ICE) and room
+        // traffic the server is supposed to forward opaquely; even a
+        // prefix of it in a log is content the server should not
+        // retain. (PROTOCOL.md already promised "no payload logging"
+        // — this line was the exception to that promise.)
+        if (process.env.SIGNAL_DEBUG) {
+          const dataJson = JSON.stringify(msg.data ?? null)
+          console.log('[signal] publish', msg.topic, 'bytes=', dataJson === undefined ? 0 : Buffer.byteLength(dataJson))
+        }
         if (!validTopic(msg.topic)) {
           break
         }
@@ -324,7 +363,10 @@ const requestHandler = (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.end('okay')
 }
-const useTls = fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY)
+// Sec L15: the existence check above already exited when no cert is
+// available and plaintext was not explicitly requested — useTls is
+// therefore just "not plaintext", never a silent downgrade.
+const useTls = !PLAINTEXT
 const server = useTls
   ? https.createServer(
       { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) },

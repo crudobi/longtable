@@ -90,6 +90,151 @@ export async function ingestClaim(claim) {
   return defaultIngestor.ingestClaim(claim)
 }
 
+/**
+ * S15 — per-repo reconcile budget. One huge repo used to head-of-line
+ * block the shared queue: reconcileRepo verified every record in the
+ * repo state before the next DID's reconcile could run (the 100 MiB
+ * CAR cap bounds bytes, not record count). A reconcile now stops after
+ * MAX_RECONCILE_RECORDS records or MAX_RECONCILE_MS milliseconds and
+ * leaves the rest for the next periodic sweep — and, critically, SKIPS
+ * the sweep-delete when it stops early, because `seen` is incomplete
+ * and a sweep would delete rows for records it never looked at.
+ * Defaults: 5000 records / 30 s — far above any real author's repo
+ * (device-signature verification is sub-millisecond per record), low
+ * enough that one DID cannot stall the queue for minutes.
+ */
+export const MAX_RECONCILE_RECORDS = 5000
+export const MAX_RECONCILE_MS = 30_000
+
+/**
+ * Int M1 — lexicon/per-record validation on ingest. C2 verifies the
+ * binding + every recipe signature, but nothing checked the record
+ * shape: recordToRow coerces arbitrary values and never rejects. These
+ * caps are the kitchen.longtable.recipe lexicon's own bounds
+ * (lexicons/kitchen.longtable.recipe.json) — a record outside them is
+ * not a conformant recipe, so reconcile rejects it, counts it
+ * (stats.validationRejected) and never indexes it. The signature check
+ * still runs for records that pass validation; validation runs first
+ * because it is cheap and the signature check is not.
+ */
+export const RECIPE_LIMITS = {
+  nameMaxLength: 300,
+  descriptionMaxLength: 3000,
+  ingredientsMax: 100,
+  ingredientMaxLength: 1000,
+  instructionsMax: 200,
+  instructionMaxLength: 5000,
+  minutesMax: 10080,
+  yieldMaxLength: 100,
+  tagsMax: 20,
+  tagMaxLength: 64,
+  imagesMax: 10,
+  deviceSignatureMaxLength: 256,
+  longtableIdMaxLength: 64,
+}
+
+function isNonEmptyString(v) {
+  return typeof v === 'string' && v.length > 0
+}
+
+function isStringArrayWithin(v, maxItems, maxItemLength) {
+  return (
+    Array.isArray(v) &&
+    v.length <= maxItems &&
+    v.every((s) => typeof s === 'string' && s.length <= maxItemLength)
+  )
+}
+
+function isValidMinutes(v) {
+  return (
+    v === undefined ||
+    (typeof v === 'number' &&
+      Number.isInteger(v) &&
+      v >= 0 &&
+      v <= RECIPE_LIMITS.minutesMax)
+  )
+}
+
+/**
+ * Validate one recipe record against the lexicon shape. Returns null
+ * when the record is conformant, else a short machine-readable reason
+ * (no record content is ever logged — the caller logs the reason only).
+ * Checks, in order: the record is an object; $type is exactly the
+ * recipe collection; required fields are present with the right types;
+ * every field is within its lexicon cap.
+ */
+export function validateRecipeRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return 'invalid-record:not-an-object'
+  }
+  if (record.$type !== RECIPE_COLLECTION) {
+    return 'invalid-record:bad-$type'
+  }
+  if (!isNonEmptyString(record.name) || record.name.length > RECIPE_LIMITS.nameMaxLength) {
+    return 'invalid-record:bad-name'
+  }
+  if (!Array.isArray(record.ingredients) || !isStringArrayWithin(record.ingredients, RECIPE_LIMITS.ingredientsMax, RECIPE_LIMITS.ingredientMaxLength)) {
+    return 'invalid-record:bad-ingredients'
+  }
+  if (!Array.isArray(record.instructions) || !isStringArrayWithin(record.instructions, RECIPE_LIMITS.instructionsMax, RECIPE_LIMITS.instructionMaxLength)) {
+    return 'invalid-record:bad-instructions'
+  }
+  if (!isNonEmptyString(record.createdAt) || Number.isNaN(Date.parse(record.createdAt))) {
+    return 'invalid-record:bad-createdAt'
+  }
+  if (!isNonEmptyString(record.longtableId) || record.longtableId.length > RECIPE_LIMITS.longtableIdMaxLength) {
+    return 'invalid-record:bad-longtableId'
+  }
+  if (
+    record.description !== undefined &&
+    (typeof record.description !== 'string' || record.description.length > RECIPE_LIMITS.descriptionMaxLength)
+  ) {
+    return 'invalid-record:bad-description'
+  }
+  if (!isValidMinutes(record.prepTimeMinutes) || !isValidMinutes(record.cookTimeMinutes)) {
+    return 'invalid-record:bad-minutes'
+  }
+  if (
+    record.recipeYield !== undefined &&
+    (typeof record.recipeYield !== 'string' || record.recipeYield.length > RECIPE_LIMITS.yieldMaxLength)
+  ) {
+    return 'invalid-record:bad-yield'
+  }
+  if (
+    record.tags !== undefined &&
+    !isStringArrayWithin(record.tags, RECIPE_LIMITS.tagsMax, RECIPE_LIMITS.tagMaxLength)
+  ) {
+    return 'invalid-record:bad-tags'
+  }
+  if (record.images !== undefined) {
+    if (!Array.isArray(record.images) || record.images.length > RECIPE_LIMITS.imagesMax) {
+      return 'invalid-record:bad-images'
+    }
+    for (const img of record.images) {
+      const ref = img?.ref
+      const ok =
+        img !== null &&
+        typeof img === 'object' &&
+        (typeof ref === 'string' || typeof ref?.$link === 'string')
+      if (!ok) return 'invalid-record:bad-images'
+    }
+  }
+  if (
+    record.deviceSignature !== undefined &&
+    (typeof record.deviceSignature !== 'string' ||
+      record.deviceSignature.length > RECIPE_LIMITS.deviceSignatureMaxLength)
+  ) {
+    return 'invalid-record:bad-deviceSignature'
+  }
+  if (
+    record.updatedAt !== undefined &&
+    (typeof record.updatedAt !== 'string' || Number.isNaN(Date.parse(record.updatedAt)))
+  ) {
+    return 'invalid-record:bad-updatedAt'
+  }
+  return null
+}
+
 export function createIngestor(
   {
     index,
@@ -107,6 +252,9 @@ export function createIngestor(
     // nothing almost certainly had its cursor rejected (too old) — drop
     // the cursor once and reconnect without it instead of looping.
     firehoseCursorStaleCloseMs = 10_000,
+    // S15: per-repo reconcile budget (record count and/or wall time).
+    maxReconcileRecords = MAX_RECONCILE_RECORDS,
+    maxReconcileMs = MAX_RECONCILE_MS,
   } = {},
 ) {
   if (!index) throw new Error('createIngestor: index is required')
@@ -118,6 +266,8 @@ export function createIngestor(
     indexed: 0,
     rejected: 0,
     signatureRejected: 0,
+    validationRejected: 0,
+    budgetExceeded: 0,
     sweepSkipped: 0,
     mediaPurged: 0,
     lastReconcileAt: null,
@@ -208,12 +358,27 @@ export function createIngestor(
           ? 'missing-binding'
           : firstInvalidReason
     let signatureRejected = 0
+    let validationRejected = 0
     const reject = (entry, reason) => {
       signatureRejected++
       stats.rejected++
       stats.signatureRejected++
       log.warn?.(
         `[appview] reconcile ${did}: dropped ${entry.collection}/${entry.rkey}: device signature rejected (${reason})`,
+      )
+    }
+    // Int M1 / S16: the record fails ingest acceptance before any
+    // signature is checked — malformed shape, over-cap field, wrong
+    // $type, or an rkey that is not the record's own longtableId
+    // (the signature binds longtableId, not the repo rkey, so without
+    // this assert the same signed record could be indexed under any
+    // number of rkeys). Counted separately from signature failures.
+    const rejectInvalid = (entry, reason) => {
+      validationRejected++
+      stats.rejected++
+      stats.validationRejected++
+      log.warn?.(
+        `[appview] reconcile ${did}: dropped ${entry.collection}/${entry.rkey}: invalid record (${reason})`,
       )
     }
     if (bindings.size === 0) {
@@ -234,11 +399,46 @@ export function createIngestor(
     // was deleted or never existed) — it is dropped below and its old row
     // is swept, while the bound devices' rows stay.
     const recipeCount = records.filter((r) => r.collection === RECIPE_COLLECTION).length
-    const skipSweep = bindings.size === 0 && candidates === 0 && recipeCount > 0
+    let skipSweep = bindings.size === 0 && candidates === 0 && recipeCount > 0
     const seen = new Set()
     let changed = 0
+    // S15: the budget clock starts with the per-record loop.
+    const reconcileStartedAt = Date.now()
+    let processed = 0
+    let budgetExceeded = false
     for (const entry of records) {
       if (entry.collection !== RECIPE_COLLECTION) continue
+      processed++
+      // S15: stop here — do not handle this record or any after it.
+      // The sweep below is skipped too (see skipSweep): `seen` is
+      // incomplete, so sweeping would delete rows the budget never
+      // looked at. The next periodic sweep retries the remainder.
+      if (
+        processed > maxReconcileRecords ||
+        Date.now() - reconcileStartedAt >= maxReconcileMs
+      ) {
+        budgetExceeded = true
+        stats.budgetExceeded++
+        log.warn?.(
+          `[appview] reconcile ${did}: budget exceeded after ${processed - 1} records (${maxReconcileRecords} records / ${maxReconcileMs} ms) — stopping early, sweep skipped`,
+        )
+        break
+      }
+      // Int M1: lexicon shape + field caps, before any crypto.
+      const invalidReason = validateRecipeRecord(entry.record)
+      if (invalidReason) {
+        rejectInvalid(entry, invalidReason)
+        continue
+      }
+      // S16: the repo rkey must be the record's own longtableId — the
+      // client publishes rkey === longtableId (publish.ts puts
+      // recipe.id in both), and the device signature binds longtableId,
+      // not the rkey. Without this assert, one signed record could be
+      // indexed under any number of rkeys.
+      if (entry.rkey !== entry.record.longtableId) {
+        rejectInvalid(entry, 'rkey-longtableId-mismatch')
+        continue
+      }
       const binding = bindings.get(entry.record?.deviceDid)
       if (!binding) {
         // No verified binding for THIS device. When no device is bound
@@ -270,6 +470,10 @@ export function createIngestor(
         stats.indexed++
       }
     }
+    // S15: an early stop leaves `seen` incomplete — sweeping would
+    // delete rows for records the budget never examined. Skip it the
+    // same way the missing-binding case does; the next sweep retries.
+    if (budgetExceeded) skipSweep = true
     let deleted = 0
     if (skipSweep) {
       stats.sweepSkipped++
@@ -295,7 +499,7 @@ export function createIngestor(
       }
     }
     stats.lastReconcileAt = new Date().toISOString()
-    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected, signatureRejected, sweepSkipped: skipSweep, bindingReason, bindings: bindings.size }
+    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected + validationRejected, signatureRejected, validationRejected, budgetExceeded, processed, sweepSkipped: skipSweep, bindingReason, bindings: bindings.size }
   }
 
   /**

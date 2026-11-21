@@ -263,3 +263,189 @@ test('M15: WEB_TLS_CERT/WEB_TLS_KEY serve HTTPS', async () => {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
 })
+
+// Wave 5C additions — hub /healthz (blocker #14 remainder) and Sec L15
+// (fail-closed TLS). The S5/M15 tests above are untouched.
+
+function freshWebPort() {
+  return 18100 + Math.floor(Math.random() * 500)
+}
+
+function spawnWeb(port, extraEnv = {}, stdio = 'ignore') {
+  return spawn(process.execPath, [path.join(HERE, 'web-server.mjs')], {
+    env: { ...process.env, WEB_PORT: String(port), ...extraEnv },
+    stdio,
+  })
+}
+
+async function stopWeb(child) {
+  if (child.exitCode !== null) return
+  child.kill('SIGKILL')
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 2000)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+async function waitForWebUp(port, deadlineMs = 5000) {
+  const started = Date.now()
+  for (;;) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`)
+      if (res.status === 200) return
+    } catch {
+      /* not up yet */
+    }
+    if (Date.now() - started > deadlineMs) throw new Error('web server did not come up')
+    await sleep(100)
+  }
+}
+
+function writeStatus(dir, status, name = 'hub-status.json') {
+  const file = path.join(dir, name)
+  fs.writeFileSync(file, JSON.stringify(status))
+  return file
+}
+
+function freshStatus(overrides = {}) {
+  return {
+    name: 'test-hub',
+    heartbeatAt: new Date().toISOString(),
+    children: { web: { pid: 1234, restarts: 0 }, signaling: { pid: 1235, restarts: 1 } },
+    endpoints: { web: 'http://127.0.0.1:18081', signaling: 'wss://127.0.0.1:18082' },
+    ...overrides,
+  }
+}
+
+function checkHealthzHeaders(headers) {
+  assert.equal(headers['x-content-type-options'], 'nosniff')
+  assert.equal(headers['x-frame-options'], 'SAMEORIGIN')
+  assert.equal(headers['referrer-policy'], 'no-referrer')
+  assert.equal(headers['content-security-policy'], "frame-ancestors 'self'")
+}
+
+test('healthz: fresh heartbeat is 200 with the hub state; HEAD answers the same headers', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'longtable-web-healthz-'))
+  const root = path.join(tmp, 'app')
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'index.html'), '<h1>app shell</h1>\n')
+  const statusFile = writeStatus(tmp, freshStatus())
+  const port = freshWebPort()
+  const child = spawnWeb(port, { WEB_ROOT: root, HUB_STATUS_FILE: statusFile })
+  try {
+    await waitForWebUp(port)
+    assert.equal(child.exitCode, null)
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`)
+    assert.equal(res.status, 200)
+    checkHealthzHeaders(Object.fromEntries(res.headers.entries()))
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.name, 'test-hub')
+    assert.equal(body.heartbeatAt, JSON.parse(fs.readFileSync(statusFile, 'utf8')).heartbeatAt)
+    assert.equal(typeof body.heartbeatAgeMs, 'number')
+    assert.ok(body.heartbeatAgeMs >= 0 && body.heartbeatAgeMs < 60_000)
+    assert.equal(body.children.web.pid, 1234)
+    assert.equal(body.endpoints.signaling, 'wss://127.0.0.1:18082')
+
+    // HEAD: same status + headers, no body.
+    const head = await fetch(`http://127.0.0.1:${port}/healthz`, { method: 'HEAD' })
+    assert.equal(head.status, 200)
+    checkHealthzHeaders(Object.fromEntries(head.headers.entries()))
+    assert.equal(await head.text(), '')
+
+    // /healthz is not the SPA fallback: a dead hub must not answer
+    // 200 with the app shell.
+    assert.doesNotMatch(JSON.stringify(body), /app shell/)
+  } finally {
+    await stopWeb(child)
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('healthz: stale heartbeat, missing file, unparseable file, and no status file are all 503', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'longtable-web-healthz503-'))
+  const root = path.join(tmp, 'app')
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'index.html'), '<h1>app shell</h1>\n')
+  // The unparseable case is written raw (writeStatus would JSON-encode
+  // the string, which parses fine).
+  const garbageFile = path.join(tmp, 'garbage-status.json')
+  fs.writeFileSync(garbageFile, 'this is not json{')
+  // Each case gets its own file: the cases array is built eagerly,
+  // so sharing one path would let later writes clobber earlier ones
+  // before the loop reads them.
+  const cases = [
+    ['stale heartbeat', writeStatus(tmp, freshStatus({ heartbeatAt: new Date(Date.now() - 5 * 60_000).toISOString() }), 'stale-status.json'), /stale/],
+    ['missing file', path.join(tmp, 'no-such-status.json'), /unreadable/],
+    ['unparseable file', garbageFile, /unreadable/],
+    ['no heartbeat field', writeStatus(tmp, { name: 'test-hub' }, 'nohb-status.json'), /no heartbeat/],
+  ]
+  // Each case gets its own server (the status file is read per request,
+  // but a fresh server per case keeps the cases independent).
+  for (const [label, file, reasonRe] of cases) {
+    const port = freshWebPort()
+    const child = spawnWeb(port, { WEB_ROOT: root, HUB_STATUS_FILE: file })
+    try {
+      await waitForWebUp(port)
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`)
+      assert.equal(res.status, 503, `${label}: expected 503`)
+      checkHealthzHeaders(Object.fromEntries(res.headers.entries()))
+      const body = await res.json()
+      assert.equal(body.ok, false)
+      assert.match(body.reason, reasonRe, `${label}: reason ${body.reason}`)
+    } finally {
+      await stopWeb(child)
+    }
+  }
+  // No HUB_STATUS_FILE at all (a standalone web server is not a hub).
+  const port = freshWebPort()
+  const child = spawnWeb(port, { WEB_ROOT: root })
+  try {
+    await waitForWebUp(port)
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`)
+    assert.equal(res.status, 503)
+    const body = await res.json()
+    assert.equal(body.ok, false)
+    assert.match(body.reason, /not configured/)
+  } finally {
+    await stopWeb(child)
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('Sec L15: WEB_TLS_CERT set-but-missing refuses to start (no silent plain HTTP)', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'longtable-web-tlsfail-'))
+  const root = path.join(tmp, 'app')
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'index.html'), '<h1>app shell</h1>\n')
+  const port = freshWebPort()
+  let stderr = ''
+  const child = spawnWeb(
+    port,
+    { WEB_ROOT: root, WEB_TLS_CERT: '/nonexistent/web.crt', WEB_TLS_KEY: '/nonexistent/web.key' },
+    ['ignore', 'ignore', 'pipe'],
+  )
+  child.stderr.on('data', (d) => {
+    stderr += d.toString()
+  })
+  try {
+    const code = await new Promise((resolve) => {
+      if (child.exitCode !== null) return resolve(child.exitCode)
+      const timer = setTimeout(() => resolve(null), 5000)
+      child.once('exit', (c) => {
+        clearTimeout(timer)
+        resolve(c)
+      })
+    })
+    assert.equal(code, 1, 'missing WEB_TLS certs must exit 1, not serve plain HTTP')
+    assert.match(stderr, /WEB_TLS_CERT\/WEB_TLS_KEY are set but the files are missing/)
+    assert.match(stderr, /refusing to serve plain HTTP/)
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/`))
+  } finally {
+    if (child.exitCode === null) await stopWeb(child)
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
