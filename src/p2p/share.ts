@@ -37,6 +37,10 @@ import {
   noteCorruptStore,
   readStoredJson,
 } from '../store/corrupt'
+import {
+  getRecipeProvenance,
+  receivedRecipeRefusal,
+} from '../friends/provenance'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
 // don't want evaluated at app startup (and it keeps the initial bundle lean).
@@ -389,12 +393,18 @@ export function leaveShare(recipeId: string): void {
 /**
  * Host side: start sharing one of my recipes. Idempotent — calling twice
  * returns the same room. The returned payload is what goes in the QR code.
+ *
+ * H4: a recipe received from a friend is never QR-shared onward — the
+ * code would hand the plaintext to anyone who scans it.
  */
 export async function shareRecipe(
   recipeId: string,
   title: string,
   signaling: string = getActiveHub().signalingUrl,
+  kv: KeyValueStore = secretKv,
 ): Promise<SharePayload> {
+  const provenance = getRecipeProvenance(recipeId, kv)
+  if (provenance) throw new Error(receivedRecipeRefusal(provenance))
   const repo = getRepo()
   const doc = await getOrCreateDoc(repo, recipeId)
   const room = roomForRecipe(recipeId)
@@ -464,6 +474,11 @@ export async function joinShare(payload: SharePayload): Promise<void> {
   // Apply the embedded snapshot for instant content. y-webrtc then handles
   // live updates. Falls back to waiting for sync if no snapshot (old payloads).
   if (payload.snapshot) {
+    // M8: refuse an oversized snapshot before applying it — a crafted
+    // code must not make the app apply an unbounded Yjs update.
+    if (estimatedDecodedBytes(payload.snapshot) > MAX_SNAPSHOT_BYTES) {
+      throw new Error('That share code carries a snapshot that is too large.')
+    }
     Y.applyUpdate(doc, base64ToU8(payload.snapshot))
   }
   await joinRoom(payload.room, doc, payload.signaling, payload.secret)
@@ -531,6 +546,21 @@ export async function rejoinShares(): Promise<void> {
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
 
+/**
+ * Max decoded snapshot bytes accepted in a share payload (M8): a
+ * snapshot is unauthenticated bytes from a QR code or pasted string,
+ * and a share doc holds at most 20 photos — 32 MiB bounds the Yjs
+ * update a crafted code can make the app apply, while leaving ample
+ * headroom for real photo-carrying recipes.
+ */
+export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
+
+/** Approximate decoded byte length of a base64 string (no decode). */
+function estimatedDecodedBytes(b64: string): number {
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0
+  return Math.floor((b64.length * 3) / 4) - padding
+}
+
 /** Parse and validate a pasted/scanned share payload. Throws on invalid. */
 export function parseSharePayload(text: string): SharePayload {
   let obj: unknown
@@ -572,6 +602,10 @@ export function parseSharePayload(text: string): SharePayload {
     ) {
       throw new Error('That code is not a valid Longtable share invitation.')
     }
+    // M8: size cap before decoding/applying — see MAX_SNAPSHOT_BYTES.
+    if (estimatedDecodedBytes(o.snapshot) > MAX_SNAPSHOT_BYTES) {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    }
     const scratch = new Y.Doc()
     try {
       Y.applyUpdate(scratch, base64ToU8(o.snapshot))
@@ -591,6 +625,30 @@ export function parseSharePayload(text: string): SharePayload {
     (typeof o.secret !== 'string' || !o.secret)
   ) {
     throw new Error('That code is not a valid Longtable share invitation.')
+  }
+  // M8: a room secret must be well-formed strict base64. The 32-byte
+  // length rule is enforced at the friend-invite boundary
+  // (validatePairSecret), where the secret derives channel passwords;
+  // share payloads validate format only — the existing fixtures pin
+  // short test secrets as valid, and a short room secret is still a
+  // secret the guest must hold. Real shares mint 32-byte secrets
+  // (newShareSecret); a malformed or non-base64 secret is a forged or
+  // corrupted code, not a legacy share (legacy shares carry no secret
+  // at all).
+  if (o.secret !== undefined) {
+    if (
+      typeof o.secret !== 'string' ||
+      !o.secret ||
+      o.secret.length % 4 !== 0 ||
+      !BASE64_RE.test(o.secret)
+    ) {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    }
+    try {
+      base64ToU8(o.secret)
+    } catch {
+      throw new Error('That code is not a valid Longtable share invitation.')
+    }
   }
   return obj as SharePayload
 }

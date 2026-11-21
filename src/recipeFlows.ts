@@ -25,7 +25,9 @@ import {
   saveSession,
   type PublicKv,
 } from './public/atproto'
-import type { Identity } from './identity/identity'
+import { getRecipeProvenance, receivedRecipeRefusal } from './friends/provenance'
+import { secretKv } from './secrets/secretStore'
+import type { Identity, KeyValueStore } from './identity/identity'
 import type { Recipe, VisibilityTier } from './types'
 
 /**
@@ -49,6 +51,17 @@ export interface FlowContext {
    * localStorage stub.
    */
   publicationsKv?: PublicKv
+  /**
+   * Called with the user-facing label of each remote copy that could not
+   * be taken down ('the copies shared with friends', 'the public copy').
+   */
+  onRemoteProblem?: (label: string) => void
+  /**
+   * Store the provenance check reads (H4). Defaults to the app's
+   * secret store — the same store importReceivedShares records
+   * provenance into. Tests pass their injected store here.
+   */
+  kv?: KeyValueStore
 }
 
 /** The tombstone notice (H6/H13): friends' copies are recalled on sync, not instantly. */
@@ -90,6 +103,7 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
     } catch (e) {
       console.warn('unshare failed', e)
       problems.push('the copies shared with friends')
+      ctx.onRemoteProblem?.('the copies shared with friends')
     }
   }
   // If it was published publicly, remove the ATProto record first.
@@ -100,6 +114,7 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<s
         (e) => {
           console.warn('unpublish failed', e)
           problems.push('the public copy')
+          ctx.onRemoteProblem?.('the public copy')
         },
       )
     } else {
@@ -189,6 +204,11 @@ export async function applyVisibilityFlow(
   }
 
   if (tier === 'public') {
+    // H4: a recipe received from a friend is not this device's to
+    // publish — checked before any session or network step, so the
+    // refusal is the same for the UI and the localhost API.
+    const provenance = getRecipeProvenance(id, ctx.kv ?? secretKv)
+    if (provenance) throw new Error(receivedRecipeRefusal(provenance))
     const session = loadSession()
     if (!session || !idn) throw new VisibilitySessionError()
     const client = new AtprotoClient(session.pdsUrl, {

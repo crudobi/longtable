@@ -39,11 +39,16 @@ import {
   RECIPE_COLLECTION,
   saveSession,
   type AtprotoBlob,
-  type AtprotoClient,
   type AtprotoSession,
+  type FetchFn,
   type Publication,
   type PublicKv,
 } from './atproto'
+import { AtprotoClient } from './atproto'
+import {
+  getRecipeProvenance,
+  receivedRecipeRefusal,
+} from '../friends/provenance'
 
 export { PUBLICATIONS_KEY, RECIPE_COLLECTION, PUBKEY_COLLECTION }
 
@@ -413,6 +418,11 @@ function localStorageSafe(): PublicKv {
  *     blobs already uploaded (best-effort — a deleteBlob failure is
  *     warned, never fatal), so a failed putRecord does not strand blobs
  *     on the PDS with no record pointing at them.
+ *
+ * H4: a recipe received from a friend is never published as this
+ * device's own — the refusal happens here as well as in the
+ * visibility flow, so no caller can publish a received copy by
+ * going around the flow.
  */
 export async function publishRecipe(
   client: AtprotoClient,
@@ -421,6 +431,8 @@ export async function publishRecipe(
   recipe: PublishableRecipe,
   kv: KeyValueStore = localStorageSafe(),
 ): Promise<string> {
+  const provenance = getRecipeProvenance(recipe.id, kv)
+  if (provenance) throw new Error(receivedRecipeRefusal(provenance))
   await ensurePubkeyBinding(client, session, identity, kv)
 
   const blobs: AtprotoBlob[] = []
@@ -500,24 +512,85 @@ async function deleteUploadedBlobs(
 /**
  * Remove a recipe's public record from the PDS and drop its registry
  * entry. A record that is already gone counts as unpublished.
+ *
+ * M-N3: the delete goes to the PDS the record was actually published
+ * to — the stored `publication.pdsUrl` — first, not to the session's
+ * current PDS. After an account/PDS move, deleting on the new PDS
+ * 404s while the record stays live on the old one; the old code then
+ * dropped the registry entry and lost all trace of it. The stored PDS
+ * is attempted first; when it differs from the session PDS the session
+ * PDS is attempted too (the record may have been re-created there).
+ * A 404 on a PDS only counts as "gone" for that PDS; the registry
+ * entry is dropped only once every attempted PDS answered success or
+ * 404. Anything else throws and the registry entry is kept, so the
+ * unpublish can be retried instead of silently succeeding.
+ * Returns the PDS URLs attempted and any cross-PDS warnings.
  */
 export async function unpublishRecipe(
   client: AtprotoClient,
   session: AtprotoSession,
   recipeId: string,
   kv: KeyValueStore = localStorageSafe(),
-): Promise<void> {
-  try {
-    await client.deleteRecord(session, {
-      repo: session.did,
-      collection: RECIPE_COLLECTION,
-      rkey: recipeId,
-    })
-  } catch (e) {
-    const status = (e as { status?: number }).status
-    const name = (e as { error?: string }).error
-    if (status !== 404 && name !== 'RecordNotFound') throw e
+  opts: { fetchFn?: FetchFn } = {},
+): Promise<{ pdsUrlsAttempted: string[]; warnings: string[] }> {
+  const pub = getPublication(recipeId, kv as PublicKv)
+  const storedPds = pub?.pdsUrl
+  const targets: string[] = []
+  if (storedPds) targets.push(storedPds)
+  if (!targets.includes(session.pdsUrl)) targets.push(session.pdsUrl)
+  const warnings: string[] = []
+  if (storedPds && storedPds !== session.pdsUrl) {
+    warnings.push(
+      'This recipe was published to a different publishing server than the one signed in now — removing it from both.',
+    )
+  }
+  let anyDeleted = false
+  let allResolved = true
+  for (const pdsUrl of targets) {
+    // The passed client already speaks the session PDS (and carries
+    // the caller's fetch, e.g. a test fake); a different stored PDS
+    // gets a fresh client for that host.
+    const targetClient =
+      pdsUrl === client.pdsUrl
+        ? client
+        : new AtprotoClient(pdsUrl, { fetchFn: opts.fetchFn })
+    try {
+      await targetClient.deleteRecord(session, {
+        repo: session.did,
+        collection: RECIPE_COLLECTION,
+        rkey: recipeId,
+      })
+      anyDeleted = true
+    } catch (e) {
+      const status = (e as { status?: number }).status
+      const name = (e as { error?: string }).error
+      if (status === 404 || name === 'RecordNotFound') {
+        if (pdsUrl === storedPds) {
+          warnings.push(
+            'The record was already gone from the publishing server it was published to.',
+          )
+        }
+        continue
+      }
+      // A real failure on one PDS must not drop the registry entry
+      // while a live copy may still exist there.
+      allResolved = false
+      warnings.push(
+        `Could not reach the publishing server at ${pdsUrl} to remove the record.`,
+      )
+    }
+  }
+  if (!anyDeleted && !allResolved) {
+    throw new Error(
+      'Could not remove the public record — the publishing server did not answer. The local entry was kept so the removal can be retried.',
+    )
+  }
+  if (!allResolved) {
+    throw new Error(
+      'The public record may still be live on one publishing server. The local entry was kept so the removal can be retried.',
+    )
   }
   dropPublication(recipeId, kv as PublicKv)
   saveSession(session, kv as PublicKv)
+  return { pdsUrlsAttempted: targets, warnings }
 }

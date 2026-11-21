@@ -81,6 +81,117 @@ export interface FriendInvitePayload {
   room: string
   /** Base64 32-byte pair secret. Whoever holds the invite becomes the friend. */
   pairSecret: string
+  /** ISO timestamp the invite was minted (M2: invites expire). */
+  createdAt?: string
+  /** ISO timestamp after which the invite must not be accepted (M2). */
+  expiresAt?: string
+}
+
+/** Invite lifetime (M2): an invite is a bearer credential, so it gets an expiry. */
+export const INVITE_TTL_MS = 24 * 60 * 60 * 1000
+
+// ---------------------------------------------------------------------------
+// Secret validation (M8)
+// ---------------------------------------------------------------------------
+
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
+
+/**
+ * A pair secret must be strict base64 decoding to exactly 32 bytes —
+ * the size every consumer (pairId hash, y-webrtc room password) assumes.
+ * atob alone is too lenient (it ignores some invalid input and happily
+ * decodes short strings), so the shape is checked first. Throws on
+ * anything else. Checked at the parse and pairing boundaries; the
+ * friend-record store itself does not reject legacy records, which
+ * fail here at use time instead.
+ */
+export function validatePairSecret(secretB64: unknown): void {
+  if (
+    typeof secretB64 !== 'string' ||
+    !secretB64 ||
+    secretB64.length % 4 !== 0 ||
+    !BASE64_RE.test(secretB64)
+  ) {
+    throw new Error('That invite code has a malformed pair secret.')
+  }
+  let bytes: Uint8Array
+  try {
+    bytes = base64ToU8(secretB64)
+  } catch {
+    throw new Error('That invite code has a malformed pair secret.')
+  }
+  if (bytes.length !== 32) {
+    throw new Error('That invite code has a pair secret of the wrong length.')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Used invites (M2 — single-use enforcement)
+// ---------------------------------------------------------------------------
+
+/**
+ * Used-invite store (M2). An invite is a bearer credential: once it has
+ * paired one guest, a second guest holding the same code must not be
+ * able to pair with it. The store records the invite fingerprint
+ * (pairId + room — never the secret itself) with the peer it paired.
+ *
+ * Honest limit (documented, not hidden): enforcement is per-device —
+ * the inviter's runPairing refuses a second pairing on a used invite,
+ * and the guest's refuses to re-pair on one it already used. A wiped
+ * device loses its used-invite store, and a malicious inviter can
+ * always mint a fresh invite; what single-use closes is the accidental
+ * and the replayed-code case, where a copied QR/paste keeps working
+ * forever. Full single-use would also require evicting a second guest
+ * who already holds the pairSecret — impossible without rotating the
+ * channel password, which would evict the first guest too — so the
+ * Wave 1 S8 per-DID channel binding remains the backstop: two guests
+ * on one invite still land in separate rooms/shelves and cannot see
+ * each other's shares.
+ */
+export interface UsedInvite {
+  pairId: string
+  room: string
+  peerDid: string
+  usedAt: string
+}
+
+const USED_INVITES_KEY = 'longtable:used-invites:v1'
+
+export function loadUsedInvites(
+  kv: KeyValueStore = secretKv,
+): UsedInvite[] {
+  try {
+    const raw = kv.getItem(USED_INVITES_KEY)
+    if (!raw) return []
+    const arr: unknown = JSON.parse(raw)
+    return Array.isArray(arr) ? (arr as UsedInvite[]) : []
+  } catch {
+    return []
+  }
+}
+
+function saveUsedInvites(invites: UsedInvite[], kv: KeyValueStore): void {
+  kv.setItem(USED_INVITES_KEY, JSON.stringify(invites))
+}
+
+export function isInviteUsed(
+  pairId: string,
+  room: string,
+  kv: KeyValueStore = secretKv,
+): boolean {
+  return loadUsedInvites(kv).some((u) => u.pairId === pairId && u.room === room)
+}
+
+export function markInviteUsed(
+  pairId: string,
+  room: string,
+  peerDid: string,
+  kv: KeyValueStore = secretKv,
+): void {
+  const invites = loadUsedInvites(kv)
+  if (invites.some((u) => u.pairId === pairId && u.room === room)) return
+  invites.push({ pairId, room, peerDid, usedAt: new Date().toISOString() })
+  saveUsedInvites(invites, kv)
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +284,19 @@ export async function createFriendInvite(
   await cryptoReady()
   const room = `longtable-pair-${u8ToHex(sodium.randombytes_buf(8))}`
   const pairSecret = u8ToBase64(sodium.randombytes_buf(32))
-  return { v: 2, kind: 'friend', did: identity.did, name, signaling, room, pairSecret }
+  const createdAt = new Date().toISOString()
+  return {
+    v: 2,
+    kind: 'friend',
+    did: identity.did,
+    name,
+    signaling,
+    room,
+    pairSecret,
+    createdAt,
+    // M2: an invite is a bearer credential — it expires.
+    expiresAt: new Date(Date.now() + INVITE_TTL_MS).toISOString(),
+  }
 }
 
 /** Parse and validate a pasted/scanned friend invite. Throws on invalid. */
@@ -202,6 +325,28 @@ export function parseFriendInvite(text: string): FriendInvitePayload {
   ) {
     throw new Error('That code is not a valid Longtable friend invitation.')
   }
+  // M8: the pair secret must be a strict 32-byte base64 value.
+  try {
+    validatePairSecret(o.pairSecret)
+  } catch {
+    throw new Error('That code is not a valid Longtable friend invitation.')
+  }
+  // M2: invites expire. Minted-before-expiry invites carry no timestamps
+  // and stay accepted (compat); anything carrying an expiry is enforced.
+  if (o.expiresAt !== undefined) {
+    const exp = Date.parse(o.expiresAt)
+    if (!Number.isFinite(exp)) {
+      throw new Error('That code is not a valid Longtable friend invitation.')
+    }
+    if (Date.now() > exp) {
+      throw new Error(
+        'That invite code has expired — ask your friend to show a fresh invite code.',
+      )
+    }
+  }
+  if (o.createdAt !== undefined && !Number.isFinite(Date.parse(o.createdAt))) {
+    throw new Error('That code is not a valid Longtable friend invitation.')
+  }
   return obj as FriendInvitePayload
 }
 
@@ -214,6 +359,14 @@ interface Hello {
   name: string
   /** base64 detached signature over the v2 hello message (see helloMessage). */
   sig: string
+  /**
+   * Base64 detached signature binding the announced display name to
+   * this pairing (M3): over helloNameMessage(room, did, pairId, name).
+   * A v2 peer (channelVersion 2) MUST send a valid nameSig — its name
+   * is then bound to its DID and cannot be swapped after the fact. A
+   * pre-fix peer sends none and its name stays unbound (compat).
+   */
+  nameSig?: string
   /**
    * Channel-derivation version this side supports (S8). 2 = DID-bound
    * rooms/docs. Absent = pre-fix build (legacy pairId-only derivation).
@@ -241,6 +394,23 @@ export function helloMessage(room: string, did: string, pairId: string): Uint8Ar
   return utf8ToU8(`longtable-pair:v2:${room}:${did}:${pairId}`)
 }
 
+/**
+ * The exact bytes a pairing hello's name signature covers (M3, v3):
+ *   longtable-pair:v3:name:<room>:<did>:<pairId>:<name>
+ * The display name a friend record stores is the name this signature
+ * vouches for — a hello whose name was swapped after signing (or whose
+ * name never was signed) is not accepted from a v2 peer.
+ * Exported for unit tests.
+ */
+export function helloNameMessage(
+  room: string,
+  did: string,
+  pairId: string,
+  name: string,
+): Uint8Array {
+  return utf8ToU8(`longtable-pair:v3:name:${room}:${did}:${pairId}:${name}`)
+}
+
 async function connectEphemeral(
   room: string,
   doc: Y.Doc,
@@ -255,11 +425,37 @@ async function connectEphemeral(
   })
 }
 
+export interface RunPairingOptions {
+  /**
+   * M2 single-use enforcement: refuse a pairing on an invite this
+   * device already used, and record the invite as used on success.
+   * The app's pairing entry points (FriendsPanel, both sides) pass
+   * true. The library default is false so the S8 separate-channels
+   * guarantee — two pairings on one reused invite land in different
+   * rooms — stays provable at this layer; the used-invite store is
+   * the enforcement mechanism either way.
+   */
+  singleUse?: boolean
+  /**
+   * M3: the display name the guest expects (the name on the invite
+   * they scanned). A hello announcing a different name is skipped,
+   * never accepted — the inviter cannot swap names mid-pairing.
+   */
+  expectedPeerName?: string | null
+}
+
 /**
  * Run the pairing handshake for one side. `expectedPeerDid` pins the peer
  * (the guest scanned the inviter's DID, so it accepts only that DID); the
  * inviter passes null and accepts whoever shows up with the invite.
  * Resolves with the persisted friend record.
+ *
+ * Bad hellos are SKIPPED, never fatal (M4): the first unverifiable
+ * hello used to throw and abort the whole pairing, so one malformed
+ * hello — or one racer — was a pairing DoS. Now an unverifiable, wrong-
+ * DID, wrong-name, or name-unbound hello is ignored and polling
+ * continues until a good hello arrives or the timeout fires (which
+ * reports how many bad hellos were ignored).
  */
 export async function runPairing(
   identity: Identity,
@@ -268,9 +464,18 @@ export async function runPairing(
   expectedPeerDid: string | null,
   kv: KeyValueStore = secretKv,
   timeoutMs = 90000,
+  opts: RunPairingOptions = {},
 ): Promise<FriendRecord> {
   await cryptoReady()
+  // M8: refuse a malformed pair secret before deriving anything from it.
+  validatePairSecret(invite.pairSecret)
   const pairId = await pairIdFor(invite.pairSecret)
+  // M2: single-use — an invite this device already paired on is spent.
+  if (opts.singleUse && isInviteUsed(pairId, invite.room, kv)) {
+    throw new Error(
+      'This invite code has already been used — ask your friend to show a fresh invite code.',
+    )
+  }
   const doc = new Y.Doc()
   const provider = await connectEphemeral(invite.room, doc, invite.signaling)
   try {
@@ -278,10 +483,16 @@ export async function runPairing(
       identity,
       helloMessage(invite.room, identity.did, pairId),
     )
+    // M3: sign my own display name into the hello as well.
+    const nameSig = await signDetached(
+      identity,
+      helloNameMessage(invite.room, identity.did, pairId, myName),
+    )
     const mine: Hello = {
       did: identity.did,
       name: myName,
       sig: u8ToBase64(sig),
+      nameSig: u8ToBase64(nameSig),
       // v2 channel binding (S8): this side derives DID-bound rooms/docs.
       channelVersion: 2,
     }
@@ -289,6 +500,10 @@ export async function runPairing(
       doc.getMap(HELLO_MAP).set(identity.did, JSON.stringify(mine))
     })
 
+    // Hellos already judged bad this run (did + sig): never re-verify
+    // them on every poll — they cannot become good.
+    const skippedBad = new Set<string>()
+    let skippedCount = 0
     const t0 = Date.now()
     for (;;) {
       const hellos: Hello[] = []
@@ -301,18 +516,62 @@ export async function runPairing(
           /* not a hello (yet) */
         }
       })
-      const hello = hellos[0]
-      if (hello) {
-        if (expectedPeerDid && hello.did !== expectedPeerDid) {
-          throw new Error('The device that answered is not the one on the invite.')
+      for (const hello of hellos) {
+        const badKey = `${hello.did}:${hello.sig}`
+        if (skippedBad.has(badKey)) continue
+        const skip = (): void => {
+          skippedBad.add(badKey)
+          skippedCount++
         }
-        const ok = await verifyDetached(
-          hello.did,
-          helloMessage(invite.room, hello.did, pairId),
-          base64ToU8(hello.sig),
-        )
+        // Wrong device: a racer, or the wrong guest — keep waiting
+        // for the expected one (M4: skip, never throw mid-pairing).
+        if (expectedPeerDid && hello.did !== expectedPeerDid) {
+          skip()
+          continue
+        }
+        // M3: the guest knows the name on the invite they scanned.
+        if (
+          opts.expectedPeerName != null &&
+          hello.name !== opts.expectedPeerName
+        ) {
+          skip()
+          continue
+        }
+        let ok = false
+        try {
+          ok = await verifyDetached(
+            hello.did,
+            helloMessage(invite.room, hello.did, pairId),
+            base64ToU8(hello.sig),
+          )
+        } catch {
+          ok = false
+        }
         if (!ok) {
-          throw new Error("Could not verify the other device's identity signature.")
+          skip()
+          continue
+        }
+        // M3: a v2 peer's display name must be signed. An unsigned or
+        // mis-signed name from a v2 peer is a swapped name — skip it.
+        if (hello.channelVersion === 2) {
+          if (typeof hello.name !== 'string' || typeof hello.nameSig !== 'string') {
+            skip()
+            continue
+          }
+          let nameOk = false
+          try {
+            nameOk = await verifyDetached(
+              hello.did,
+              helloNameMessage(invite.room, hello.did, pairId, hello.name),
+              base64ToU8(hello.nameSig),
+            )
+          } catch {
+            nameOk = false
+          }
+          if (!nameOk) {
+            skip()
+            continue
+          }
         }
         const rec: FriendRecord = {
           did: hello.did,
@@ -334,10 +593,17 @@ export async function runPairing(
         // The friend record carries the pair secret: await the Keystore
         // flush so the pairing survives a kill right after it completes.
         await flushSecrets()
+        // M2: this invite is spent now (single-use mode only).
+        if (opts.singleUse) markInviteUsed(pairId, invite.room, hello.did, kv)
         return rec
       }
       if (Date.now() - t0 > timeoutMs) {
-        throw new Error('Pairing timed out — the other device never answered.')
+        throw new Error(
+          'Pairing timed out — the other device never answered.' +
+            (skippedCount > 0
+              ? ` (${skippedCount} unverifiable hello${skippedCount === 1 ? '' : 's'} ignored.)`
+              : ''),
+        )
       }
       await new Promise((r) => setTimeout(r, 400))
     }
@@ -458,6 +724,11 @@ export function disconnectFriendChannel(friendDid: string): void {
     provider.destroy()
     channelProviders.delete(friendDid)
   }
+}
+
+/** Whether this device currently holds a live provider for a friend's channel. */
+export function hasFriendChannelProvider(friendDid: string): boolean {
+  return channelProviders.has(friendDid)
 }
 
 /**

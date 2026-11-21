@@ -39,6 +39,7 @@ import {
   installFriendsDebugHooks,
   loadReceivedMap,
   republishIfShared,
+  sweepFriendsOnlyShares,
 } from './friends/service'
 import { loadVault } from './friends/shelf'
 import { listHubs } from './hubs/hubs'
@@ -188,6 +189,12 @@ export default function App() {
         await rejoinFriendChannels()
         await importReceivedShares(id).catch((e) =>
           console.warn('import received shares failed', e),
+        )
+        // M1-rel / M-N4: finish any interrupted unfriend, then sweep
+        // every friend's shelf so each holds only their own current
+        // shares. Best-effort: a failed sweep is logged, never fatal.
+        await sweepFriendsOnlyShares(id).catch((e) =>
+          console.warn('friends-only sweep failed', e),
         )
       } catch (e) {
         if (e instanceof IdentityDamagedError) {
