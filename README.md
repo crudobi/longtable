@@ -5,6 +5,38 @@ devices, friends are the sync network, and public recipes are DID-signed
 records anyone can verify. No platform account, no cloud service in the
 middle, no telemetry.
 
+## What works out of the box — and what needs a hub
+
+Installing from GitHub gets you a local cookbook. Creating, editing,
+deleting, importing, and backing up recipes all work offline, with no
+account and no server. The networked features do not work out of the
+box, and this release does not pretend otherwise:
+
+- **There is no public hub.** Longtable ships no production hub, and
+  none is promised. The built-in hub ("Local dev hub") points at
+  developer-only endpoints — signaling `wss://10.0.2.2:4444`, TURN
+  `10.0.2.2:3478`, AppView `http://localhost:3210`, PDS
+  `http://localhost:2583` (see `src/hubs/hubs.ts`, `DEFAULT_HUB`) —
+  and release builds ship no TURN credential for it. `10.0.2.2` is the
+  Android emulator's alias for its host machine: on a real phone these
+  addresses reach nothing.
+- **Until you configure a hub, invite-code pairing, friend sync over
+  signaling, publishing, and Discover do nothing.** There is no service
+  behind those addresses on a real phone. Local cooking is unaffected,
+  and pairing by hand ("Pair without a hub" in Friends) needs no
+  signaling server — though across NAT it still needs a STUN/TURN
+  server from a configured hub.
+- **To get the networked features, run a hub or use one someone you
+  trust runs.** One tarball, one config, one command — see
+  [hub/README.md](hub/README.md) — then add it in the app under Hubs.
+  A hub is rendezvous and indexing only: it can never read your
+  recipes, and switching hubs loses nothing.
+
+Install instructions for the GitHub release (APK, not AAB; checksum
+verification; what to expect from Android) are in
+[docs/install.md](docs/install.md). What data leaves the device, and
+when, is in [docs/privacy-policy.md](docs/privacy-policy.md).
+
 What works today:
 
 - **Cookbook** — create/edit/delete recipes with photos, fully offline.
@@ -21,10 +53,14 @@ What works today:
   the app says so, in those words, where you unfriend).
 - **Public publishing** — recipes marked public become signed
   `kitchen.longtable.recipe` ATProto records on your own PDS, searchable
-  by name and ingredients through any hub's AppView within seconds.
+  by name and ingredients through a configured hub's AppView within
+  seconds. Needs a configured hub and a PDS account — see "What works
+  out of the box" above.
 - **Hubs** — rendezvous/indexing only, never trusted with content.
   One tarball, one config, one command to run one; clients keep a hub
-  list and lose nothing when a hub dies or is switched.
+  list and lose nothing when a hub dies or is switched. No public hub
+  ships with the app — the built-in hub is a development placeholder
+  (see above).
 - **Backup & restore** — a readable recipe export (`.json`, through
   the app's own importer) and an encrypted full backup (`.ltbackup`:
   identity key, friends + pair secrets, key vault, shares, and all
@@ -42,17 +78,26 @@ What works today:
   The design keeps hub operating cost near-zero so "free forever" is
   credible.
 - **Deliberately easy to use but modular and developer-extensible.**
-  Zero-setup local mode (no identity needed until you publish/share),
+  Zero-setup local mode (cooking needs no identity and no server;
+  publishing and sharing need a configured hub — see above),
   clean module boundaries (storage / sync / identity / friends /
   publishing / hubs / importers), a versioned importer plugin API, and a
   documented public protocol third parties can build against.
 - **Anti-centralization built into the functionality, not just policy.**
   Anyone can run a hub; clients support multiple hubs and switch with
-  zero data loss; the app works hub-less; portable DIDs; public lexicon
-  schemas + a documented protocol so third-party clients are first-class.
+  zero data loss; local cooking and manual pairing work hub-less
+  (invite pairing, publishing, and Discover need a configured hub);
+  portable DIDs; public lexicon schemas + a documented protocol so
+  third-party clients are first-class.
 
 ## For developers
 
+- [docs/install.md](docs/install.md) — install the GitHub release on a
+  phone (APK sideload + checksum verification).
+- [docs/privacy-policy.md](docs/privacy-policy.md) — what data leaves
+  the device, and when; the app's privacy policy.
+- [docs/data-safety.md](docs/data-safety.md) — groundwork for a future
+  Play data-safety declaration (not a filed declaration).
 - [docs/](docs/README.md) — the developer documentation index.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 - [docs/architecture.md](docs/architecture.md) — the module map: every

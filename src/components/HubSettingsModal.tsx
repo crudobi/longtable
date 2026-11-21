@@ -106,6 +106,14 @@ export function HubSettingsModal({ onClose, onChanged }: Props) {
           recipes, friends, and identity live on this device — switching hubs
           loses nothing, and if a hub dies the others carry on.
         </p>
+        <p className="muted">
+          The built-in hub is a development placeholder: it points at a
+          developer&apos;s machine, not a public service, and the release
+          build carries no TURN credential for it. Until you add a hub you
+          (or someone you trust) runs, invite-code pairing, publishing,
+          and Discover do nothing. Pairing by hand (&ldquo;Pair without a
+          hub&rdquo;) and local cooking need no hub.
+        </p>
 
         <ul className="hub-list">
           {hubs.map((h) => (
