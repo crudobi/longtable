@@ -285,6 +285,15 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
                   >
                     <span className="recipe-card-title">{r.title}</span>
                     <span className="recipe-card-meta">{shortDid(r.did)}</span>
+                    {/* S10: search summaries are UNVERIFIED until opened
+                        (the summary alone cannot be signature-checked —
+                        see discover.ts), so every card says so plainly
+                        instead of implying the DID attribution is
+                        verified. Opening the card verifies the full
+                        record before anything is displayed. */}
+                    <span className="recipe-card-meta" data-testid="discover-result-unverified">
+                      Unverified — open to verify
+                    </span>
                     {r.ingredients.length > 0 && (
                       <span className="recipe-card-meta">
                         {r.ingredients.slice(0, 3).join(', ')}

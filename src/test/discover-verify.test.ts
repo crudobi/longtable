@@ -287,3 +287,30 @@ describe('search summaries are unverified until opened', () => {
     ).rejects.toBeInstanceOf(RecipeVerificationError)
   })
 })
+
+describe('search summaries carry longtableId (S10)', () => {
+  it('searchAppView passes the summary longtableId through', async () => {
+    const identity = await identityFromSeed(SEED)
+    const served = await signedServedRecord(identity)
+    const summary = {
+      did: ACCT,
+      rkey: 'recipe-1',
+      name: 'Tomato Soup',
+      ingredients: ['tomatoes', 'salt'],
+      tags: [],
+      updatedAt: '2026-01-02T10:00:00.000Z',
+      longtableId: 'lt-recipe-1',
+      deviceDid: identity.did,
+      deviceSignature: served.deviceSignature,
+      deviceKey: served.deviceKey,
+    }
+    const fetchFn = async (): Promise<Response> =>
+      new Response(JSON.stringify({ results: [summary] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    const results = await searchAppView(APPVIEW, { q: 'soup' }, fetchFn)
+    expect(results).toHaveLength(1)
+    expect(results[0].longtableId).toBe('lt-recipe-1')
+  })
+})

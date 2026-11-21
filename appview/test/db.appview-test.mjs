@@ -142,3 +142,89 @@ describe('RecipeIndex device-signature fields', () => {
     expect(index.upsert(withSig)).toBe(false)
   })
 })
+
+describe('RecipeIndex summaries carry longtableId (S10)', () => {
+  let index
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+  })
+  afterEach(() => index.close())
+
+  it('search and byAuthor summaries include the record longtableId', () => {
+    const device = makeDevice()
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/signed`,
+      did: DID,
+      rkey: 'signed',
+      cid: 'cid-signed-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'Signed Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        longtableId: 'lt-signed',
+        createdAt: '2026-10-12T00:00:00.000Z',
+        deviceDid: device.deviceDid,
+        deviceSignature: 'c2lnbmF0dXJl',
+      },
+      deviceKey: device.devicePublicKey,
+    })
+    expect(index.search({ q: 'Signed Soup' })[0].longtableId).toBe('lt-signed')
+    expect(index.byAuthor(DID)[0].longtableId).toBe('lt-signed')
+    // A record with no longtableId at all serves null, not a crash.
+    index.upsert({
+      uri: `at://${DID}/kitchen.longtable.recipe/noid`,
+      did: DID,
+      rkey: 'noid',
+      cid: 'cid-noid-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'No Id Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        createdAt: '2026-10-12T00:00:00.000Z',
+      },
+    })
+    expect(index.search({ q: 'No Id Soup' })[0].longtableId).toBeNull()
+  })
+})
+
+describe('RecipeIndex DID listing + unverified count (N1 / S2)', () => {
+  let index
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+  })
+  afterEach(() => index.close())
+
+  it('listDids returns each distinct DID once; countUnverified counts NULL-signature rows', () => {
+    const other = 'did:plc:otherauthor'
+    index.upsert(recipe('pancakes', 'Fluffy Pancakes', ['1 egg']))
+    index.upsert(recipe('borscht', 'AppView Borscht', ['3 beets', '1 onion']))
+    index.upsert({
+      uri: `at://${other}/kitchen.longtable.recipe/signed`,
+      did: other,
+      rkey: 'signed',
+      cid: 'cid-signed-v1',
+      record: {
+        $type: 'kitchen.longtable.recipe',
+        name: 'Signed Soup',
+        ingredients: ['1 egg'],
+        instructions: ['Cook it.'],
+        longtableId: 'lt-signed',
+        createdAt: '2026-10-12T00:00:00.000Z',
+        deviceDid: 'did:key:zFakeDevice',
+        deviceSignature: 'c2lnbmF0dXJl',
+      },
+      deviceKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+    })
+    expect(index.listDids().sort()).toEqual([DID, other].sort())
+    // The two unsigned rows are unverified; the signed row is not.
+    expect(index.countUnverified()).toBe(2)
+    expect(index.count()).toBe(3)
+  })
+
+  it('listDids is empty and countUnverified is 0 on an empty index', () => {
+    expect(index.listDids()).toEqual([])
+    expect(index.countUnverified()).toBe(0)
+  })
+})

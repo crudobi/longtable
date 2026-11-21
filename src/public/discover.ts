@@ -35,10 +35,14 @@
  *   could substitute its own bound key is outside what the client can
  *   detect — that is the AppView-ingest half of C2, not this one.
  *
- *   Search summaries carry deviceDid / deviceSignature / deviceKey too,
- *   but no longtableId, so they CANNOT be verified from the summary alone
- *   — verification happens when the full record is opened. List items are
- *   therefore UNVERIFIED until opened: never badge them as verified.
+ *   Search summaries carry deviceDid / deviceSignature / deviceKey and
+ *   longtableId, but they still CANNOT be verified from the summary alone
+ *   — the canonical hash needs description, instructions, prep/cook
+ *   minutes, yield and images, which the summary does not carry, so
+ *   verifying would mean fetching every full record behind a search.
+ *   List items are therefore UNVERIFIED until opened and the UI says so
+ *   explicitly ("Unverified — open to verify"); verification happens
+ *   when the full record is opened. Never badge a list item as verified.
  */
 import sodium from 'libsodium-wrappers'
 import type { RecipeInput } from '../types'
@@ -63,9 +67,16 @@ export interface PublicSearchResult {
   ingredients: string[]
   description?: string
   /**
-   * The AppView serves these for every summary, but a summary carries no
-   * longtableId, so they CANNOT be verified here — the record is verified
-   * only when the full record is opened (see fetchPublicRecipe). Treat
+   * Carried through from the AppView summary (S10) so the open path
+   * and any future summary-level check have the record's identity.
+   * It does NOT make the summary verifiable on its own — the canonical
+   * hash needs the full record (see the header comment).
+   */
+  longtableId?: string
+  /**
+   * The AppView serves these for every summary, but a summary cannot
+   * be verified from its own fields — the record is verified only
+   * when the full record is opened (see fetchPublicRecipe). Treat
    * list items as UNVERIFIED; never badge them as verified.
    */
   deviceDid?: string
@@ -164,6 +175,12 @@ function normalizeResult(raw: unknown): PublicSearchResult | null {
     title,
     ingredients,
     description,
+    // Carried through (S10) — the summary's longtableId, for the open
+    // path. It does not make the summary itself verifiable.
+    longtableId:
+      (typeof o.longtableId === 'string' && o.longtableId) ||
+      (typeof rec.longtableId === 'string' && rec.longtableId) ||
+      undefined,
     // Carried through only — summaries are UNVERIFIED until opened (see
     // the PublicSearchResult comment). Never badge a list item verified.
     deviceDid:

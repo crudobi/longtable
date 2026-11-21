@@ -86,6 +86,12 @@ function rowToSummary(row) {
     ingredients: JSON.parse(row.ingredients),
     tags: JSON.parse(row.tags),
     updatedAt: row.updated_at,
+    // Served so clients can carry the record's identity through search
+    // results (S10). A summary still cannot be verified on its own —
+    // the canonical hash needs the full record — so the client marks
+    // list items unverified until opened; the id is here for the
+    // open path and any future summary-level check.
+    longtableId: row.longtable_id,
     deviceDid: row.device_did,
     deviceSignature: row.device_signature,
     deviceKey: row.device_key,
@@ -256,6 +262,26 @@ export class RecipeIndex {
 
   listUrisByDid(did) {
     return this.db.prepare('SELECT uri FROM recipes WHERE did = ?').all(did).map((r) => r.uri)
+  }
+
+  /** Every distinct author DID in the index — the periodic/startup reconcile sweep re-verifies each one (N1/S2). */
+  listDids() {
+    return this.db.prepare('SELECT DISTINCT did FROM recipes').all().map((r) => r.did)
+  }
+
+  /**
+   * Rows that predate device-signature verification (or were never
+   * re-verified): at least one signature field is NULL. The HTTP layer
+   * excludes these from serving until a reconcile re-verifies them (S2);
+   * they stay in the store so the sweep can find their DID again.
+   */
+  countUnverified() {
+    const row = this.db
+      .prepare(
+        'SELECT COUNT(*) AS n FROM recipes WHERE device_did IS NULL OR device_signature IS NULL OR device_key IS NULL',
+      )
+      .get()
+    return Number(row.n)
   }
 
   count() {
