@@ -208,10 +208,13 @@ Manual reset (sanctioned fallback, only if the tag watch ever
 misses a tag): reset `last-processed` to the parent of HEAD so the
 next trigger re-runs HEAD, then start the service (or wait for the
 next 10-minute timer tick). Do NOT touch `last-processed-tags` —
-the re-run records the tag set on success.
+the re-run records the tag set on success. `<repo>` is the Longtable
+checkout, `<host root>/ops/longtable-ci` is the ops CI state dir;
+the exact commands with real paths live in the ops-side copy kept
+with the CI state (`tagging-ops.md`).
 
 ```bash
-git -C /store/muscle/code/longtable rev-parse HEAD^ > /store/muscle/ops/longtable-ci/last-processed
+git -C <repo> rev-parse HEAD^ > <host root>/ops/longtable-ci/last-processed
 sudo systemctl start longtable-ci.service
 ```
 
@@ -221,7 +224,7 @@ the next tick does not re-run (and fail at `github-release`, which
 refuses to overwrite the existing release):
 
 ```bash
-git -C /store/muscle/code/longtable tag --points-at HEAD | sort > /store/muscle/ops/longtable-ci/last-processed-tags
+git -C <repo> tag --points-at HEAD | sort > <host root>/ops/longtable-ci/last-processed-tags
 ```
 
 ## Signed tags
@@ -244,8 +247,8 @@ this project as of Wave 6C; do not invent or silently create one):
 ```bash
 gpg --full-generate-key        # RSA or ed25519, signing-capable; no expiry or a dated one, your call
 git config --global user.signingkey <fingerprint>   # gpg --list-secret-keys --keyid-format long
-gpg --armor --export <fingerprint> > /store/muscle/ops/longtable-ci/tag-signing-key.pub
-chmod 644 /store/muscle/ops/longtable-ci/tag-signing-key.pub
+gpg --armor --export <fingerprint> > <host root>/ops/longtable-ci/tag-signing-key.pub
+chmod 644 <host root>/ops/longtable-ci/tag-signing-key.pub
 git tag -s v0.2.3 -m "Longtable v0.2.3"   # sign with the pinned key
 git verify-tag v0.2.3                      # sanity check before pushing
 ```
