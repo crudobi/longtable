@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { RecipeInput } from '../types'
+import type { RecipeInput, SourceTimestamps } from '../types'
 import { MAX_IMPORT_FILE_BYTES } from '../importers/contract'
 import type { ImporterInput, RecipeImporter } from '../importers/contract'
 import {
@@ -13,8 +13,13 @@ import { friendlyError } from '../friendlyError'
 interface Props {
   onClose: () => void
   /** Create the validated recipes in the cookbook. Called only after the
-   *  whole import run validated — a failed run imports nothing. */
-  onImported: (recipes: RecipeInput[]) => Promise<void> | void
+   *  whole import run validated — a failed run imports nothing. The
+   *  per-recipe source timestamps (M24) ride along so an import of a
+   *  backup keeps its original times. */
+  onImported: (
+    recipes: RecipeInput[],
+    timestamps?: (SourceTimestamps | undefined)[],
+  ) => Promise<void> | void
 }
 
 /**
@@ -111,8 +116,12 @@ export function ImportPanel({ onClose, onImported }: Props) {
     setWarnings([])
     setError(null)
     try {
-      const { recipes, warnings: runWarnings } = await runImporter(selected.id, input)
-      await onImported(recipes)
+      const {
+        recipes,
+        warnings: runWarnings,
+        timestamps,
+      } = await runImporter(selected.id, input)
+      await onImported(recipes, timestamps)
       setResult(
         (recipes.length === 1
           ? `Imported “${recipes[0].title}”.`

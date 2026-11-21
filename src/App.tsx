@@ -80,7 +80,7 @@ import {
 } from './public/atproto'
 import { getPublication, loadPublications, publishRecipe, unpublishRecipe } from './public/publish'
 import { searchAppView } from './public/discover'
-import type { Recipe, RecipeInput, RecipeSummary, VisibilityTier } from './types'
+import type { Recipe, RecipeInput, RecipeSummary, SourceTimestamps, VisibilityTier } from './types'
 
 type View =
   | { name: 'list' }
@@ -314,6 +314,17 @@ export default function App() {
         photos: input.photos,
         prepMinutes: input.prepMinutes,
         cookMinutes: input.cookMinutes,
+        // M22 (PATCH): the API's merged patch can carry descriptive
+        // fields the form never edits. They ride through only when
+        // present in the input object — the form's input never has
+        // these keys, so an in-app edit still leaves them untouched.
+        // (Also fixes PUT: a descriptive field sent through the API
+        // used to be silently dropped by this six-field patch.)
+        ...('description' in input ? { description: input.description } : {}),
+        ...('recipeYield' in input ? { recipeYield: input.recipeYield } : {}),
+        ...('tags' in input ? { tags: input.tags } : {}),
+        ...('author' in input ? { author: input.author } : {}),
+        ...('sourceUrl' in input ? { sourceUrl: input.sourceUrl } : {}),
       })
       // If this recipe is shared friends-only, republish the new version
       // (encrypted, same key) to its authorized friends.
@@ -592,11 +603,16 @@ export default function App() {
    * the panel reports the imported titles.
    */
   const handleImportRecipes = useCallback(
-    async (inputs: RecipeInput[]) => {
+    async (
+      inputs: RecipeInput[],
+      timestamps?: (SourceTimestamps | undefined)[],
+    ) => {
       const repo = getRepo()
       const index = await getOrCreateIndex(repo)
       try {
-        await createRecipesAtomic(repo, index, inputs)
+        // M24: source timestamps ride through, so an import of a
+        // backup keeps its original times instead of "now".
+        await createRecipesAtomic(repo, index, inputs, timestamps)
       } catch (e) {
         setError(friendlyError(e))
         return

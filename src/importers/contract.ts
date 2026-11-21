@@ -11,7 +11,7 @@
  *
  * Developer documentation: docs/importers.md.
  */
-import type { RecipeInput } from '../types'
+import type { RecipeInput, RecipePatch } from '../types'
 
 /** The plugin API version this app implements. Importers must declare it. */
 export const IMPORTER_API_VERSION = 1
@@ -78,6 +78,16 @@ export interface ImportedRecipe {
   author?: string
   /** The page or file the recipe came from, when known. */
   sourceUrl?: string
+  /**
+   * Source timestamps, when the source records them (M24: a
+   * longtable-json export carries `createdAt`/`updatedAt` per recipe).
+   * Import-time only, like `imageCids` and `warnings`: `runImporter`
+   * validates them and hands them to the store separately, so a backup
+   * restored through import keeps its original times instead of being
+   * re-stamped "now". Never stored by validation — see below.
+   */
+  createdAt?: string
+  updatedAt?: string
   /**
    * Photo CIDs the importer could not turn into bytes itself (M-N6: a
    * saved `kitchen.longtable.recipe` record carries photos as
@@ -196,6 +206,19 @@ function cleanMinutes(value: unknown, field: string, source: string): number | u
     throw new ImporterError(`${source}: "${field}" must be a number of minutes (0 or more).`)
   }
   return Math.round(n)
+}
+
+/**
+ * True when `value` is a string holding a parseable ISO-8601 date.
+ * Used for source timestamps (M24) at the API and importer edges:
+ * an unparseable timestamp is a data error, not something to store.
+ */
+export function isValidIsoTimestamp(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim() !== '' &&
+    Number.isFinite(Date.parse(value))
+  )
 }
 
 /** Approximate decoded byte size of a data URL (base64 inflates by 4/3). */
@@ -392,6 +415,103 @@ export function validateImportedRecipe(
     ...(author ? { author } : {}),
     ...(sourceUrl ? { sourceUrl } : {}),
   }
+}
+
+/**
+ * Validate a partial recipe patch (M22: PATCH /v1/recipes/<id>) and
+ * normalize it to the app's `RecipePatch`. Only fields present in the
+ * body are validated; absent fields are untouched by the store.
+ * `null` on an optional field clears it (prepMinutes, cookMinutes,
+ * description, recipeYield, tags, author, sourceUrl, photos → empty);
+ * `null` on title/ingredients/steps is rejected — send [] to empty a
+ * list. Throws `ImporterError` with a plain-language message, like
+ * validateImportedRecipe. Visibility is NOT validated here: the router
+ * strips it out and runs the tier flow separately, so a patch can
+ * never mark a tier directly without the byte-path flow.
+ */
+export function validateRecipePatch(
+  raw: unknown,
+  source: string,
+): RecipePatch {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ImporterError(`${source}: not a patch object.`)
+  }
+  const r = raw as Record<string, unknown>
+  const patch: RecipePatch = {}
+  if ('title' in r) {
+    if (r.title === null) {
+      throw new ImporterError(`${source}: "title" must be text.`)
+    }
+    const title = typeof r.title === 'string' ? r.title.trim() : ''
+    if (!title) {
+      throw new ImporterError(`${source}: missing a title.`)
+    }
+    if (title.length > MAX_TITLE) {
+      throw new ImporterError(
+        `${source}: the title is too long (${title.length} characters).`,
+      )
+    }
+    patch.title = title
+  }
+  if ('ingredients' in r) {
+    if (r.ingredients === null) {
+      throw new ImporterError(`${source}: "ingredients" must be a list.`)
+    }
+    patch.ingredients = cleanStringList(r.ingredients, 'ingredients', source)
+  }
+  if ('steps' in r) {
+    if (r.steps === null) {
+      throw new ImporterError(`${source}: "steps" must be a list.`)
+    }
+    patch.steps = cleanStringList(r.steps, 'steps', source)
+  }
+  if ('photos' in r) {
+    // null clears the photos; otherwise the same shape rule as a full write.
+    patch.photos = r.photos === null ? [] : cleanPhotos(r.photos, source)
+  }
+  if ('prepMinutes' in r) {
+    patch.prepMinutes =
+      r.prepMinutes === null
+        ? undefined
+        : cleanMinutes(r.prepMinutes, 'prepMinutes', source)
+  }
+  if ('cookMinutes' in r) {
+    patch.cookMinutes =
+      r.cookMinutes === null
+        ? undefined
+        : cleanMinutes(r.cookMinutes, 'cookMinutes', source)
+  }
+  if ('description' in r) {
+    patch.description =
+      r.description === null
+        ? undefined
+        : cleanText(
+            r.description,
+            'description',
+            source,
+            MAX_IMPORT_DESCRIPTION_CHARS,
+          )
+  }
+  if ('recipeYield' in r) {
+    patch.recipeYield =
+      r.recipeYield === null
+        ? undefined
+        : cleanText(r.recipeYield, 'recipeYield', source, MAX_IMPORT_YIELD_CHARS)
+  }
+  if ('tags' in r) {
+    patch.tags = r.tags === null ? undefined : cleanTags(r.tags, source)
+  }
+  if ('author' in r) {
+    patch.author =
+      r.author === null
+        ? undefined
+        : cleanText(r.author, 'author', source, MAX_IMPORT_AUTHOR_CHARS)
+  }
+  if ('sourceUrl' in r) {
+    patch.sourceUrl =
+      r.sourceUrl === null ? undefined : cleanSourceUrl(r.sourceUrl)
+  }
+  return patch
 }
 
 /**

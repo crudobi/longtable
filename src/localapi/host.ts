@@ -26,15 +26,30 @@ import {
 import { getOrCreateIdentity } from '../identity/identity'
 import { listFriends } from '../friends/friends'
 import { friendlyError } from '../friendlyError'
-import type { Recipe, RecipeInput, VisibilityTier } from '../types'
+import { getPublication } from '../public/publish'
+import type {
+  Recipe,
+  RecipeInput,
+  RecipePatch,
+  SourceTimestamps,
+  VisibilityTier,
+} from '../types'
 
 /** An error carrying the HTTP status the router should answer with. */
 export class LocalApiError extends Error {
   readonly status: number
-  constructor(status: number, message: string) {
+  /** Structured extra body fields (M23: a failed visibility flip
+   *  reports what actually changed under `changed`). */
+  readonly details?: Record<string, unknown>
+  constructor(
+    status: number,
+    message: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message)
     this.name = 'LocalApiError'
     this.status = status
+    this.details = details
   }
 }
 
@@ -51,7 +66,23 @@ export interface ApiRecipe extends ApiRecipeSummary {
   prepMinutes?: number
   cookMinutes?: number
   photos: string[]
+  description?: string
+  recipeYield?: string
+  tags?: string[]
+  author?: string
+  sourceUrl?: string
   createdAt: string
+}
+
+/** Whether a public record is recorded for a recipe (M23). */
+export type PublicRecordState = 'listed' | 'not listed' | 'unknown'
+
+/** What a visibility move returns: the flow's warnings (H13) plus
+ *  whether a public record is recorded afterwards (M23), so the
+ *  router can say what a part-way flip actually left behind. */
+export interface VisibilityChange {
+  warnings: string[]
+  publicRecord: PublicRecordState
 }
 
 export interface LocalApiHost {
@@ -59,9 +90,22 @@ export interface LocalApiHost {
   listRecipes(): Promise<ApiRecipeSummary[]>
   /** Full recipe by id, or null when the id is unknown. */
   getRecipe(id: string): Promise<ApiRecipe | null>
-  createRecipe(input: RecipeInput): Promise<{ id: string }>
+  /** Create, optionally with the source's own timestamps (M24: a
+   *  backup restore keeps its original created/updated times). */
+  createRecipe(
+    input: RecipeInput,
+    timestamps?: SourceTimestamps,
+  ): Promise<{ id: string }>
   /** Full content update (router has already validated the shape). */
   updateRecipe(id: string, input: RecipeInput): Promise<void>
+  /**
+   * Partial content update (M22: PATCH). Only the fields present in
+   * `patch` change; an explicit `undefined` clears an optional field.
+   * Visibility is never applied here — the router runs the tier flow
+   * (setVisibility) for it. Runs the UI's update flow when one is
+   * wired (friends / public republish), else the bare store update.
+   */
+  patchRecipe(id: string, patch: RecipePatch): Promise<void>
   /**
    * Delete with the UI's side paths. Returns the flow's warnings (H13:
    * remote copies that could not be taken down, the tombstone recall
@@ -74,10 +118,21 @@ export interface LocalApiHost {
    * Move a recipe between the 'private' and 'public' tiers through the
    * app's byte-path flow. 'friends-only' is deliberately NOT offered:
    * it needs a person picking which friends, in the app. Returns the
-   * flow's warnings (H13), as for deleteRecipe.
+   * flow's warnings (H13), as for deleteRecipe, plus whether a public
+   * record is recorded afterwards (M23). On failure throws a 502
+   * whose `details.changed` reports the recipe as it actually stands
+   * now — a flip that fails part-way must not hide what moved.
    */
-  setVisibility(id: string, tier: 'private' | 'public'): Promise<{ warnings: string[] }>
-  importRecipes(inputs: RecipeInput[]): Promise<string[]>
+  setVisibility(
+    id: string,
+    tier: 'private' | 'public',
+  ): Promise<VisibilityChange>
+  /** Create the validated recipes, optionally with per-recipe source
+   *  timestamps (M24), parallel to `inputs`. */
+  importRecipes(
+    inputs: RecipeInput[],
+    timestamps?: (SourceTimestamps | undefined)[],
+  ): Promise<string[]>
   /** Names + DIDs only — never pair secrets or shelf internals. */
   listFriends(): { name: string; did: string }[]
 }
@@ -124,9 +179,34 @@ function toApiRecipe(id: string, recipe: Recipe): ApiRecipe {
       ? { cookMinutes: recipe.cookMinutes }
       : {}),
     photos: recipe.photos,
+    // Descriptive fields the store keeps (M24 / M22): the API used to
+    // drop them on read, so a PATCH to one was unobservable over the
+    // wire. They ride through when set, like the edit form's fields.
+    ...(recipe.description !== undefined
+      ? { description: recipe.description }
+      : {}),
+    ...(recipe.recipeYield !== undefined
+      ? { recipeYield: recipe.recipeYield }
+      : {}),
+    ...(recipe.tags !== undefined ? { tags: recipe.tags } : {}),
+    ...(recipe.author !== undefined ? { author: recipe.author } : {}),
+    ...(recipe.sourceUrl !== undefined ? { sourceUrl: recipe.sourceUrl } : {}),
     visibility: recipe.visibility ?? 'private',
     createdAt: recipe.createdAt,
     updatedAt: recipe.updatedAt,
+  }
+}
+
+/**
+ * Whether a public record is recorded for this recipe (M23): read
+ * from the publications registry. 'unknown' when the registry cannot
+ * be read here (no localStorage in this environment).
+ */
+function readPublicRecord(id: string): PublicRecordState {
+  try {
+    return getPublication(id) ? 'listed' : 'not listed'
+  } catch {
+    return 'unknown'
   }
 }
 
@@ -170,9 +250,19 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
       return recipe ? toApiRecipe(id, recipe) : null
     },
 
-    async createRecipe(input) {
+    async createRecipe(input, timestamps) {
       const idx = await index()
-      const summary = await storeCreateRecipe(repo(), idx, input)
+      // M24: a lone updatedAt stands in for createdAt, so a source
+      // that only kept one time still restores coherently.
+      const stamp =
+        timestamps?.createdAt !== undefined ||
+        timestamps?.updatedAt !== undefined
+          ? {
+              createdAt: timestamps.createdAt ?? timestamps.updatedAt,
+              updatedAt: timestamps.updatedAt ?? timestamps.createdAt,
+            }
+          : undefined
+      const summary = await storeCreateRecipe(repo(), idx, input, stamp)
       hooks.onChanged?.()
       return { id: summary.id }
     },
@@ -190,6 +280,52 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
           prepMinutes: input.prepMinutes,
           cookMinutes: input.cookMinutes,
         })
+      }
+      hooks.onChanged?.()
+    },
+
+    async patchRecipe(id, patch) {
+      // Visibility is never applied here: the router runs the tier
+      // flow (setVisibility) for it, so a patch can never mark a tier
+      // directly without the byte-path flow.
+      const contentPatch: RecipePatch = { ...patch }
+      delete contentPatch.visibility
+      if (hooks.applyUpdate) {
+        // The UI's update flow takes a full input, so merge the patch
+        // over the stored recipe first — the flow then republishes to
+        // friends / the PDS exactly as an in-app edit would. Fields
+        // the patch does not mention keep their stored values; an
+        // explicit `undefined` in the patch clears the field (the
+        // merged object carries the key, so the flow's `'field' in
+        // input` checks see the clear).
+        const existing = await host.getRecipe(id)
+        if (!existing) {
+          throw new LocalApiError(
+            404,
+            'No recipe with that id exists in this cookbook.',
+          )
+        }
+        const merged: RecipeInput = {
+          title: existing.title,
+          ingredients: existing.ingredients,
+          steps: existing.steps,
+          photos: existing.photos,
+          ...(existing.prepMinutes !== undefined
+            ? { prepMinutes: existing.prepMinutes }
+            : {}),
+          ...(existing.cookMinutes !== undefined
+            ? { cookMinutes: existing.cookMinutes }
+            : {}),
+        }
+        for (const [key, value] of Object.entries(contentPatch)) {
+          // Assign even when undefined: the key's presence is the
+          // "clear this field" signal for the UI flow's `in` checks.
+          ;(merged as Record<string, unknown>)[key] = value
+        }
+        await hooks.applyUpdate(id, merged)
+      } else {
+        const idx = await index()
+        await storeUpdateRecipe(repo(), idx, id, contentPatch)
       }
       hooks.onChanged?.()
     },
@@ -226,21 +362,54 @@ export function createLocalApiHost(hooks: LocalApiHostHooks = {}): LocalApiHost 
       try {
         const warnings = await hooks.applyVisibility(id, recipe, tier)
         hooks.onChanged?.()
-        return { warnings }
+        return { warnings, publicRecord: readPublicRecord(id) }
       } catch (e) {
         if (e instanceof LocalApiError) throw e
-        throw new LocalApiError(502, friendlyError(e, 'the publishing server'))
+        // M23: the flip may have moved some bytes before failing — a
+        // publish can land while the local tier-mark fails, or an
+        // unpublish can land while the tier-mark fails. Report the
+        // state the recipe is actually in now (tier, updatedAt, and
+        // whether a public record is recorded for it) instead of a
+        // bare error: the caller can then retry the same call
+        // idempotently, or clean up the side that moved. The cause
+        // stays in the device log.
+        console.warn('[longtable] localhost API visibility flip failed part-way', e)
+        const current = await host.getRecipe(id).catch(() => null)
+        const publicRecord = readPublicRecord(id)
+        const changed = current
+          ? {
+              id,
+              visibility: current.visibility,
+              updatedAt: current.updatedAt,
+              publicRecord,
+            }
+          : undefined
+        const state = current
+          ? ` The recipe is still ${current.visibility} on this device` +
+            (publicRecord === 'listed'
+              ? ' and the public copy is still listed.'
+              : publicRecord === 'not listed'
+                ? ' and no public copy is recorded for it.'
+                : '.')
+          : ''
+        const reason = friendlyError(e, 'the publishing server')
+        const reasonSentence = reason.endsWith('.') ? reason : `${reason}.`
+        throw new LocalApiError(
+          502,
+          `${reasonSentence}${state}`,
+          changed ? { changed } : undefined,
+        )
       }
     },
 
-    async importRecipes(inputs) {
+    async importRecipes(inputs, timestamps) {
       const idx = await index()
       // H11: atomic, best-effort — a mid-loop store failure rolls back
       // what was already created and says so, instead of leaving a
       // partial import behind a "nothing was changed" 500.
       let ids: string[]
       try {
-        ids = await createRecipesAtomic(repo(), idx, inputs)
+        ids = await createRecipesAtomic(repo(), idx, inputs, timestamps)
       } catch (e) {
         throw new LocalApiError(
           500,

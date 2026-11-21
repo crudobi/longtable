@@ -123,8 +123,9 @@ A missing or wrong token gets **401** with an explanatory error.
 | GET | `/v1/recipes/<id>` | One full recipe. |
 | POST | `/v1/recipes` | Create a recipe. |
 | PUT | `/v1/recipes/<id>` | Replace a recipe's content (full update). |
+| PATCH | `/v1/recipes/<id>` | Change only the fields you send (partial update). |
 | DELETE | `/v1/recipes/<id>` | Delete a recipe (and unpublish/unshare it first). |
-| POST | `/v1/import` | Run an importer over text; creates what it finds. |
+| POST | `/v1/import` | Run an importer over text or a page URL; creates what it finds. |
 | GET | `/v1/friends` | Your friends' names + DIDs (read-only). |
 
 #### `GET /v1/health`
@@ -217,10 +218,52 @@ different from the current tier, the tier change runs through the
 app's real visibility flow (publishing/unpublishing included).
 Flipping a recipe to `public` needs `"confirm": true` in the body,
 as for creating one public. Answers **200**
-`{ "id": "…", "visibility": "…", "warnings": [] }`. Unknown id → 404.
+`{ "id": "…", "visibility": "…", "updatedAt": "…", "warnings": [] }`.
+Unknown id → 404.
+
+`PUT` also accepts an optional `"expectedUpdatedAt"` (see
+[`PATCH`](#patch-v1recipesid)): when it does not match the recipe's
+current `updatedAt`, the call is refused with **412** and nothing is
+written.
 
 Editing a recipe that is already public or shared republishes the new
 version exactly as an in-app edit would.
+
+#### `PATCH /v1/recipes/<id>`
+
+Body: a *partial* update — only the fields you send change, and
+everything else keeps its stored value. Send a field with `null` to
+clear it (`"prepMinutes": null` removes the time;
+`"description": null` removes the description; `"photos": null`
+empties the photos). An unknown field is rejected with **400** —
+a silently ignored field in a patch is a lost update by another name.
+
+```json
+{ "title": "Tomato Soup v2", "prepMinutes": null }
+```
+
+If the body carries a `visibility` different from the current tier,
+the tier change runs through the app's real visibility flow, exactly
+as for `PUT` (including the `"confirm": true` requirement for going
+public). Answers **200**
+`{ "id": "…", "visibility": "…", "updatedAt": "…", "warnings": [] }`.
+Unknown id → 404. A body with nothing to change is **400**.
+
+**Lost-update guard.** `GET` a recipe and you get its `updatedAt` —
+that value is the recipe's version. Send it back as
+`"expectedUpdatedAt"` and the patch (or `PUT`) only lands if the
+recipe has not changed since you read it:
+
+```json
+{ "title": "Tomato Soup v3", "expectedUpdatedAt": "2026-11-21T03:00:00.000Z" }
+```
+
+Two writers racing the same recipe: the first one's write lands and
+refreshes `updatedAt`; the second one's precondition no longer
+matches, so it is refused with **412** and nothing is overwritten.
+Re-read the recipe and retry against the new version. Without
+`expectedUpdatedAt` the write lands unguarded, as before — the guard
+is opt-in, so older scripts keep working.
 
 #### `DELETE /v1/recipes/<id>`
 
@@ -239,11 +282,17 @@ devices next sync.
 #### `POST /v1/import`
 
 Runs one of the app's registered importers (the same Importer API v1
-importers the Import panel uses) over source text:
+importers the Import panel uses) over source text — or, for the URL
+importer, over a page URL:
 
 ```json
 { "importerId": "longtable-json", "text": "{ \"title\": \"…\", … }" }
+{ "importerId": "web-page", "url": "https://example.com/tomato-soup" }
 ```
+
+Send either `"text"` or `"url"`, not both. An importer that cannot
+use a URL source (only `web-page` accepts one) is refused with
+**422**.
 
 Registered importers that accept text input include `longtable-json`
 (Longtable/JSON recipes), `mealie-json` (a Mealie `recipe.json`
@@ -256,8 +305,12 @@ recipe fails midway, the recipes already created are deleted again
 where possible, and the **500** error names the failing recipe and
 whether the rollback held or left stranded recipes behind. There is no
 transaction around the whole import; a 500 after a partial import
-means "check the recipe list", not "nothing changed". On success,
-**201**:
+means "check the recipe list", not "nothing changed". Source timestamps
+are kept: a recipe that records `createdAt`/`updatedAt` (a Longtable
+export does) is created with those times, so restoring a backup
+through the API is faithful — the recipes do not all come back stamped
+with the import time. An unparseable timestamp fails the whole import
+with **422**. On success, **201**:
 
 ```json
 { "importer": "longtable-json", "imported": ["<id>", …], "count": 1, "warnings": [] }
@@ -286,8 +339,18 @@ Creates and updates use exactly the shape an
 | `cookMinutes` | number | Optional, ≥ 0. |
 | `photos` | string[] | Optional. Only `data:image/…` and `http(s)://` entries are kept. |
 | `visibility` | string | Optional on writes; see below. |
+| `description` | string | Optional. |
+| `recipeYield` | string | Optional, e.g. "4 servings". |
+| `tags` | string[] | Optional. |
+| `author` | string | Optional. |
+| `sourceUrl` | string | Optional, `http(s)://` only. |
+| `createdAt` | string | Optional on create; an ISO-8601 date the recipe keeps (a restore). |
+| `updatedAt` | string | Optional on create; an ISO-8601 date the recipe keeps (a restore). |
 
 Validation failures are **422** with a message naming the field.
+A `createdAt`/`updatedAt` that is not a parseable date is **400**.
+`PATCH` bodies use the same field rules, except only the fields
+present change — see [`PATCH`](#patch-v1recipesid).
 
 ### Visibility rules
 
@@ -316,9 +379,10 @@ Validation failures are **422** with a message naming the field.
 | 404 | No such recipe id, or no such endpoint. |
 | 405 | That method isn't supported for that path. |
 | 413 | Request body over 16 MB. |
+| 412 | The recipe changed since you read it: `expectedUpdatedAt` no longer matches. Nothing was written; re-read and retry. |
 | 422 | Well-formed but not allowed: recipe validation failed, a tier can't be honored (friends-only; public without sign-in), a destructive call arrived without `"confirm": true`, or an import found nothing valid. |
 | 500 | Something went wrong on the device while handling that request. Some changes may already have been applied — check the recipe list before trying again. |
-| 502 | A visibility change failed at the publishing server. The message says what the server said, in plain language. |
+| 502 | A visibility change failed at the publishing server. The message says what the server said, in plain language. The body also carries a `changed` object — `{ "id": "…", "visibility": "…", "updatedAt": "…", "publicRecord": "listed" \| "not listed" \| "unknown" }` — the recipe as it actually stands now, so you can see what moved before the failure (a publish that landed while the local tier did not change, or an unpublish that landed while the tier did not). |
 | 503 | The app is still starting up, or has no device identity yet. Try again in a moment. |
 | 504 | The app didn't answer in time — it may be suspended in the background. Bring Longtable to the front and retry. |
 
@@ -344,6 +408,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"title":"Tomato Soup","ingredients":["4 tomatoes"],"steps":["Simmer."]}' \
   $LT/v1/recipes
+
+# Change just the title, guarded against a newer version:
+curl -X PATCH -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Tomato Soup v2","expectedUpdatedAt":"2026-11-21T03:00:00.000Z"}' \
+  $LT/v1/recipes/<id>
 ```
 
 ### Node

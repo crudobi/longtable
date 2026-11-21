@@ -7,6 +7,7 @@ import type {
   RecipeInput,
   RecipePatch,
   RecipeSummary,
+  SourceTimestamps,
 } from '../types'
 
 const INDEX_URL_KEY = 'longtable:recipe-index-url'
@@ -426,11 +427,25 @@ export async function createRecipesAtomic(
   repo: YjsStore,
   index: IndexHandle,
   inputs: RecipeInput[],
+  // Optional per-recipe source timestamps (M24), parallel to `inputs`:
+  // a recipe restored from a backup keeps its original created/updated
+  // times instead of being re-stamped "now". A lone updatedAt stands
+  // in for createdAt too, so a source that only kept one time still
+  // restores coherently; absent entries create "now", as before.
+  timestamps?: (SourceTimestamps | undefined)[],
 ): Promise<string[]> {
   const ids: string[] = []
   try {
-    for (const input of inputs) {
-      const summary = await createRecipe(repo, index, input)
+    for (let i = 0; i < inputs.length; i++) {
+      const ts = timestamps?.[i]
+      const stamp =
+        ts?.createdAt !== undefined || ts?.updatedAt !== undefined
+          ? {
+              createdAt: ts.createdAt ?? ts.updatedAt,
+              updatedAt: ts.updatedAt ?? ts.createdAt,
+            }
+          : undefined
+      const summary = await createRecipe(repo, index, inputs[i], stamp)
       ids.push(summary.id)
     }
     return ids
@@ -634,9 +649,21 @@ export async function updateRecipe(
   if (!entry) throw new Error(`recipe not found: ${id}`)
 
   const doc = await getOrCreateDoc(repo, guidFromUrl(entry.url) ?? id)
-  const updatedAt = nowIso()
+  let updatedAt = nowIso()
   doc.transact(() => {
     const map = doc.getMap(RECIPE_MAP)
+    // M22: updatedAt doubles as the lost-update version token, so it
+    // must be strictly increasing per recipe. Two writes inside one
+    // millisecond would otherwise mint the same stamp and the
+    // precondition could not tell them apart — bump past the stored
+    // stamp by 1 ms in that case.
+    const prevUpdatedAt = map.get('updatedAt')
+    if (typeof prevUpdatedAt === 'string') {
+      const prevMs = Date.parse(prevUpdatedAt)
+      if (Number.isFinite(prevMs) && prevMs >= Date.parse(updatedAt)) {
+        updatedAt = new Date(prevMs + 1).toISOString()
+      }
+    }
     // Skip scalar writes whose value is unchanged (same rationale as
     // replaceArray's identical-content guard): map.set() mints a new Yjs
     // item even for an identical value, and that item is a *concurrent*

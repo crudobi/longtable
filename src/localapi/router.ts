@@ -38,12 +38,33 @@
  *    limit on a delete, import notes (dropped photos). A warning never
  *    means the call failed; it means something about the result needs
  *    the caller's attention. Always present (possibly empty) on
- *    DELETE, PUT, public POST, and POST /v1/import.
+ *    DELETE, PUT, PATCH, public POST, and POST /v1/import.
+ *  - PATCH (M22) is the partial update: only the fields sent change,
+ *    and an optional `expectedUpdatedAt` in the body is a lost-update
+ *    precondition — a stale value is refused with 412 and nothing is
+ *    written. PUT accepts the same precondition.
+ *  - A visibility flip that fails part-way (M23) answers 502 with a
+ *    `changed` block — the recipe's tier, updatedAt, and whether a
+ *    public record is recorded for it, as they actually stand now —
+ *    instead of a bare error that hides what moved.
+ *  - POST /v1/import (M24) takes a page `url` for the URL importer as
+ *    well as `text`, and source timestamps ride through an import so
+ *    a backup restores with its original times.
  */
-import { ImporterError, validateImportedRecipe } from '../importers/contract'
+import {
+  ImporterError,
+  isValidIsoTimestamp,
+  validateImportedRecipe,
+  validateRecipePatch,
+} from '../importers/contract'
 import { ensurePluginsLoaded, runImporter } from '../importers/registry'
-import type { RecipeInput } from '../types'
-import { LocalApiError, type LocalApiHost } from './host'
+import type { RecipeInput, RecipePatch } from '../types'
+import {
+  LocalApiError,
+  type ApiRecipe,
+  type LocalApiHost,
+  type PublicRecordState,
+} from './host'
 import { LOCAL_API_VERSION, type LocalApiSettings } from './settings'
 
 export interface ApiRequest {
@@ -63,9 +84,13 @@ export interface ApiResponse {
 }
 
 const ok = (status: number, body: unknown): ApiResponse => ({ status, body })
-const fail = (status: number, message: string): ApiResponse => ({
+const fail = (
+  status: number,
+  message: string,
+  details?: Record<string, unknown>,
+): ApiResponse => ({
   status,
-  body: { error: message },
+  body: { error: message, ...(details ?? {}) },
 })
 
 /**
@@ -115,6 +140,75 @@ interface RecipeBody {
   visibility?: string
   /** Explicit human gate for destructive acts (H12) — see requireConfirm. */
   confirm?: boolean
+  /** Optional source timestamps (M24) — the recipe keeps its original times. */
+  createdAt?: string
+  updatedAt?: string
+  /** Optional lost-update precondition (M22) — the `updatedAt` last read. */
+  expectedUpdatedAt?: string
+}
+
+/** Read an optional `visibility` field: must be a string when present. */
+function parseVisibilityField(r: Record<string, unknown>): string | undefined {
+  if (!('visibility' in r) || r.visibility === undefined) return undefined
+  if (typeof r.visibility !== 'string') {
+    throw new LocalApiError(
+      400,
+      '"visibility" must be "private", "friends-only", or "public".',
+    )
+  }
+  return r.visibility
+}
+
+/** Read an optional `confirm` field: must be a boolean when present. */
+function parseConfirmField(r: Record<string, unknown>): boolean | undefined {
+  if (!('confirm' in r) || r.confirm === undefined) return undefined
+  if (typeof r.confirm !== 'boolean') {
+    throw new LocalApiError(400, '"confirm" must be true or false.')
+  }
+  return r.confirm
+}
+
+/**
+ * Read an optional `expectedUpdatedAt` field (M22): the `updatedAt`
+ * the caller read, for the lost-update precondition. Must be a
+ * parseable ISO-8601 date when present.
+ */
+function parseExpectedUpdatedAtField(
+  r: Record<string, unknown>,
+): string | undefined {
+  if (!('expectedUpdatedAt' in r) || r.expectedUpdatedAt === undefined) {
+    return undefined
+  }
+  if (!isValidIsoTimestamp(r.expectedUpdatedAt)) {
+    throw new LocalApiError(
+      400,
+      '"expectedUpdatedAt" must be an ISO-8601 date string, e.g. the "updatedAt" from a GET.',
+    )
+  }
+  return r.expectedUpdatedAt
+}
+
+/**
+ * Read optional source timestamps (M24): `createdAt`/`updatedAt` the
+ * caller is restoring. Must be parseable ISO-8601 dates when present.
+ */
+function parseSourceTimestamps(r: Record<string, unknown>): {
+  createdAt?: string
+  updatedAt?: string
+} {
+  const out: { createdAt?: string; updatedAt?: string } = {}
+  for (const field of ['createdAt', 'updatedAt'] as const) {
+    if (field in r && r[field] !== undefined) {
+      if (!isValidIsoTimestamp(r[field])) {
+        throw new LocalApiError(
+          400,
+          `"${field}" must be an ISO-8601 date string.`,
+        )
+      }
+      out[field] = r[field] as string
+    }
+  }
+  return out
 }
 
 /** Validate a create/update body: importer recipe shape + optional tier. */
@@ -124,26 +218,13 @@ function parseRecipeBody(req: ApiRequest): RecipeBody {
     throw new LocalApiError(400, 'Expected a JSON object describing the recipe.')
   }
   const r = raw as Record<string, unknown>
-  let visibility: string | undefined
-  if ('visibility' in r && r.visibility !== undefined) {
-    if (typeof r.visibility !== 'string') {
-      throw new LocalApiError(
-        400,
-        '"visibility" must be "private", "friends-only", or "public".',
-      )
-    }
-    visibility = r.visibility
-  }
-  let confirm: boolean | undefined
-  if ('confirm' in r && r.confirm !== undefined) {
-    if (typeof r.confirm !== 'boolean') {
-      throw new LocalApiError(400, '"confirm" must be true or false.')
-    }
-    confirm = r.confirm
-  }
+  const visibility = parseVisibilityField(r)
+  const confirm = parseConfirmField(r)
+  const expectedUpdatedAt = parseExpectedUpdatedAtField(r)
+  const { createdAt, updatedAt } = parseSourceTimestamps(r)
   // ImporterError (→ 422) on any shape problem; the message is plain.
   const input = validateImportedRecipe(r, 'localhost API')
-  return { input, visibility, confirm }
+  return { input, visibility, confirm, createdAt, updatedAt, expectedUpdatedAt }
 }
 
 /**
@@ -204,6 +285,164 @@ function checkTierAllowed(visibility: string | undefined): void {
     400,
     `"visibility" must be "private", "friends-only", or "public" — got "${visibility}".`,
   )
+}
+
+/**
+ * The lost-update guard (M22): when the caller sends the `updatedAt`
+ * it read, refuse (412) when the stored recipe has moved since — the
+ * caller's view is stale and its write would silently overwrite the
+ * newer version. Checked after the body parses and before anything
+ * is written, so a stale call never writes. Absent = no check (older
+ * clients keep working, unguarded).
+ */
+function checkPrecondition(
+  existing: { updatedAt: string },
+  expectedUpdatedAt: string | undefined,
+): void {
+  if (expectedUpdatedAt === undefined) return
+  if (expectedUpdatedAt !== existing.updatedAt) {
+    throw new LocalApiError(
+      412,
+      `That recipe changed since you last read it (it was updated at ${existing.updatedAt}). Read it again and retry your change against the new version.`,
+    )
+  }
+}
+
+interface PatchBody {
+  patch: RecipePatch
+  visibility?: string
+  confirm?: boolean
+  expectedUpdatedAt?: string
+}
+
+/**
+ * Validate a PATCH body (M22): the content fields go through the
+ * importer's patch validator — partial, so absent fields are
+ * untouched and `null` clears an optional field — while `visibility`
+ * / `confirm` / `expectedUpdatedAt` are the call's own fields, not
+ * recipe fields. An unknown field is rejected outright: a silently
+ * ignored typo'd field in a patch is a lost update by another name.
+ */
+function parsePatchBody(req: ApiRequest): PatchBody {
+  const raw = parseJsonBody(req)
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new LocalApiError(400, 'Expected a JSON object describing the change.')
+  }
+  const r = raw as Record<string, unknown>
+  const visibility = parseVisibilityField(r)
+  const confirm = parseConfirmField(r)
+  const expectedUpdatedAt = parseExpectedUpdatedAtField(r)
+  const rest: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(r)) {
+    if (key === 'visibility' || key === 'confirm' || key === 'expectedUpdatedAt') {
+      continue
+    }
+    rest[key] = value
+  }
+  const known = new Set([
+    'title',
+    'ingredients',
+    'steps',
+    'photos',
+    'prepMinutes',
+    'cookMinutes',
+    'description',
+    'recipeYield',
+    'tags',
+    'author',
+    'sourceUrl',
+  ])
+  for (const key of Object.keys(rest)) {
+    if (!known.has(key)) {
+      throw new LocalApiError(400, `"${key}" is not a recipe field.`)
+    }
+  }
+  // ImporterError (→ 422) on any shape problem; the message is plain.
+  const patch = validateRecipePatch(rest, 'localhost API')
+  if (Object.keys(patch).length === 0 && visibility === undefined) {
+    throw new LocalApiError(
+      400,
+      'Nothing to change — send at least one recipe field or a new visibility.',
+    )
+  }
+  return { patch, visibility, confirm, expectedUpdatedAt }
+}
+
+/**
+ * One write plus an optional tier change, in the order that keeps a
+ * partial failure honest (M23): going public writes the new content
+ * while still private, then publishes it; going private unpublishes
+ * first, then writes the new content. The confirm + sign-in refusals
+ * (422) happen before anything is written. A failure inside the flip
+ * itself already carries the host's `changed` report; the one failure
+ * the host cannot see — the content write AFTER a successful flip —
+ * is answered here as a 502 with the recipe as it now stands.
+ */
+async function applyWriteWithFlip(
+  host: LocalApiHost,
+  id: string,
+  existing: ApiRecipe,
+  target: 'private' | 'public' | undefined,
+  confirm: boolean | undefined,
+  write: () => Promise<void>,
+): Promise<{ warnings: string[] }> {
+  let warnings: string[] = []
+  let publicRecord: PublicRecordState = 'unknown'
+  try {
+    if (target && target !== existing.visibility) {
+      if (target === 'public') {
+        // H12: see the POST branch — the confirm comes first, before
+        // the sign-in check and before anything is written.
+        requireConfirm(
+          confirm,
+          'Making a recipe public lists it under your publishing account for anyone to find.',
+        )
+        if (!host.canPublish()) throw new LocalApiError(422, NOT_SIGNED_IN)
+        // Update content while still private (a plain update — no
+        // republish of half-moved state), then publish the new content
+        // through the byte-path flow in one write.
+        await write()
+        const flip = await host.setVisibility(id, 'public')
+        warnings = flip.warnings
+        publicRecord = flip.publicRecord
+      } else {
+        // Going private: unpublish through the flow FIRST, then update
+        // as an ordinary private recipe.
+        const flip = await host.setVisibility(id, 'private')
+        warnings = flip.warnings
+        publicRecord = flip.publicRecord
+        await write()
+      }
+    } else {
+      await write()
+    }
+  } catch (e) {
+    if (e instanceof LocalApiError && e.details?.changed !== undefined) throw e
+    if (target === 'private' && target !== existing.visibility) {
+      const after = await host.getRecipe(id).catch(() => null)
+      if (after && after.visibility === 'private') {
+        // The flip landed, the content write after it did not: say
+        // so plainly, with the recipe as it now stands. The cause
+        // stays in the device log.
+        console.warn('[longtable] localhost API flip landed but the content write failed', e)
+        throw new LocalApiError(
+          502,
+          'The recipe is now private, but saving the new content failed. ' +
+            'The recipe still has its previous content — read it again and retry the change.',
+          {
+            changed: {
+              id,
+              visibility: 'private',
+              updatedAt: after.updatedAt,
+              publicRecord,
+            },
+          },
+        )
+      }
+    }
+    throw e
+  }
+  return { warnings }
 }
 
 const NOT_SIGNED_IN =
@@ -282,7 +521,8 @@ async function route(
   }
 
   if (method === 'POST' && isRecipes && seg.length === 2) {
-    const { input, visibility, confirm } = parseRecipeBody(req)
+    const { input, visibility, confirm, createdAt, updatedAt } =
+      parseRecipeBody(req)
     checkTierAllowed(visibility)
     if (visibility === 'public') {
       // H12: making a recipe public is the one wide-exposure move — the
@@ -298,12 +538,29 @@ async function route(
       // leaves a surprise private recipe behind.
       throw new LocalApiError(422, NOT_SIGNED_IN)
     }
-    const { id } = await host.createRecipe(input)
+    // M24: a create may carry the source's own timestamps (a backup
+    // restore), so the recipe keeps its original times.
+    const timestamps =
+      createdAt !== undefined || updatedAt !== undefined
+        ? { createdAt, updatedAt }
+        : undefined
+    const { id } = await host.createRecipe(input, timestamps)
     let warnings: string[] = []
     if (visibility === 'public') {
       ;({ warnings } = await host.setVisibility(id, 'public'))
     }
-    return ok(201, { id, title: input.title, visibility: visibility ?? 'private', warnings })
+    // Echo the stored timestamps when the caller supplied source
+    // ones, so a restore can confirm what actually landed.
+    const stored = timestamps ? await host.getRecipe(id) : null
+    return ok(201, {
+      id,
+      title: input.title,
+      visibility: visibility ?? 'private',
+      warnings,
+      ...(stored
+        ? { createdAt: stored.createdAt, updatedAt: stored.updatedAt }
+        : {}),
+    })
   }
 
   if (method === 'PUT' && isRecipes && seg.length === 3) {
@@ -312,34 +569,61 @@ async function route(
     if (!existing) {
       return fail(404, 'No recipe with that id exists in this cookbook.')
     }
-    const { input, visibility, confirm } = parseRecipeBody(req)
+    const { input, visibility, confirm, expectedUpdatedAt } =
+      parseRecipeBody(req)
+    // M22: the precondition is checked before anything is written.
+    checkPrecondition(existing, expectedUpdatedAt)
     checkTierAllowed(visibility)
     const target = visibility as 'private' | 'public' | undefined
-    let warnings: string[] = []
-    if (target && target !== existing.visibility) {
-      if (target === 'public') {
-        // H12: see the POST branch — the confirm comes first, before
-        // the sign-in check and before anything is written.
-        requireConfirm(
-          confirm,
-          'Making a recipe public lists it under your publishing account for anyone to find.',
-        )
-        if (!host.canPublish()) throw new LocalApiError(422, NOT_SIGNED_IN)
-        // Update content while still private (a plain update — no
-        // republish of half-moved state), then publish the new content
-        // through the byte-path flow in one write.
-        await host.updateRecipe(id, input)
-        ;({ warnings } = await host.setVisibility(id, 'public'))
-      } else {
-        // Going private: unpublish through the flow FIRST, then update
-        // as an ordinary private recipe.
-        ;({ warnings } = await host.setVisibility(id, 'private'))
-        await host.updateRecipe(id, input)
-      }
-    } else {
-      await host.updateRecipe(id, input)
+    const { warnings } = await applyWriteWithFlip(
+      host,
+      id,
+      existing,
+      target,
+      confirm,
+      () => host.updateRecipe(id, input),
+    )
+    const after = await host.getRecipe(id)
+    return ok(200, {
+      id,
+      visibility: target ?? existing.visibility,
+      updatedAt: after?.updatedAt ?? existing.updatedAt,
+      warnings,
+    })
+  }
+
+  if (method === 'PATCH' && isRecipes && seg.length === 3) {
+    const id = seg[2]
+    const existing = await host.getRecipe(id)
+    if (!existing) {
+      return fail(404, 'No recipe with that id exists in this cookbook.')
     }
-    return ok(200, { id, visibility: target ?? existing.visibility, warnings })
+    const { patch, visibility, confirm, expectedUpdatedAt } =
+      parsePatchBody(req)
+    // M22: the precondition is checked before anything is written.
+    checkPrecondition(existing, expectedUpdatedAt)
+    checkTierAllowed(visibility)
+    const target = visibility as 'private' | 'public' | undefined
+    const { warnings } = await applyWriteWithFlip(
+      host,
+      id,
+      existing,
+      target,
+      confirm,
+      // A visibility-only patch has no content to write; the flip
+      // itself refreshes updatedAt.
+      () =>
+        Object.keys(patch).length > 0
+          ? host.patchRecipe(id, patch)
+          : Promise.resolve(),
+    )
+    const after = await host.getRecipe(id)
+    return ok(200, {
+      id,
+      visibility: target ?? existing.visibility,
+      updatedAt: after?.updatedAt ?? existing.updatedAt,
+      warnings,
+    })
   }
 
   if (method === 'DELETE' && isRecipes && seg.length === 3) {
@@ -361,23 +645,51 @@ async function route(
   if (method === 'POST' && path === '/v1/import') {
     const raw = parseJsonBody(req)
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      throw new LocalApiError(400, 'Expected a JSON object with "importerId" and "text".')
+      throw new LocalApiError(
+        400,
+        'Expected a JSON object with "importerId" and "text" or "url".',
+      )
     }
     const r = raw as Record<string, unknown>
     if (typeof r.importerId !== 'string' || !r.importerId) {
       throw new LocalApiError(400, '"importerId" is required — the id of a registered importer.')
     }
-    if (typeof r.text !== 'string') {
-      throw new LocalApiError(400, '"text" is required — the source text for the importer.')
+    if (r.text !== undefined && typeof r.text !== 'string') {
+      throw new LocalApiError(400, '"text" must be a string — the source text for the importer.')
+    }
+    if (r.url !== undefined && typeof r.url !== 'string') {
+      throw new LocalApiError(400, '"url" must be a string — the page URL for the importer.')
+    }
+    const text = typeof r.text === 'string' ? r.text : undefined
+    const url = typeof r.url === 'string' ? r.url.trim() : undefined
+    if (text !== undefined && url !== undefined) {
+      throw new LocalApiError(
+        400,
+        'Send either "text" or "url", not both — the importer reads one source.',
+      )
+    }
+    if (text === undefined && url === undefined) {
+      throw new LocalApiError(
+        400,
+        'Send "text" (the source text) or "url" (a page for the URL importer) — the importer needs a source.',
+      )
+    }
+    if (url === '') {
+      throw new LocalApiError(400, '"url" must not be empty.')
     }
     await ensurePluginsLoaded()
     // runImporter validates every recipe; one bad recipe fails the
     // whole import and nothing is saved (same atomicity as the UI).
-    const { recipes, warnings } = await runImporter(r.importerId, {
-      kind: 'text',
-      text: r.text,
-    })
-    const ids = await host.importRecipes(recipes)
+    // M24: a URL source goes to the URL importer, and source
+    // timestamps ride through from the importer and are kept on
+    // create — a backup restores with its original times.
+    const { recipes, warnings, timestamps } = await runImporter(
+      r.importerId,
+      url !== undefined
+        ? { kind: 'url', url }
+        : { kind: 'text', text: text as string },
+    )
+    const ids = await host.importRecipes(recipes, timestamps)
     return ok(201, { importer: r.importerId, imported: ids, count: ids.length, warnings })
   }
 
@@ -401,7 +713,7 @@ export async function handleApiRequest(
   try {
     return await route(req, host, settings)
   } catch (e) {
-    if (e instanceof LocalApiError) return fail(e.status, e.message)
+    if (e instanceof LocalApiError) return fail(e.status, e.message, e.details)
     if (e instanceof ImporterError) return fail(422, e.message)
     console.warn('[longtable] localhost API request failed', e)
     return fail(
