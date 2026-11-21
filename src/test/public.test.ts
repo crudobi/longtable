@@ -22,6 +22,7 @@ import {
   getPublication,
   publishRecipe,
   pubkeyBindingMessage,
+  pubkeyRkeyForDeviceDid,
   recipeSignatureMessage,
   signRecipeRecord,
   unpublishRecipe,
@@ -309,7 +310,7 @@ describe('device signatures', () => {
 // ---------------------------------------------------------------------------
 
 describe('ensurePubkeyBinding', () => {
-  it('writes rkey "self" once, with a verifiable signature, and not again', async () => {
+  it('writes the per-device rkey once, with a verifiable signature, and not again', async () => {
     await sodium.ready
     const fake = makeFakePds()
     const client = new AtprotoClient(PDS, { fetchFn: fake.fetchFn })
@@ -324,7 +325,9 @@ describe('ensurePubkeyBinding', () => {
     expect(putCalls).toHaveLength(1)
     expect(putCalls[0].body.repo).toBe(ACCT)
     expect(putCalls[0].body.collection).toBe('kitchen.longtable.pubkey')
-    expect(putCalls[0].body.rkey).toBe('self')
+    // Per-device rkey (H-N1), not the legacy single-slot 'self'.
+    expect(putCalls[0].body.rkey).toBe(await pubkeyRkeyForDeviceDid(identity.did))
+    expect(putCalls[0].body.rkey).toMatch(/^dev-[0-9a-f]{32}$/)
 
     const record = putCalls[0].body.record as Record<string, string>
     expect(record.$type).toBe('kitchen.longtable.pubkey')
@@ -351,6 +354,75 @@ describe('ensurePubkeyBinding', () => {
     expect(
       fake.calls.filter((c) => c.path === 'com.atproto.repo.putRecord'),
     ).toHaveLength(1)
+  })
+
+  it('a second device writes only its own per-device rkey and never touches the first device binding (H-N1)', async () => {
+    await sodium.ready
+    const fake = makeFakePds()
+    const client = new AtprotoClient(PDS, { fetchFn: fake.fetchFn })
+    const session = await makeSession(client)
+    const deviceA = await identityFromSeed(SEED)
+    const deviceB = await identityFromSeed(new Uint8Array(32).fill(11))
+    const kv = memoryStore()
+
+    // Device A binds first (per-device rkey, as the current client does).
+    expect(await ensurePubkeyBinding(client, session, deviceA, kv)).toBe(true)
+    const rkeyA = await pubkeyRkeyForDeviceDid(deviceA.did)
+    // Plus a legacy 'self' binding for A, as an older client would have left.
+    fake.records.set(fake.key(ACCT, 'kitchen.longtable.pubkey', 'self'), {
+      record: {
+        $type: 'kitchen.longtable.pubkey',
+        deviceDid: deviceA.did,
+        devicePublicKey: u8ToBase64(deviceA.publicKey),
+        signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      cid: 'bafylegacy',
+    })
+    const selfBefore = fake.records.get(fake.key(ACCT, 'kitchen.longtable.pubkey', 'self'))
+
+    // Device B binds: exactly one putRecord, at B's own per-device rkey.
+    expect(await ensurePubkeyBinding(client, session, deviceB, kv)).toBe(true)
+    const rkeyB = await pubkeyRkeyForDeviceDid(deviceB.did)
+    expect(rkeyB).not.toBe(rkeyA)
+    const putCalls = fake.calls.filter(
+      (c) => c.path === 'com.atproto.repo.putRecord',
+    )
+    expect(putCalls).toHaveLength(2)
+    expect(putCalls[1].body.rkey).toBe(rkeyB)
+    expect(putCalls[1].body.collection).toBe('kitchen.longtable.pubkey')
+    // Neither A's per-device binding nor the legacy 'self' record moved.
+    expect(fake.records.get(fake.key(ACCT, 'kitchen.longtable.pubkey', rkeyA))).toBeDefined()
+    expect(fake.records.get(fake.key(ACCT, 'kitchen.longtable.pubkey', 'self'))).toBe(selfBefore)
+    // B's binding verifies as B's.
+    const recordB = putCalls[1].body.record as Record<string, string>
+    expect(recordB.deviceDid).toBe(deviceB.did)
+    expect(
+      await verifyDetached(
+        deviceB.did,
+        utf8ToU8(pubkeyBindingMessage(ACCT, deviceB.did, u8ToBase64(deviceB.publicKey))),
+        base64ToU8(recordB.signature),
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('pubkeyRkeyForDeviceDid', () => {
+  it('derives a deterministic dev-<hex> rkey and pins the cross-implementation vector', async () => {
+    // BLAKE2b-256 of the deviceDid string, computed independently
+    // (python hashlib.blake2b, digest_size=32) — the AppView pins the
+    // same vector, so the two halves agree on every binding's address.
+    expect(
+      await pubkeyRkeyForDeviceDid(
+        'did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK',
+      ),
+    ).toBe('dev-af0042b31ec6679cc02818a49bf60f70')
+    const identity = await identityFromSeed(SEED)
+    const rkey = await pubkeyRkeyForDeviceDid(identity.did)
+    expect(rkey).toMatch(/^dev-[0-9a-f]{32}$/)
+    expect(await pubkeyRkeyForDeviceDid(identity.did)).toBe(rkey)
+    const other = await identityFromSeed(new Uint8Array(32).fill(12))
+    expect(await pubkeyRkeyForDeviceDid(other.did)).not.toBe(rkey)
   })
 })
 

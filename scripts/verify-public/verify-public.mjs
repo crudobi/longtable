@@ -233,7 +233,12 @@ async function modeVerify(did, rkey) {
     fail('recipe record is lexicon-valid', String(e).split('\n')[0])
   }
 
-  const pubkeyEntry = records.find((r) => r.collection === 'kitchen.longtable.pubkey' && r.rkey === 'self')
+  // Per-device bindings (H-N1): the binding for THIS recipe's device —
+  // any rkey (the per-device rkey, or the legacy `self` record as
+  // migration) — not just the record at `self`.
+  const pubkeyEntry = records.find(
+    (r) => r.collection === 'kitchen.longtable.pubkey' && r.record?.deviceDid === record.deviceDid,
+  )
   if (!pubkeyEntry) {
     fail('pubkey binding record present')
     return finish()
@@ -302,7 +307,11 @@ async function modeForgeSelftest(did, rkey) {
     return finish()
   }
   const record = entry.record
-  const pk = records.find((r) => r.collection === 'kitchen.longtable.pubkey')?.record
+  const pk = records.find((r) => r.collection === 'kitchen.longtable.pubkey' && r.record?.deviceDid === record.deviceDid)?.record
+  if (!pk) {
+    fail('pubkey binding for the recipe device found (selftest precondition)')
+    return finish()
+  }
   const devicePubKey = devicePublicKeyFromDid(pk.deviceDid)
   if (!verifyDeviceSignature(record, did, devicePubKey)) {
     fail('genuine signature verifies before forging (selftest precondition)')

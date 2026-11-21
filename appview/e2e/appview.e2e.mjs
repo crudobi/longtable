@@ -30,6 +30,7 @@ import {
   canonicalRecipeHashHex,
   recipeSignatureMessage,
   pubkeyBindingMessage,
+  pubkeyRkeyForDeviceDid,
   didKeyFromPublicKeyBytes,
 } from '../device-signature.mjs'
 
@@ -101,7 +102,9 @@ async function login(account) {
 // binding, and sign each recipe record — otherwise the AppView's
 // device-signature gate (C2) correctly drops every record as unsigned.
 // Keys are node:crypto Ed25519 (independent signer from the libsodium
-// verifier), fresh per run; the binding is overwritten on re-runs.
+// verifier), fresh per run; each run's binding is a NEW per-device
+// record (H-N1), so old runs' bindings persist in the repo — revocation
+// (deleting a device's binding) is a separate feature, not this script.
 function makeDevice() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519')
   const publicKeyBytes = new Uint8Array(publicKey.export({ type: 'spki', format: 'der' }).subarray(-32))
@@ -118,10 +121,13 @@ function signMsg(device, message) {
 }
 
 async function publishBinding(agent, account, device) {
+  // Per-device rkey (H-N1): the binding lives at the rkey derived from
+  // the deviceDid, so a second device adds its own binding instead of
+  // overwriting the first device's.
   await agent.com.atproto.repo.putRecord({
     repo: account.did,
     collection: 'kitchen.longtable.pubkey',
-    rkey: 'self',
+    rkey: pubkeyRkeyForDeviceDid(device.deviceDid),
     record: {
       $type: 'kitchen.longtable.pubkey',
       deviceDid: device.deviceDid,
@@ -227,6 +233,33 @@ async function main() {
         found.value.deviceKey === authorDevice.devicePublicKey &&
         typeof found.value.deviceSignature === 'string',
       JSON.stringify(found.value),
+    )
+
+    // --- H-N1: a second device publishes its own binding + recipe ---
+    // The second device must NOT un-index the first device's recipe:
+    // both bindings coexist (per-device rkeys) and both recipes stay
+    // searchable, each under its own deviceDid/deviceKey.
+    const authorDevice2 = makeDevice()
+    await publishBinding(authorAgent, author, authorDevice2)
+    const createdSecond = await authorAgent.com.atproto.repo.createRecord({
+      repo: author.did,
+      collection: COLLECTION,
+      record: signedRecipeRecord(authorDevice2, author.did, 'AppView Borscht Two', 'e2e-borscht-author-2', ['1 beet', '1 potato']),
+    })
+    const authorUri2 = createdSecond.data.uri
+    console.log(`author second device published ${authorUri2}`)
+    const bothDevices = await waitFor('both author-device recipes in search', async () => {
+      const s = await getJson('/search?q=Borscht')
+      const a = s.results.find((r) => r.uri === authorUri)
+      const b = s.results.find((r) => r.uri === authorUri2)
+      return a && b ? { a, b } : null
+    })
+    check('second device publish keeps first device recipe searchable (H-N1)', !!bothDevices.value)
+    check(
+      'second device recipe carries its own deviceDid/deviceKey',
+      bothDevices.value?.b.deviceDid === authorDevice2.deviceDid &&
+        bothDevices.value?.b.deviceKey === authorDevice2.devicePublicKey,
+      JSON.stringify(bothDevices.value?.b),
     )
 
     // --- attacker publishes a same-named recipe in their OWN repo ---

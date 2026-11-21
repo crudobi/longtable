@@ -4,12 +4,14 @@ import {
   canonicalRecipeHashHex,
   recipeSignatureMessage,
   pubkeyBindingMessage,
+  pubkeyRkeyForDeviceDid,
   base58Decode,
   base58Encode,
   devicePublicKeyFromDid,
   didKeyFromPublicKeyBytes,
   decodeBase64Strict,
   verifyPubkeyBinding,
+  verifyPubkeyBindings,
   verifyRecipeDeviceSignature,
 } from '../device-signature.mjs'
 
@@ -128,6 +130,104 @@ describe('strict base64', () => {
     expect(decodeBase64Strict(good, 64)).toBeNull() // wrong length
     expect(decodeBase64Strict('!!!not-base64!!!', 32)).toBeNull()
     expect(decodeBase64Strict('', 32)).toBeNull()
+  })
+})
+
+describe('per-device binding rkey (H-N1)', () => {
+  it('derives a dev-<hex> rkey deterministically from the deviceDid', () => {
+    // Cross-implementation pin: BLAKE2b-256 of the deviceDid string,
+    // computed independently (python hashlib.blake2b, digest_size=32).
+    expect(
+      pubkeyRkeyForDeviceDid('did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK'),
+    ).toBe('dev-af0042b31ec6679cc02818a49bf60f70')
+    const device = makeDevice()
+    const rkey = pubkeyRkeyForDeviceDid(device.deviceDid)
+    expect(rkey).toMatch(/^dev-[0-9a-f]{32}$/)
+    // Deterministic: same device, same rkey, every time.
+    expect(pubkeyRkeyForDeviceDid(device.deviceDid)).toBe(rkey)
+    // Different devices get different rkeys.
+    expect(pubkeyRkeyForDeviceDid(makeDevice().deviceDid)).not.toBe(rkey)
+  })
+
+  it('returns null for non-string input, never throws', () => {
+    expect(pubkeyRkeyForDeviceDid(undefined)).toBeNull()
+    expect(pubkeyRkeyForDeviceDid(null)).toBeNull()
+    expect(pubkeyRkeyForDeviceDid(42)).toBeNull()
+    expect(pubkeyRkeyForDeviceDid('')).toBeNull()
+  })
+})
+
+describe('verifyPubkeyBindings (H-N1)', () => {
+  function entry(device, rkey, cid = 'cid-pk') {
+    return { collection: 'kitchen.longtable.pubkey', rkey, cid, record: bindingRecord(device) }
+  }
+
+  it('loads every device binding from per-device rkeys', async () => {
+    const a = makeDevice()
+    const b = makeDevice()
+    const res = await verifyPubkeyBindings(DID, [
+      entry(a, pubkeyRkeyForDeviceDid(a.deviceDid), 'cid-a'),
+      entry(b, pubkeyRkeyForDeviceDid(b.deviceDid), 'cid-b'),
+    ])
+    expect(res.bindings.size).toBe(2)
+    expect(res.candidates).toBe(2)
+    expect(res.firstInvalidReason).toBeNull()
+    expect(res.ignoredRkeys).toEqual([])
+    expect(res.bindings.get(a.deviceDid).devicePublicKey).toBe(a.devicePublicKey)
+    expect(res.bindings.get(b.deviceDid).devicePublicKey).toBe(b.devicePublicKey)
+  })
+
+  it('accepts the legacy self rkey as one device binding (migration)', async () => {
+    const a = makeDevice()
+    const res = await verifyPubkeyBindings(DID, [entry(a, 'self')])
+    expect(res.bindings.size).toBe(1)
+    expect(res.candidates).toBe(1)
+    expect(res.bindings.get(a.deviceDid).devicePublicKey).toBe(a.devicePublicKey)
+  })
+
+  it('deduplicates self plus per-device for the same device', async () => {
+    const a = makeDevice()
+    const res = await verifyPubkeyBindings(DID, [
+      entry(a, 'self', 'cid-self'),
+      entry(a, pubkeyRkeyForDeviceDid(a.deviceDid), 'cid-dev'),
+    ])
+    expect(res.bindings.size).toBe(1)
+    expect(res.candidates).toBe(2)
+  })
+
+  it('ignores a binding at an unexpected rkey and reports it', async () => {
+    const a = makeDevice()
+    const res = await verifyPubkeyBindings(DID, [entry(a, 'weird')])
+    expect(res.bindings.size).toBe(0)
+    expect(res.candidates).toBe(0)
+    expect(res.firstInvalidReason).toBeNull()
+    expect(res.ignoredRkeys).toEqual(['weird'])
+  })
+
+  it('keeps valid bindings and reports the first invalid reason', async () => {
+    const a = makeDevice()
+    const b = makeDevice()
+    const attacker = makeDevice()
+    const bad = bindingRecord(b)
+    bad.signature = signMsg(attacker, pubkeyBindingMessage(DID, b.deviceDid, b.devicePublicKey))
+    const res = await verifyPubkeyBindings(DID, [
+      entry(a, pubkeyRkeyForDeviceDid(a.deviceDid), 'cid-a'),
+      { collection: 'kitchen.longtable.pubkey', rkey: pubkeyRkeyForDeviceDid(b.deviceDid), cid: 'cid-b', record: bad },
+    ])
+    expect(res.bindings.size).toBe(1)
+    expect(res.bindings.has(a.deviceDid)).toBe(true)
+    expect(res.candidates).toBe(2)
+    expect(res.firstInvalidReason).toBe('binding-signature-invalid')
+  })
+
+  it('ignores non-pubkey collections entirely', async () => {
+    const a = makeDevice()
+    const res = await verifyPubkeyBindings(DID, [
+      { collection: 'kitchen.longtable.recipe', rkey: 'a', cid: 'cid-a', record: {} },
+      entry(a, 'self'),
+    ])
+    expect(res.bindings.size).toBe(1)
+    expect(res.candidates).toBe(1)
   })
 })
 

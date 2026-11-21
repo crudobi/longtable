@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { cidForRecord } from '@atproto/repo'
 import { RecipeIndex } from '../db.mjs'
 import { createIngestor, isWantedPath } from '../ingest.mjs'
-import { makeDevice, bindingRecord, signedRecipeRecord, signMsg } from './signed-fixtures.mjs'
+import { makeDevice, bindingRecord, signedRecipeRecord, signMsg, perDeviceBindingEntry, legacyBindingEntry } from './signed-fixtures.mjs'
 import { canonicalRecipeHashHex, recipeSignatureMessage, pubkeyBindingMessage } from '../device-signature.mjs'
 
 const DID = 'did:plc:fakeauthor'
@@ -270,20 +270,55 @@ describe('device-signature gate (C2)', () => {
     expect(ingestor.stats.signatureRejected).toBe(1)
   })
 
-  it('rebinding to a new device deletes recipes signed by the old device', async () => {
-    const recipe = signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])
-    state.records = [recipeEntry('a', recipe), bindingEntryFor(device)]
+  it('rebinding to a new device keeps recipes signed by the old device (H-N1)', async () => {
+    // Device A publishes first (per-device binding, as the client does now).
+    const recipeA = signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])
+    state.records = [recipeEntry('a', recipeA), perDeviceBindingEntry(device, DID, 'cid-pk-a')]
     await ingestor.reconcileRepo(DID)
     expect(index.count()).toBe(1)
 
+    // Device B publishes: it ADDS its own per-device binding — it never
+    // overwrites A's. Both devices' recipes must stay indexed.
     const newDevice = makeDevice()
+    const recipeB = signedRecipeRecord(newDevice, DID, 'Beta Stew', ['2 potatoes'])
     state.records = [
-      recipeEntry('a', recipe),
-      { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid: 'cid-pk2', record: bindingRecord(newDevice, DID) },
+      recipeEntry('a', recipeA),
+      recipeEntry('b', recipeB),
+      perDeviceBindingEntry(device, DID, 'cid-pk-a'),
+      perDeviceBindingEntry(newDevice, DID, 'cid-pk-b'),
     ]
     const res = await ingestor.reconcileRepo(DID)
     expect(res.ok).toBe(true)
-    expect(index.count()).toBe(0)
+    expect(res.bindings).toBe(2)
+    expect(index.count()).toBe(2)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(1)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
+    expect(ingestor.stats.signatureRejected).toBe(0)
+  })
+
+  it('deleting one device binding drops only that device recipes (revocation)', async () => {
+    const newDevice = makeDevice()
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      recipeEntry('b', signedRecipeRecord(newDevice, DID, 'Beta Stew', ['2 potatoes'])),
+      perDeviceBindingEntry(device, DID, 'cid-pk-a'),
+      perDeviceBindingEntry(newDevice, DID, 'cid-pk-b'),
+    ]
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(2)
+
+    // Device A's binding is deleted from the repo (revocation): A's rows
+    // leave, B's stay — the sweep is per-device now.
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      recipeEntry('b', signedRecipeRecord(newDevice, DID, 'Beta Stew', ['2 potatoes'])),
+      perDeviceBindingEntry(newDevice, DID, 'cid-pk-b'),
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(index.count()).toBe(1)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(0)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
     expect(ingestor.stats.signatureRejected).toBe(1)
   })
 
@@ -305,6 +340,134 @@ describe('device-signature gate (C2)', () => {
     expect(res.reason).toBe('device-signature-rejected')
     expect(ingestor.stats.signatureRejected).toBe(1)
     expect(index.count()).toBe(0)
+  })
+})
+
+describe('per-device bindings (H-N1)', () => {
+  let index, state, ingestor, device
+  beforeEach(() => {
+    index = new RecipeIndex(':memory:')
+    state = { records: [] }
+    device = makeDevice()
+    ingestor = createIngestor({
+      index,
+      repoStateProvider: fakeProvider(state),
+      pdsUrl: 'http://localhost:2583',
+      log: { info() {}, warn() {}, error() {} },
+    })
+  })
+  afterEach(() => index.close())
+
+  function recipeEntry(rkey, rec, cid = `cid-${rkey}`) {
+    return { collection: 'kitchen.longtable.recipe', rkey, cid, record: rec }
+  }
+
+  it('two devices publish and both recipes stay indexed through flip-flopping reconciles', async () => {
+    const other = makeDevice()
+    const recA = signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])
+    const recB = signedRecipeRecord(other, DID, 'Beta Stew', ['2 potatoes'])
+    const both = [
+      recipeEntry('a', recA),
+      recipeEntry('b', recB),
+      perDeviceBindingEntry(device, DID, 'cid-pk-a'),
+      perDeviceBindingEntry(other, DID, 'cid-pk-b'),
+    ]
+    // A publishes, then B publishes, then A publishes again — the old
+    // single-slot world un-published the other device on every flip.
+    // Here the repo accumulates both bindings, so every reconcile keeps both.
+    state.records = [recipeEntry('a', recA), perDeviceBindingEntry(device, DID, 'cid-pk-a')]
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(1)
+    state.records = both
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(2)
+    // Flip-flop: same state, bindings in the other order, again and again.
+    state.records = [...both].reverse()
+    await ingestor.reconcileRepo(DID)
+    expect(index.count()).toBe(2)
+    state.records = both
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.bindings).toBe(2)
+    expect(index.count()).toBe(2)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(1)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
+    expect(ingestor.stats.signatureRejected).toBe(0)
+  })
+
+  it('each indexed row carries its own device key (not the other device key)', async () => {
+    const other = makeDevice()
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      recipeEntry('b', signedRecipeRecord(other, DID, 'Beta Stew', ['2 potatoes'])),
+      perDeviceBindingEntry(device, DID, 'cid-pk-a'),
+      perDeviceBindingEntry(other, DID, 'cid-pk-b'),
+    ]
+    await ingestor.reconcileRepo(DID)
+    expect(index.getRecipe(DID, 'a').deviceKey).toBe(device.devicePublicKey)
+    expect(index.getRecipe(DID, 'a').deviceDid).toBe(device.deviceDid)
+    expect(index.getRecipe(DID, 'b').deviceKey).toBe(other.devicePublicKey)
+    expect(index.getRecipe(DID, 'b').deviceDid).toBe(other.deviceDid)
+  })
+
+  it('migration: the legacy self binding still verifies its recipes', async () => {
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      legacyBindingEntry(device, DID),
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.bindings).toBe(1)
+    expect(res.bindingReason).toBeNull()
+    expect(index.count()).toBe(1)
+    expect(index.getRecipe(DID, 'a').deviceKey).toBe(device.devicePublicKey)
+  })
+
+  it('self plus a per-device binding for the same device deduplicate to one binding', async () => {
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      legacyBindingEntry(device, DID, 'cid-pk-self'),
+      perDeviceBindingEntry(device, DID, 'cid-pk-dev'),
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.bindings).toBe(1)
+    expect(index.count()).toBe(1)
+  })
+
+  it('a binding at an unexpected rkey is ignored and its recipes are dropped', async () => {
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      {
+        collection: 'kitchen.longtable.pubkey',
+        rkey: 'weird',
+        cid: 'cid-pk-weird',
+        record: bindingRecord(device, DID),
+      },
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.bindings).toBe(0)
+    expect(res.bindingReason).toBe('missing-binding')
+    expect(index.count()).toBe(0)
+    expect(ingestor.stats.signatureRejected).toBe(1)
+  })
+
+  it('a recipe for an unbound device is dropped while a bound device recipes stay', async () => {
+    const other = makeDevice()
+    state.records = [
+      recipeEntry('a', signedRecipeRecord(device, DID, 'Alpha Soup', ['1 egg'])),
+      recipeEntry('b', signedRecipeRecord(other, DID, 'Beta Stew', ['2 potatoes'])),
+      perDeviceBindingEntry(other, DID, 'cid-pk-b'),
+    ]
+    const res = await ingestor.reconcileRepo(DID)
+    expect(res.ok).toBe(true)
+    expect(res.bindings).toBe(1)
+    expect(res.bindingReason).toBeNull()
+    expect(index.count()).toBe(1)
+    expect(index.search({ q: 'Alpha' })).toHaveLength(0)
+    expect(index.search({ q: 'Beta' })).toHaveLength(1)
+    expect(ingestor.stats.signatureRejected).toBe(1)
   })
 })
 
