@@ -1,0 +1,13 @@
+# Pinned SHA-256 of the shared CI lib (ops/shared/ci/ci-lib.sh).
+#
+# run-pipeline.sh and install-ci.sh verify the lib against this pin BEFORE
+# sourcing it (Sec L21). The lib is shared infrastructure outside the
+# repo, so a commit cannot tamper with it — the pin only guards against
+# an unreviewed local change to the lib.
+#
+# Update ONLY when the shared lib changes deliberately: review the lib
+# diff, recompute the hash, commit the new pin. The pipeline fails
+# closed on a mismatch, so a stale pin blocks every run until updated.
+#
+# Pinned from ops/shared @ d98b7f7c22a2e911b9cda6f74495d7c856c53cfe (2026-11-21).
+aeb28c25b4ec02baed1e4ef1391626353c063c9d17268450e17087f95fc53640  ci-lib.sh

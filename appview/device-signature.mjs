@@ -232,7 +232,7 @@ export async function verifyPubkeyBinding(accountDid, binding) {
       keyBytes,
     )
   } catch {
-    ok = false
+    /* verification threw; ok stays false */
   }
   if (!ok) return { ok: false, reason: 'binding-signature-invalid' }
   return {
@@ -331,7 +331,7 @@ export async function verifyRecipeDeviceSignature(accountDid, record, binding) {
       binding.devicePublicKeyBytes,
     )
   } catch {
-    ok = false
+    /* verification threw; ok stays false */
   }
   return ok ? { ok: true } : { ok: false, reason: 'recipe-signature-invalid' }
 }

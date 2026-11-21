@@ -58,7 +58,7 @@ function baseCaps() {
 // Fresh Appium session with app data preserved (noReset). Install/uninstall
 // is done explicitly with adb (first step), so session churn never wipes data.
 async function newSession(caps) {
-  if (driver) { try { await driver.deleteSession(); } catch (_) { /* already gone */ } }
+  if (driver) { try { await driver.deleteSession(); } catch { /* already gone */ } }
   driver = await remote({
     protocol: 'http', hostname: '127.0.0.1', port: 4723, path: '/',
     capabilities: caps,
@@ -147,7 +147,7 @@ async function main() {
 
   await step('appium session: clean install + launch', async () => {
     // Deterministic clean slate via adb; Appium reset semantics stay out of it.
-    try { adb('uninstall', PKG); } catch (_) { /* not installed */ }
+    try { adb('uninstall', PKG); } catch { /* not installed */ }
     adb('install', APK);
     await newSession({
       ...baseCaps(),

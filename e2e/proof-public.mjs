@@ -41,6 +41,7 @@
  */
 import { remote } from 'webdriverio'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 
 import path from 'node:path'
@@ -165,6 +166,36 @@ function runRecord(did, rkey) {
   return JSON.parse(v.out.trim())
 }
 
+// CIDv1 raw + sha2-256, multibase base32 — the ATProto blob CID shape.
+// Independent re-implementation (same algorithm as appview/media.mjs
+// cidForBytes/blobMatchesCid, written separately so the photo leg does
+// not trust the serving layer's own check): SHA-256 the bytes, prefix
+// 0x01 (CIDv1) 0x55 (raw codec) 0x12 0x20 (sha2-256, 32 bytes),
+// base32-encode (RFC 4648, no padding), prepend 'b'.
+const B32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567'
+function base32Encode(bytes) {
+  let out = ''
+  let acc = 0
+  let bits = 0
+  for (const b of bytes) {
+    acc = (acc << 8) | b
+    bits += 8
+    while (bits >= 5) {
+      out += B32_ALPHABET[(acc >> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) out += B32_ALPHABET[(acc << (5 - bits)) & 31]
+  return out
+}
+function cidForBytes(bytes) {
+  const digest = createHash('sha256').update(bytes).digest()
+  return 'b' + base32Encode(Buffer.concat([Buffer.from([0x01, 0x55, 0x12, 0x20]), digest]))
+}
+function cidMatches(cid, bytes) {
+  return cid === cidForBytes(bytes)
+}
+
 /* ---------------- app-side helpers -------------------------------------- */
 
 async function makeSession(udid) {
@@ -200,7 +231,30 @@ async function evalJs(driver, script) {
   return driver.executeScript('return eval(arguments[0])', [script])
 }
 
-async function createRecipe(driver, title, ingredients, stepText) {
+async function attachPhoto(driver) {
+  // Same technique as proof-migration: chromedriver cannot drive the
+  // OS file picker, so inject the fixture JPEG via DataTransfer +
+  // bubbling change event on the photo file input, then wait for the
+  // attached-photo thumbnail. The fixture is embedded as base64
+  // (evalJs has no argument channel beyond the script string).
+  const b64 = fs.readFileSync(new URL('./fixtures/photo.jpg', import.meta.url)).toString('base64')
+  await evalJs(driver, `
+    var b64 = ${JSON.stringify(b64)};
+    var bin = atob(b64);
+    var arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    var file = new File([arr], "photo.jpg", { type: "image/jpeg" });
+    var dt = new DataTransfer();
+    dt.items.add(file);
+    var input = document.querySelector('[data-testid="field-photos"]');
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    "attached";
+  `)
+  await (await driver.$('img[alt="Attached photo 1"]')).waitForExist({ timeout: 30000 })
+}
+
+async function createRecipe(driver, title, ingredients, stepText, withPhoto = false) {
   await (await driver.$('[data-testid="new-recipe"]')).click()
   await (await driver.$('[data-testid="field-title"]')).waitForExist({ timeout: 20000 })
   await (await driver.$('[data-testid="field-title"]')).setValue(title)
@@ -210,6 +264,7 @@ async function createRecipe(driver, title, ingredients, stepText) {
   }
   await (await driver.$('[data-testid="field-step"]')).setValue(stepText)
   await (await driver.$('[data-testid="add-step"]')).click()
+  if (withPhoto) await attachPhoto(driver)
   await (await driver.$('[data-testid="save-recipe"]')).click()
   await (await driver.$('[data-testid="recipe-title"]')).waitForExist({ timeout: 20000 })
 }
@@ -270,7 +325,9 @@ async function main() {
   const A = await makeSession('emulator-5554')
   try {
     // ---- 1. Create the stew, sign in, publish via UI ---------------------
-    await createRecipe(A, STEW, ['2 cups flour', '1 tsp smoked paprika'], 'Stew it low and slow.')
+    // The stew carries the fixture photo (attachPhoto), so the photo
+    // leg (§4c) can prove the blob path end to end.
+    await createRecipe(A, STEW, ['2 cups flour', '1 tsp smoked paprika'], 'Stew it low and slow.', true)
     step('app: recipe created', true)
 
     await (await A.$('[data-testid="open-publish-settings"]')).click()
@@ -294,9 +351,29 @@ async function main() {
     await evalJs(A, 'window.confirm = () => true')
     const t0 = Date.now()
     await (await A.$('[data-testid="visibility-public"]')).click()
+    // Wait for THIS run's publish to land in the registry FIRST, then
+    // search for that exact (did, rkey). The old order searched by
+    // name alone, and the AppView index persists across runs: a stale
+    // stew from a prior run could satisfy the name poll in ~300ms,
+    // before this run's publish had written its registry entry
+    // (attempt-1 flake, 2026-11-21: search latency 285 ms, registry
+    // empty, stewId undefined, the verifier binding lookup threw
+    // "recipe undefined not found"). The registry write happens after
+    // putRecord, so a registry entry proves this run published; app
+    // data was cleared at proof start, so the first entry is this
+    // run's stew. If the registry stays empty, fail here with a clear
+    // error instead of cascading into a misleading verifier failure.
+    const regFound = await pollUntil(async () => {
+      const raw = await evalJs(A, 'localStorage.getItem("longtable:publications:v1") || "{}"')
+      const keys = Object.keys(JSON.parse(raw))
+      return keys[0] || null
+    }, 60000, 500)
+    const stewId = regFound.value
+    step('app: publication registry holds the record', !!stewId, stewId ? `rkey=${stewId}` : 'empty after 60s')
+    if (!stewId) throw new Error('publication registry empty 60s after the visibility click — this run did not publish')
     const found = await pollUntil(async () => {
       const rs = await appviewSearch({ q: STEW })
-      return rs.find((r) => r.did === AUTHOR.did) || null
+      return rs.find((r) => r.did === AUTHOR.did && r.rkey === stewId) || null
     }, 60000, 200)
     const latencyMs = Date.now() - t0
     step(
@@ -305,13 +382,6 @@ async function main() {
       found.value ? `search latency ${latencyMs} ms from visibility click` : 'not found in 60s',
     )
 
-    const registryRaw = await evalJs(
-      A,
-      'localStorage.getItem("longtable:publications:v1") || "{}"',
-    )
-    const registry = JSON.parse(registryRaw)
-    const stewId = Object.keys(registry)[0]
-    step('app: publication registry holds the record', !!stewId, stewId ? `rkey=${stewId}` : '')
 
     // ---- 2. AppView search semantics --------------------------------------
     const byIngredients = await appviewSearch({ ingredients: 'flour,paprika' })
@@ -396,6 +466,35 @@ async function main() {
         searchHit.deviceSignature === full.deviceSignature &&
         searchHit.deviceKey === full.deviceKey,
     )
+
+    // ---- 4c. Photo blob: the bytes behind the record's image CID ---------
+    // The stew was created with the fixture photo attached (§1), so the
+    // published record carries an image CID. The AppView serves the
+    // blob at /media/:did/:cid after fetching it from the PDS and
+    // verifying the bytes against the CID — this leg proves the whole
+    // photo path end to end (client uploadBlob + CID check, PDS blob,
+    // AppView media fetch + CID verify), which no proof exercised
+    // before. The CID check is recomputed here independently (SHA-256
+    // + CIDv1 raw base32) — never trust the serving layer's own word.
+    // Byte-equality with the fixture is NOT asserted: the client
+    // downscales the photo on attach, so the published blob is a
+    // re-encode of the fixture.
+    const photoRec = runRecord(AUTHOR.did, stewId)
+    const photoRef = photoRec.images?.[0]?.ref
+    const photoCid = typeof photoRef?.$link === 'string' ? photoRef.$link
+      : typeof photoRef === 'string' ? photoRef : null
+    step('photo: published record carries an image CID', typeof photoCid === 'string' && photoCid.length > 0, photoCid ?? 'no images[] ref')
+    if (photoCid) {
+      const mediaRes = await fetch(`${APPVIEW}/media/${encodeURIComponent(AUTHOR.did)}/${encodeURIComponent(photoCid)}`)
+      step('photo: AppView serves the blob for the record CID', mediaRes.status === 200, `HTTP ${mediaRes.status}`)
+      if (mediaRes.status === 200) {
+        const photoBytes = Buffer.from(await mediaRes.arrayBuffer())
+        step('photo: served blob is non-empty', photoBytes.length > 0, `${photoBytes.length} bytes`)
+        step('photo: served bytes hash to the record CID (CIDv1 raw sha2-256)', cidMatches(photoCid, photoBytes), `cid=${photoCid}`)
+        const mediaType = mediaRes.headers.get('content-type') ?? ''
+        step('photo: served blob is an image', mediaType.startsWith('image/'), mediaType)
+      }
+    }
 
     // ---- 5. Forge attempts --------------------------------------------------
     // (a) Mallory's token, Olga's repo — the PDS itself must refuse.

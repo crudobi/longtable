@@ -56,6 +56,12 @@ if [ -z "$STATE" ]; then
   STATE=$(cd "$REPO/../.." 2>/dev/null && pwd)/ops/longtable-ci
 fi
 [ -d "$STATE" ] || { echo "history-scan: state dir missing: $STATE" >&2; exit 2; }
+# Sec L21: the installed copy must track the repo — a stale installed
+# script silently runs old gates (the pre-H3 installed copy ran the
+# worktree scanner and skipped the message scan entirely). Fail closed
+# on drift; the operator re-runs ci/install-ci.sh after any ci/ change.
+[ -f "$REPO/ci/history-scan.sh" ] || { echo "history-scan: repo copy missing: $REPO/ci/history-scan.sh" >&2; exit 2; }
+cmp -s "$STATE/history-scan.sh" "$REPO/ci/history-scan.sh" || { echo "history-scan: installed copy $STATE/history-scan.sh differs from $REPO/ci/history-scan.sh — run ci/install-ci.sh" >&2; exit 2; }
 # Hash-pinned scanner (H3): the scan must not judge history with a
 # scanner from the history it judges. The pinned copy is verified
 # against its sha256sums manifest before every run; a missing pin or
@@ -118,8 +124,10 @@ for rev in $REVS; do
 done
 # Keep only rev-prefixed hit lines (drop the per-rev summary lines).
 # The path is matched with .+ so a hit on an unusually-named path is
-# never silently dropped from the baseline comparison.
-grep -E '^[0-9a-f]{7,40}:.+:[0-9]+:(pattern|secret)$' "$TMP/hits" > "$TMP/hitlines" || true
+# never silently dropped from the baseline comparison. The
+# secret-binary class (S30: a secrets literal in a binary blob, no
+# line number) is a hit like any other.
+grep -E '^[0-9a-f]{7,40}:.+:[0-9]+:(pattern|secret|secret-binary)$' "$TMP/hits" > "$TMP/hitlines" || true
 sort -u "$TMP/hitlines" -o "$TMP/hitlines"
 HIT_COUNT=$(wc -l < "$TMP/hitlines")
 echo "history-scan: $HIT_COUNT distinct hits across $REV_COUNT revs"

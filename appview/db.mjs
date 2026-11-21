@@ -321,7 +321,7 @@ export class RecipeIndex {
     const refs = []
     const cidRe = /^[A-Za-z0-9]+$/
     for (const row of this.db.prepare('SELECT did, images FROM recipes').all()) {
-      let images = []
+      let images
       try {
         images = JSON.parse(row.images)
       } catch {
@@ -345,7 +345,7 @@ export class RecipeIndex {
    */
   hasImage(did, cid) {
     for (const row of this.db.prepare('SELECT images FROM recipes WHERE did = ?').all(did)) {
-      let images = []
+      let images
       try {
         images = JSON.parse(row.images)
       } catch {
@@ -442,11 +442,11 @@ export class RecipeIndex {
     const clauses = []
     const params = []
     if (q) {
-      clauses.push("lower(name) LIKE ? ESCAPE '\'")
+      clauses.push("lower(name) LIKE ? ESCAPE '\\'")
       params.push(`%${escapeLikePattern(String(q).toLowerCase())}%`)
     }
     for (const ing of ingList) {
-      clauses.push("lower(ingredients) LIKE ? ESCAPE '\'")
+      clauses.push("lower(ingredients) LIKE ? ESCAPE '\\'")
       params.push(`%${escapeLikePattern(ing.toLowerCase())}%`)
     }
     const sql = `SELECT * FROM recipes ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY name ASC LIMIT 100`
