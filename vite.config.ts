@@ -1,4 +1,5 @@
 import { defineConfig, type Plugin } from 'vite'
+import { configDefaults } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import wasm from 'vite-plugin-wasm'
 import { VitePWA } from 'vite-plugin-pwa'
@@ -111,5 +112,15 @@ export default defineConfig({
   ],
   test: {
     environment: 'node',
+    // signaling/server.test.mjs and hub/web-server.test.mjs are node:test
+    // suites (run with `node --test ...`); vitest's default collection
+    // picks up *.test.mjs and reports them as failed suites ("No test
+    // suite found"), so exclude them here. The files and their
+    // node --test invocation stay intact.
+    exclude: [
+      ...configDefaults.exclude,
+      'signaling/server.test.mjs',
+      'hub/web-server.test.mjs',
+    ],
   },
 })
