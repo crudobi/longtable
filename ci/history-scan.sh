@@ -15,20 +15,28 @@
 # case the per-commit stage cannot see (a secret committed and reverted
 # before HEAD is still public on GitHub).
 #
-# Usage: history-scan.sh [--repo DIR] [--state DIR]
+# Usage: history-scan.sh [--repo DIR] [--state DIR] [--establish-baseline]
 # Status: $STATE/history-scan.json (+ a per-run log under
 # $STATE/logs/). Exit 0 = clean, known-baseline-only, or baseline
-# established on the first run; exit 1 = new hits (needs human review).
+# established with --establish-baseline; exit 1 = new hits (needs human
+# review), missing baseline (re-run with --establish-baseline after a
+# human has reviewed the current hits), or baseline hits removed
+# (history rewritten or baseline stale — needs human review).
+# A missing baseline is NEVER silently re-established: deleting the
+# baseline plus introducing a leak would otherwise make the leak
+# "known" on the next run (S14).
 set -uo pipefail
 
 REPO=""
 STATE=""
+ESTABLISH_BASELINE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)  [ $# -ge 2 ] || { echo "history-scan: --repo needs a value" >&2; exit 2; }; REPO=$2; shift 2 ;;
     --state) [ $# -ge 2 ] || { echo "history-scan: --state needs a value" >&2; exit 2; }; STATE=$2; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --establish-baseline) ESTABLISH_BASELINE=1; shift ;;
+    -h|--help) sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
     --) shift; break ;;
     -*) echo "history-scan: unknown option $1" >&2; exit 2 ;;
     *) echo "history-scan: unexpected argument $1" >&2; exit 2 ;;
@@ -108,6 +116,15 @@ echo "history-scan: $HIT_COUNT distinct hits across $REV_COUNT revs"
 FINISHED=$(date -Iseconds)
 NEW_HITS="[]"
 if [ ! -f "$BASELINE" ]; then
+  if [ "$ESTABLISH_BASELINE" != 1 ]; then
+    # Fail closed (S14): a missing baseline is never silently
+    # re-established — that would bless whatever the current history
+    # contains, including a fresh leak. The operator establishes it
+    # explicitly after reviewing the hits in the log.
+    RESULT="missing-baseline"
+    echo "history-scan: NO BASELINE at $BASELINE — refusing to silently establish one"
+    echo "history-scan: review the $HIT_COUNT hits in the log, then re-run with --establish-baseline"
+  else
   python3 - "$BASELINE" "$TMP/hitlines" "$HEAD" "$REV_COUNT" "$STARTED" <<'PYEOF'
 import json, sys
 baseline_path, hits_path, head, revs, started = sys.argv[1:6]
@@ -117,6 +134,7 @@ with open(baseline_path, "w") as f:
 PYEOF
   RESULT="baseline-established"
   echo "history-scan: baseline established with $HIT_COUNT known hits"
+  fi
 else
   python3 - "$BASELINE" "$TMP/hitlines" > "$TMP/newhits" <<'PYEOF'
 import json, sys
@@ -133,6 +151,13 @@ PYEOF
   if [ "$NEW_COUNT" -gt 0 ]; then
     RESULT="dirty"
     echo "history-scan: $NEW_COUNT NEW hits (and $REMOVED_COUNT baseline hits gone)"
+  elif [ "$REMOVED_COUNT" -gt 0 ]; then
+    # Fail closed (S14): baseline hits disappearing means history was
+    # rewritten or the baseline is stale. Either way a human must
+    # confirm it is a legitimate rewrite, not a baseline trimmed to
+    # hide a leak — silently accepting the smaller set would do that.
+    RESULT="removed-hits"
+    echo "history-scan: $REMOVED_COUNT baseline hits gone (history rewritten or baseline stale) — needs human review"
   else
     RESULT="known"
     echo "history-scan: no new hits ($HIT_COUNT total, all in baseline; $REMOVED_COUNT baseline hits gone)"
@@ -161,6 +186,14 @@ echo "history-scan: result=$RESULT hits=$HIT_COUNT revs=$REV_COUNT log=$LOG"
 echo "history-scan: result=$RESULT hits=$HIT_COUNT revs=$REV_COUNT log=$LOG"
 if [ "$RESULT" = dirty ]; then
   echo "history-scan: NEW HITS NEED HUMAN REVIEW — see $STATUS" >&2
+  exit 1
+fi
+if [ "$RESULT" = missing-baseline ]; then
+  echo "history-scan: MISSING BASELINE — review the hits, then re-run with --establish-baseline" >&2
+  exit 1
+fi
+if [ "$RESULT" = removed-hits ]; then
+  echo "history-scan: BASELINE HITS REMOVED — see $STATUS" >&2
   exit 1
 fi
 exit 0

@@ -16,6 +16,10 @@
  *    connection, and 200 messages per 10s per connection (excess
  *    dropped, not disconnected — y-webrtc clients are nowhere near
  *    these numbers; they only bite floods)
+ *  - malformed messages (bad JSON, non-object payloads, non-array
+ *    `topics`) are dropped and counted; a single bad message can never
+ *    kill the process (S4 — the message handler is guarded and the
+ *    subscribe/unsubscribe branches require an array)
  *
  * Later this becomes the hub's signaling component; the protocol stays
  * y-webrtc-compatible so any spec-compliant client works.
@@ -57,6 +61,7 @@ let statConns = 0
 let statPublishes = 0
 let statRateDrops = 0
 let statTopicDrops = 0
+let statMalformedDrops = 0
 /** source IP -> live connection count (for MAX_CONNS_PER_IP) */
 const connsByIp = new Map()
 
@@ -118,6 +123,11 @@ const onConnection = (conn, req) => {
   let rateCount = 0
 
   conn.on('message', raw => {
+    // Defense in depth (S4): no single malformed message may kill the
+    // process. The per-branch guards below drop bad shapes; this catch
+    // is the backstop for anything they miss. The message is dropped
+    // and counted; the connection stays up.
+    try {
     const now = Date.now()
     if (now - rateWindowStart >= RATE_LIMIT_WINDOW_MS) {
       rateWindowStart = now
@@ -139,7 +149,11 @@ const onConnection = (conn, req) => {
     switch (msg.type) {
       case 'subscribe':
         if (process.env.SIGNAL_DEBUG) console.log('[signal] subscribe', msg.topics);
-        for (const t of msg.topics || []) {
+        if (!Array.isArray(msg.topics)) {
+          statMalformedDrops++
+          break
+        }
+        for (const t of msg.topics) {
           if (!validTopic(t)) {
             continue
           }
@@ -157,7 +171,11 @@ const onConnection = (conn, req) => {
         }
         break
       case 'unsubscribe':
-        for (const t of msg.topics || []) {
+        if (!Array.isArray(msg.topics)) {
+          statMalformedDrops++
+          break
+        }
+        for (const t of msg.topics) {
           const set = topics.get(t)
           if (set !== undefined) {
             set.delete(conn)
@@ -191,6 +209,9 @@ const onConnection = (conn, req) => {
         send(conn, { type: 'pong' })
         break
       // unknown types: ignore
+    }
+    } catch {
+      statMalformedDrops++
     }
   })
 
@@ -269,6 +290,6 @@ server.listen(PORT, () => {
 
 if (STATS) {
   setInterval(() => {
-    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes} rateDrops=${statRateDrops} topicDrops=${statTopicDrops}`)
+    console.log(`stats: topics=${topics.size} connections=${statConns} publishes=${statPublishes} rateDrops=${statRateDrops} topicDrops=${statTopicDrops} malformedDrops=${statMalformedDrops}`)
   }, 5000).unref()
 }
