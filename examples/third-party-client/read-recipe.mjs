@@ -9,7 +9,8 @@
  *
  *   1. Find a public recipe through an AppView search.
  *   2. Resolve the author's DID document (signing key + PDS endpoint).
- *   3. Fetch the pubkey binding + recipe records from the author's PDS.
+ *   3. Fetch the recipe record, then the pubkey binding for the recipe's
+ *      OWN device (per-device rkey, H-N1) from the author's PDS.
  *   4. Verify the repo export (commit signature; record CID present).
  *   5. Verify the device-key binding signature.
  *   6. Verify the recipe's device signature over its canonical hash.
@@ -165,6 +166,17 @@ function deviceKeyFromDid(deviceDid) {
   return raw.slice(2)
 }
 
+/* The per-device binding rkey (docs/public-protocol.md, H-N1): `dev-` +
+ * the first 32 hex chars of the BLAKE2b-256 of the deviceDid string.
+ * The deviceDid itself is never the rkey. Cross-implementation pin
+ * (same vector the protocol doc and the client pin):
+ * pubkeyRkeyForDeviceDid('did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK')
+ * === 'dev-af0042b31ec6679cc02818a49bf60f70'. */
+function pubkeyRkeyForDeviceDid(deviceDid) {
+  const hashHex = sodium.to_hex(sodium.crypto_generichash(32, sodium.from_string(deviceDid)))
+  return `dev-${hashHex.slice(0, 32)}`
+}
+
 async function main() {
   await sodium.ready
   const args = process.argv.slice(2)
@@ -203,12 +215,24 @@ async function main() {
     const url =
       `${pdsUrl}/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}` +
       `&collection=${encodeURIComponent(collection)}&rkey=${encodeURIComponent(key)}`
-    return getJson(url)
+    const res = await fetch(url)
+    if (res.status === 404) return null
+    if (!res.ok) throw new Error(`GET ${url} → HTTP ${res.status}`)
+    return res.json()
   }
-  const pubkeyRes = await getRecord('kitchen.longtable.pubkey', 'self')
   const recipeRes = await getRecord('kitchen.longtable.recipe', rkey)
-  const binding = pubkeyRes.value
+  if (!recipeRes) throw new Error(`recipe ${rkey} not found in ${did}'s repo`)
   const record = recipeRes.value
+  // The binding lives at the recipe's OWN device's per-device rkey
+  // (H-N1). The legacy single-slot `self` record is only a fallback for
+  // recipes published by pre-H-N1 clients — it names whatever device
+  // wrote it last, which is generally not this recipe's device.
+  const bindingRkey = pubkeyRkeyForDeviceDid(record.deviceDid)
+  const pubkeyRes =
+    (await getRecord('kitchen.longtable.pubkey', bindingRkey)) ??
+    (await getRecord('kitchen.longtable.pubkey', 'self'))
+  if (!pubkeyRes) throw new Error(`no pubkey binding for device ${record.deviceDid}`)
+  const binding = pubkeyRes.value
   pass('records fetched from the author\'s PDS', `"${record.name}" (${record.ingredients?.length ?? 0} ingredients)`)
 
   /* ---- Step 4: verify the repo export itself */
