@@ -13,15 +13,28 @@
  * com.atproto.server.refreshSession with the refreshJwt) and retry; the
  * refreshed tokens are written back into the passed session object and
  * into the optional onSessionRefresh callback so callers can persist them.
+ *
+ * Timeouts (Sec L13): every XRPC call carries an AbortSignal.timeout
+ * (30 s; 120 s for blob uploads), so a hung PDS cannot pin a request
+ * forever. Scheme validation (Sec L14): the constructor refuses a
+ * plaintext PDS URL to a non-local host — JWTs never travel over
+ * plaintext HTTP to a remote host.
  */
 import type { KeyValueStore } from '../identity/identity'
 import { getActiveHub, updateHub } from '../hubs/hubs'
+import { assertSafeHttpUrl } from '../hubs/endpointUrls'
 import { secretKv } from '../secrets/secretStore'
+import { assertStoreWritable, noteCorruptStore, readStoredJson } from '../store/corrupt'
 
 export const SESSION_KEY = 'longtable:atproto-session'
 export const PUBLICATIONS_KEY = 'longtable:publications:v1'
 export const APPVIEW_URL_KEY = 'longtable:appview-url'
 export const DEFAULT_APPVIEW_URL = 'http://localhost:3210'
+
+/** Default XRPC timeout (Sec L13): a hung PDS must not pin a request forever. */
+export const XRPC_TIMEOUT_MS = 30_000
+/** Blob uploads carry up to 5 MiB; they get a longer budget. */
+export const XRPC_UPLOAD_TIMEOUT_MS = 120_000
 
 export const RECIPE_COLLECTION = 'kitchen.longtable.recipe'
 export const PUBKEY_COLLECTION = 'kitchen.longtable.pubkey'
@@ -76,34 +89,51 @@ function trimSlash(url: string): string {
 // Session + settings stores
 // ---------------------------------------------------------------------------
 
+/**
+ * Load the ATProto session (H9 pattern, Wave 4A open item 1). Absent
+ * reads as null; corrupt JSON — or a value that is not a session
+ * object — is quarantined (bytes preserved, see src/store/corrupt.ts)
+ * and reads as null. The old catch-all returned null for corrupt
+ * bytes too, and the next saveSession then overwrote them with a
+ * fresh session — the same shape H9 fixed in the other stores.
+ */
 export function loadSession(kv: PublicKv = secretKv): AtprotoSession | null {
-  try {
-    const raw = kv.getItem(SESSION_KEY)
-    if (!raw) return null
-    const obj: unknown = JSON.parse(raw)
-    if (typeof obj !== 'object' || obj === null) return null
-    const s = obj as Partial<AtprotoSession>
-    if (
-      typeof s.did !== 'string' ||
-      typeof s.accessJwt !== 'string' ||
-      typeof s.refreshJwt !== 'string' ||
-      typeof s.pdsUrl !== 'string'
-    ) {
-      return null
-    }
-    return {
-      did: s.did,
-      handle: typeof s.handle === 'string' ? s.handle : '',
-      pdsUrl: s.pdsUrl,
-      accessJwt: s.accessJwt,
-      refreshJwt: s.refreshJwt,
-    }
-  } catch {
+  const read = readStoredJson(kv, SESSION_KEY)
+  if (read.status === 'absent') return null
+  if (read.status === 'corrupt') return null
+  const obj = read.value
+  if (typeof obj !== 'object' || obj === null) {
+    noteCorruptStore(kv, SESSION_KEY, read.raw, 'not a session object')
     return null
+  }
+  const s = obj as Partial<AtprotoSession>
+  if (
+    typeof s.did !== 'string' ||
+    typeof s.accessJwt !== 'string' ||
+    typeof s.refreshJwt !== 'string' ||
+    typeof s.pdsUrl !== 'string'
+  ) {
+    noteCorruptStore(kv, SESSION_KEY, read.raw, 'session is missing required fields')
+    return null
+  }
+  return {
+    did: s.did,
+    handle: typeof s.handle === 'string' ? s.handle : '',
+    pdsUrl: s.pdsUrl,
+    accessJwt: s.accessJwt,
+    refreshJwt: s.refreshJwt,
   }
 }
 
+/**
+ * Persist the session. Refuses (throws CorruptStoreError) when the
+ * stored session is corrupt: saving a fresh session over the damaged
+ * bytes would destroy them. A corrupt session heals by discarding
+ * the damaged copy from the app's corruption banner (or restoring
+ * from an encrypted backup), then signing in again.
+ */
 export function saveSession(session: AtprotoSession, kv: PublicKv = secretKv): void {
+  assertStoreWritable(SESSION_KEY)
   kv.setItem(SESSION_KEY, JSON.stringify(session))
 }
 
@@ -124,6 +154,8 @@ export function loadAppViewUrl(kv: PublicKv = secretKv): string {
 
 export function saveAppViewUrl(url: string, kv: PublicKv = secretKv): void {
   const clean = trimSlash(url)
+  // Sec L14: refuse a plaintext AppView URL to a non-local host.
+  assertSafeHttpUrl(clean, 'Discovery (AppView) URL')
   kv.setItem(APPVIEW_URL_KEY, clean)
   // Keep the active hub in sync so the hub list shows where discovery
   // actually points. Best-effort: a registry write failure must not break
@@ -145,6 +177,10 @@ export interface AtprotoClientOptions {
   fetchFn?: FetchFn
   /** Called with the session after a token refresh so callers can persist it. */
   onSessionRefresh?: (session: AtprotoSession) => void
+  /** XRPC timeout in ms (default XRPC_TIMEOUT_MS). */
+  timeoutMs?: number
+  /** Blob-upload timeout in ms (default XRPC_UPLOAD_TIMEOUT_MS). */
+  uploadTimeoutMs?: number
 }
 
 interface XrpcErrorBody {
@@ -156,11 +192,20 @@ export class AtprotoClient {
   readonly pdsUrl: string
   private readonly fetchFn: FetchFn
   private readonly onSessionRefresh?: (session: AtprotoSession) => void
+  private readonly timeoutMs: number
+  private readonly uploadTimeoutMs: number
 
   constructor(pdsUrl: string, options: AtprotoClientOptions = {}) {
+    // Sec L14: JWTs travel on every authed call, so a plaintext PDS
+    // URL to a non-local host is refused here, before any request.
+    // http://localhost (and the emulator loopback) stays allowed:
+    // the dev PDS runs there and no network path is involved.
+    assertSafeHttpUrl(trimSlash(pdsUrl), 'PDS URL')
     this.pdsUrl = trimSlash(pdsUrl)
     this.fetchFn = options.fetchFn ?? ((url, init) => fetch(url, init))
     this.onSessionRefresh = options.onSessionRefresh
+    this.timeoutMs = options.timeoutMs ?? XRPC_TIMEOUT_MS
+    this.uploadTimeoutMs = options.uploadTimeoutMs ?? XRPC_UPLOAD_TIMEOUT_MS
   }
 
   private url(path: string): string {
@@ -187,6 +232,7 @@ export class AtprotoClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identifier, password }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     })
     if (!res.ok) throw await this.parseError(res)
     const data = (await res.json()) as {
@@ -211,6 +257,7 @@ export class AtprotoClient {
   async refreshSession(session: AtprotoSession): Promise<AtprotoSession> {
     const res = await this.fetchFn(this.url('com.atproto.server.refreshSession'), {
       method: 'POST',
+      signal: AbortSignal.timeout(this.timeoutMs),
       headers: { Authorization: `Bearer ${session.refreshJwt}` },
     })
     if (!res.ok) throw await this.parseError(res)
@@ -236,15 +283,24 @@ export class AtprotoClient {
     session: AtprotoSession,
     path: string,
     makeInit: (accessJwt: string) => RequestInit,
+    timeoutMs: number = this.timeoutMs,
   ): Promise<Response> {
-    let res = await this.fetchFn(this.url(path), makeInit(session.accessJwt))
+    // Sec L13: every XRPC call carries a timeout so a hung PDS cannot
+    // pin the request (and the UI) forever. The signal is fresh per
+    // attempt — a refresh-and-retry gets its own full budget.
+    const call = (jwt: string): Promise<Response> =>
+      this.fetchFn(this.url(path), {
+        ...makeInit(jwt),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    let res = await call(session.accessJwt)
     if (res.ok) return res
     const err = await this.parseError(res)
     const expired =
       err.status === 401 || err.error === 'ExpiredToken' || err.error === 'InvalidToken'
     if (!expired) throw err
     await this.refreshSession(session)
-    res = await this.fetchFn(this.url(path), makeInit(session.accessJwt))
+    res = await call(session.accessJwt)
     if (!res.ok) throw await this.parseError(res)
     return res
   }
@@ -289,7 +345,9 @@ export class AtprotoClient {
     rkey: string,
   ): Promise<{ uri: string; cid: string; value: Record<string, unknown> } | null> {
     const qs = new URLSearchParams({ repo, collection, rkey })
-    const res = await this.fetchFn(`${this.url('com.atproto.repo.getRecord')}?${qs}`)
+    const res = await this.fetchFn(`${this.url('com.atproto.repo.getRecord')}?${qs}`, {
+      signal: AbortSignal.timeout(this.timeoutMs),
+    })
     if (res.ok) {
       return (await res.json()) as {
         uri: string
@@ -317,11 +375,16 @@ export class AtprotoClient {
     bytes: Uint8Array,
     mimeType: string,
   ): Promise<AtprotoBlob> {
-    const res = await this.authed(session, 'com.atproto.repo.uploadBlob', (jwt) => ({
+    const res = await this.authed(
+      session,
+      'com.atproto.repo.uploadBlob',
+      (jwt) => ({
       method: 'POST',
       headers: { 'Content-Type': mimeType, Authorization: `Bearer ${jwt}` },
       body: bytes as unknown as BodyInit,
-    }))
+      }),
+      this.uploadTimeoutMs,
+    )
     const data = (await res.json()) as { blob: AtprotoBlob }
     return data.blob
   }
@@ -341,7 +404,9 @@ export class AtprotoClient {
   /** Download a blob's raw bytes (public read). */
   async getBlob(did: string, cid: string): Promise<ArrayBuffer> {
     const qs = new URLSearchParams({ did, cid })
-    const res = await this.fetchFn(`${this.url('com.atproto.sync.getBlob')}?${qs}`)
+    const res = await this.fetchFn(`${this.url('com.atproto.sync.getBlob')}?${qs}`, {
+      signal: AbortSignal.timeout(this.timeoutMs),
+    })
     if (!res.ok) throw await this.parseError(res)
     return res.arrayBuffer()
   }

@@ -626,7 +626,9 @@ async function wipeDoc(repo: YjsStore, guid: string): Promise<void> {
   const cached = repo.docs.get(guid)
   repo.docs.delete(guid)
   repo.pending.delete(guid)
-  if (cached) {
+  // L-N3: an in-memory (degraded) doc has no persistence to clear;
+  // dropping it from the cache is the whole wipe.
+  if (cached?.persistence) {
     await cached.persistence.clearData()
   }
 }

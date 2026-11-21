@@ -27,6 +27,7 @@ import {
   noteCorruptStore,
   readStoredJson,
 } from '../store/corrupt'
+import { assertSafeHttpUrl, assertSafeWsUrl } from './endpointUrls'
 
 export interface HubConfig {
   id: string
@@ -281,6 +282,17 @@ export function setActiveHub(id: string, kv: KeyValueStore = defaultKv()): HubCo
 
 let idCounter = 0
 
+/**
+ * Sec L14: validate a hub's endpoint URLs. Signaling is ws(s),
+ * AppView + PDS are http(s); plaintext is loopback-only in each
+ * case (see endpointUrls.ts). Throws a plain-language Error.
+ */
+function assertHubUrls(hub: HubConfig): void {
+  assertSafeWsUrl(hub.signalingUrl, 'Signaling URL')
+  assertSafeHttpUrl(hub.appviewUrl, 'Discovery (AppView) URL')
+  assertSafeHttpUrl(hub.pdsUrl, 'Publishing (PDS) URL')
+}
+
 /** Add a hub; returns it (with its generated id). Does not activate it. */
 export function addHub(
   input: Omit<HubConfig, 'id'> & { id?: string },
@@ -293,6 +305,12 @@ export function addHub(
   if (reg.hubs.some((h) => h.id === id)) throw new Error(`duplicate hub id: ${id}`)
   const hub: HubConfig = { ...input, id }
   if (!isHubConfig(hub)) throw new Error('invalid hub configuration')
+  // Sec L14: a hub's URLs carry JWTs / sync traffic — refuse
+  // plaintext to a non-local host at write time, before anything
+  // is saved. (A registry saved before this rule keeps loading;
+  // its URLs fail closed at first use instead — see
+  // endpointUrls.ts.)
+  assertHubUrls(hub)
   reg.hubs.push(hub)
   saveRegistry(reg, kv)
   return hub
@@ -309,6 +327,7 @@ export function updateHub(
   if (i < 0) throw new Error(`unknown hub: ${id}`)
   const next = { ...reg.hubs[i], ...patch, id }
   if (!isHubConfig(next)) throw new Error('invalid hub configuration')
+  assertHubUrls(next)
   reg.hubs[i] = next
   saveRegistry(reg, kv)
   return next
