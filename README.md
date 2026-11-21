@@ -10,7 +10,11 @@ What works today:
 - **Cookbook** — create/edit/delete recipes with photos, fully offline.
   One Yjs document per recipe in IndexedDB.
 - **Sharing** — one-off recipe rooms over WebRTC (QR/paste), with
-  concurrent edits merging losslessly.
+  concurrent edits merging: scalar fields merge, but list fields
+  (ingredients, steps, photos) replace wholesale, so concurrent edits
+  to the same list can drop one side (see `src/store/recipes.ts`,
+  `replaceArray`). Per-element list merging is out of scope — see
+  [docs/architecture.md](docs/architecture.md).
 - **Friends** — pairing by invite code (device DIDs, no accounts),
   friends-only recipes end-to-end encrypted per friend, with key
   rotation on unfriend (forward-only: delivered copies stay readable —
@@ -50,6 +54,7 @@ What works today:
 ## For developers
 
 - [docs/](docs/README.md) — the developer documentation index.
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 - [docs/architecture.md](docs/architecture.md) — the module map: every
   subsystem, its public interface, and its boundary rule.
 - [docs/importers.md](docs/importers.md) — write an importer (Importer

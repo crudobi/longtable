@@ -95,6 +95,19 @@ longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>
 Both signatures are Ed25519 detached signatures produced by the device
 key, base64-encoded in the records.
 
+**What the hash does NOT cover (documented decision, Int L5).**
+`createdAt` / `updatedAt`, image mime/size, and the record `$type`
+are not inputs to the canonical hash: two records that differ only in
+a timestamp, in a photo's mime type or byte size, or in `$type` hash
+identically and verify identically. That is deliberate — the signed
+message (`longtable-recipe:v1`) covers the recipe content, not its
+metadata — and it is frozen: adding a field to the hash would change
+the signed message and invalidate every existing recipe signature, so
+it can only happen as a versioned message-format change, never as a
+quiet fix. The same statement lives in the code at
+`appview/device-signature.mjs` (`canonicalRecipeHashHex`) and
+`src/public/publish.ts` (`canonicalRecipeHash`).
+
 ## Reading and verifying a public recipe (third-party flow)
 
 1. **Find it.** Query any AppView (below) by name or ingredients, or

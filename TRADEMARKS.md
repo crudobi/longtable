@@ -14,5 +14,7 @@ they can inspect here.
   protocol may say so ("works with Longtable", "a Longtable hub"), but
   may not present themselves as the Longtable project itself.
 
-That's all. If a use isn't covered here and you're unsure, ask — the
-intent is to prevent confusion, not to control what anyone builds.
+That's all. If a use isn't covered here and you're unsure, ask the
+maintainer — Crud <crudobi@proton.me> (the address on the sign-off of
+every commit in this repository) — the intent is to prevent confusion,
+not to control what anyone builds.
