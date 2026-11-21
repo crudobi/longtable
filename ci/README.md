@@ -17,9 +17,23 @@ processed (M2).
 - `longtable-ci.path` (systemd path unit) watches
   `.git/refs/heads/main`; any commit to `main` fires
   `longtable-ci.service` within seconds.
+- `longtable-ci-tag.path` (systemd path unit, Wave 6C) watches
+  `.git/refs/tags` and `.git/packed-refs`; any tag change fires
+  `longtable-ci.service` within seconds. Tagging an
+  already-processed commit re-runs the pipeline for the tag: the
+  main loop (`lt_main_loop` in `ci/run-pipeline.sh`) records the
+  sorted set of tags pointing at HEAD in
+  `last-processed-tags` (one tag per line, beside
+  `last-processed`) and re-runs when that set is non-empty and
+  differs from the recorded set. A tag deleted from HEAD does not
+  re-trigger; a second tag added to the same commit does. The tag
+  set is recorded only on a successful run, so a failed tagged
+  run retries on the next trigger like a failed commit run.
 - `longtable-ci.timer` re-fires the service every 10 minutes as a
   fallback. The runner no-ops when `main` hasn't moved since the last
   processed commit, so the timer costs a few milliseconds when idle.
+  The timer is also the backstop if a path unit ever misses a
+  change — including a tag change.
 - Manual run: `sudo systemctl start longtable-ci.service`
   (or just commit something).
 
@@ -70,38 +84,44 @@ leaks into a build — and runs, in order:
    rewrite would ship a versionCode below the last tagged release,
    which Play refuses). Skips cleanly when no tag is reachable yet.
    Records the count as `version_code` in status.json.
-5. `npm-ci` — `npm ci`
-6. `typecheck` — `tsc --noEmit`
-7. `lint` — `npm run lint`
-8. `unit-tests` — `vitest run`
-9. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
+5. `tag-verify` — (Wave 6C) verifies every tag pointing at HEAD
+   against the operator-pinned public key
+   (`$STATE/tag-signing-key.pub`, see "Signed tags" below).
+   Skips cleanly on untagged commits. Fails closed on an unsigned
+   tag, a tag signed by any other key, or a tagged HEAD with no
+   pinned key configured — before any build or publish.
+6. `npm-ci` — `npm ci`
+7. `typecheck` — `tsc --noEmit`
+8. `lint` — `npm run lint`
+9. `unit-tests` — `vitest run`
+10. `appview-tests` — the hub AppView subpackage (`appview/`): `npm ci` +
    its own vitest suite (ingest filtering, verify-then-index rejection,
    FTS5 search, HTTP API + CORS). The service-dependent proofs
    (`e2e/proof-public.mjs`, `appview` e2e) run against the standing local
    testnet instead — they need live PLC/PDS/AppView processes and fixed
    ports, which a pristine-worktree stage cannot own.
-10. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
-11. `cap-sync` — `npx cap sync android`
-12. `apk` — `gradlew assembleDebug` (JDK 21)
-13. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
+11. `web-build` — `npm run build` (before `cap sync`, per the known gotcha)
+12. `cap-sync` — `npx cap sync android`
+13. `apk` — `gradlew assembleDebug` (JDK 21)
+14. `fleet-provision` — `e2e/run-fleet.sh provision`: provisions +
    boots all three emulator AVDs from bare state if needed (AVD
    creation + fixture-CA trust, verified), ensures the support
    services (Appium, HTTPS fixture, signaling, TURN, ATProto testnet
    + seed, AppView, TLS proxies), and installs the new APK on every
    device.
-14. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
-15. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
+15. `e2e-gate` — `e2e/run-e2e.sh <new apk>`
+16. `migration-proof` — `e2e/proof-migration.mjs`: Phase 0 APK seeds a
    recipe, the new APK upgrades over it, data must survive. Runs on
    **every** commit — this is the test whose absence let the Phase 1
    storage swap orphan user data, and it does not get tiered away.
-16. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
+17. `proof-p2p`, `proof-friends`, `proof-public`, `proof-thirdparty`,
     `proof-importer`, `proof-localapi`, `proof-hubfail` — the
     multi-device oath proofs, one stage each via
     `e2e/run-fleet.sh run <proof>`, in dependency order, each with an
     app-data reset on its devices first. (`proof-thirdparty` consumes
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
-17. `release-build` — rebuilds the web bundle hooks-off (no debug
+18. `release-build` — rebuilds the web bundle hooks-off (no debug
     hooks, no dev TURN password), asserts the hook strings
     (`__ltFriends`/`__ltPublic`/`__ltSecrets`) and the rotated dev
     TURN password are absent from the bundle — the password check
@@ -113,7 +133,7 @@ leaks into a build — and runs, in order:
     rebuilds the debug APK, and asserts the hooks are absent from
     the APK itself (`release_apk_hooks_clean`, L6). That artifact
     is what `publish` ships.
-18. `signed-release` — builds `bundleRelease` + `assembleRelease`
+19. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
     verify`, a signer pin (the release APK's signer-certificate
@@ -126,15 +146,19 @@ leaks into a build — and runs, in order:
     Runs ONLY when HEAD carries an exact git tag and SKIPS
     cleanly (recorded as `signed_release: "skipped"`) on untagged
     commits — the A3 fail-closed rule (release builds refuse untagged
-    or dirty HEADs) is never relaxed. Tag a commit (e.g. `v0.1.0`)
-    and push commit + tag together to cut a signed release.
-19. `publish` — copies the debug APK to the published location in the
+    or dirty HEADs) is never relaxed. The tag must be a SIGNED tag
+    (`git tag -s`); the `tag-verify` stage already checked its
+    signature against the pinned operator key before any build ran.
+    Tag a commit (e.g. `v0.1.0`) and push commit + tag together to
+    cut a signed release — or tag an already-processed commit, which
+    the tag path unit re-runs for the tag (see "Tagging a release").
+20. `publish` — copies the debug APK to the published location in the
     builds dir (`longtable-debug.apk`); when the signed-release stage
     published, also copies `longtable-release.aab` +
     `longtable-release.apk` (+ `longtable-release-mapping.txt` when
     produced — currently not, `minifyEnabled false`) with `.sha256`
     sidecars. Copies are atomic (`.tmp` + rename).
-20. `github-release` — creates a GitHub Release for the tag (A5)
+21. `github-release` — creates a GitHub Release for the tag (A5)
     with the signed `longtable-release.aab` +
     `longtable-release.apk` and their `.sha256` sidecars,
     changelog from `git log` since the previous tag. The generated
@@ -152,13 +176,86 @@ leaks into a build — and runs, in order:
     untagged commits — same gate as signed-release. Fails
     closed if a release for the tag already exists; never
     overwrites or deletes one.
-21. `post-publish-verify` — re-downloads the GitHub Release assets
+22. `post-publish-verify` — re-downloads the GitHub Release assets
     (`gh release download`, retried 3x) and checks each downloaded
     file against its downloaded `.sha256` sidecar AND against the
     local published file. Runs ONLY when this run published a GitHub
     release; skips cleanly otherwise. A mismatch fails the stage —
     the release is already public at that point, so the failure is
     recorded in status.json for the operator, not absorbed.
+
+## Tagging a release
+
+Cut a release by tagging the commit with a SIGNED tag and pushing
+commit + tag together:
+
+```bash
+git tag -s v0.2.3 -m "Longtable v0.2.3"   # signed; see "Signed tags"
+git push origin main v0.2.3
+```
+
+Tagging an already-processed commit works too — that was the Wave 6C
+fix. Previously the pipeline only re-ran when HEAD moved, so a tag
+on an already-processed commit never triggered a release and the
+only recourse was an undocumented manual `last-processed` reset
+(the v0.2.2 precedent). Now `longtable-ci-tag.path` fires the
+service when the tag appears and `lt_main_loop` re-runs the
+pipeline for the new HEAD tag set; the `tag-verify` stage checks
+the signature first, then `signed-release` / `github-release` /
+`post-publish-verify` run as usual.
+
+Manual reset (sanctioned fallback, only if the tag watch ever
+misses a tag): reset `last-processed` to the parent of HEAD so the
+next trigger re-runs HEAD, then start the service (or wait for the
+next 10-minute timer tick). Do NOT touch `last-processed-tags` —
+the re-run records the tag set on success.
+
+```bash
+git -C /store/muscle/code/longtable rev-parse HEAD^ > /store/muscle/ops/longtable-ci/last-processed
+sudo systemctl start longtable-ci.service
+```
+
+After this change is installed, if HEAD already carries a tag whose
+release was cut by the old manual procedure, seed the tag state so
+the next tick does not re-run (and fail at `github-release`, which
+refuses to overwrite the existing release):
+
+```bash
+git -C /store/muscle/code/longtable tag --points-at HEAD | sort > /store/muscle/ops/longtable-ci/last-processed-tags
+```
+
+## Signed tags
+
+Releases require SIGNED tags. The `tag-verify` stage checks every
+tag pointing at HEAD against the operator-pinned public key in the
+ops CI dir (`$STATE/tag-signing-key.pub`, never in the repo): the
+key is imported into a throwaway GNUPGHOME, its fingerprint is
+derived from the key itself, and `git verify-tag --raw` must report
+`VALIDSIG` for exactly that fingerprint. Unsigned tags, tags
+signed by any other key, and tagged HEADs with no pinned key all
+fail the run before any build or publish. Tags v0.1.0–v0.2.2 were
+annotated but unsigned; they point at old commits, so they do not
+trip the gate — but no future release can be cut from an unsigned
+tag.
+
+Creating the operator key is a USER-side action (no key exists for
+this project as of Wave 6C; do not invent or silently create one):
+
+```bash
+gpg --full-generate-key        # RSA or ed25519, signing-capable; no expiry or a dated one, your call
+git config --global user.signingkey <fingerprint>   # gpg --list-secret-keys --keyid-format long
+gpg --armor --export <fingerprint> > /store/muscle/ops/longtable-ci/tag-signing-key.pub
+chmod 644 /store/muscle/ops/longtable-ci/tag-signing-key.pub
+git tag -s v0.2.3 -m "Longtable v0.2.3"   # sign with the pinned key
+git verify-tag v0.2.3                      # sanity check before pushing
+```
+
+Rotating the key means replacing `tag-signing-key.pub` with the new
+public key (old tags stay verifiable in git history; only HEAD tags
+are checked per run). The proof harness
+`ci/test-tag-trigger.sh` covers the verifier with throwaway test
+keys: pass on a pinned-key signature, fail-closed on unsigned,
+wrong-key, lightweight, and missing-key cases.
 
 ## Hash-pinned scanner (H3)
 
@@ -282,6 +379,11 @@ All under the ops CI dir (`<host root>/ops/longtable-ci/`):
   `skipped` / `published`) and the `version_code` recorded by the
   version-guard stage, log path.
 - `history.jsonl` — one JSON line per run, append-only.
+- `last-processed` — the last successfully processed commit; beside
+  it, `last-processed-tags` (Wave 6C) — the sorted tags pointing at
+  that commit when it was processed, one per line.
+- `tag-signing-key.pub` — the operator-pinned tag-signing public key
+  (Wave 6C; see "Signed tags"). Absent until the operator pins one.
 - `history-scan.json` — the latest nightly all-history scan (see
   above); `history-scan-baseline.json` — the recorded known-hit set
   it compares against.
@@ -332,6 +434,9 @@ worktree — the scan never executes the repo's own `ci/` copy.
 
 ```bash
 ci/install-ci.sh          # installs units + runner; re-run after editing ci/
-sudo systemctl disable --now longtable-ci.path longtable-ci.timer   # disable
-sudo systemctl enable --now longtable-ci.path longtable-ci.timer    # re-enable
+                          # (also installs longtable-ci-tag.path; see "Tagging a release"
+                          # for the one-time tag-state seeding if HEAD already carries
+                          # a released tag)
+sudo systemctl disable --now longtable-ci.path longtable-ci-tag.path longtable-ci.timer   # disable
+sudo systemctl enable --now longtable-ci.path longtable-ci-tag.path longtable-ci.timer    # re-enable
 ```

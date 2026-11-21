@@ -2,7 +2,10 @@
 # run-pipeline.sh — Longtable on-box CI pipeline. See ci/README.md.
 #
 # Triggered by longtable-ci.service (longtable-ci.path watches
-# .git/refs/heads/main; longtable-ci.timer is a 10-minute fallback).
+# .git/refs/heads/main; longtable-ci-tag.path watches .git/refs/tags
+# and .git/packed-refs so tagging an already-processed commit re-runs
+# the pipeline for the tag — see lt_main_loop; the longtable-ci.timer
+# is a 10-minute fallback).
 # Installed into the ops CI state dir by ci/install-ci.sh; the copy in
 # the repo is the source of truth. The pipeline skeleton (flock,
 # stage runner, status/history logging, always-teardown) comes from
@@ -29,8 +32,10 @@
 # upload keystore — but ONLY when HEAD carries an exact git tag. A3
 # made release builds fail closed on untagged HEADs and CI builds
 # every commit, so the stage gates on a tag and skips cleanly
-# otherwise; the A3 check itself is never relaxed. Tag a commit
-# (e.g. v0.1.0) to cut a signed release. Verified artifacts (apksigner
+# otherwise; the A3 check itself is never relaxed. Tag a commit with
+# a SIGNED tag (`git tag -s`, verified by the tag-verify stage
+# against the pinned operator key) to cut a signed release. Verified
+# artifacts (apksigner
 # + bundletool manifest + aapt2 badging) publish as
 # longtable-release.aab/.apk (+ mapping.txt when produced) with
 # .sha256 sidecars.
@@ -86,6 +91,11 @@ RELEASE_AAB_REL=android/app/build/outputs/bundle/release/app-release.aab
 RELEASE_APK_REL=android/app/build/outputs/apk/release/app-release.apk
 MAPPING_REL=android/app/build/outputs/mapping/release/mapping.txt
 KEYSTORE_PROPS=${LT_KEYSTORE_PROPERTIES:-$STATE/key.properties}
+# Operator-pinned tag-signing public key (Wave 6C): the tag-verify stage
+# checks every HEAD tag's signature against this key. Ops-side file,
+# never in the repo; absent until the operator creates a signing key
+# and pins its public half here (see ci/README.md "Signed tags").
+TAG_SIGNING_KEY=${LT_TAG_SIGNING_KEY:-$STATE/tag-signing-key.pub}
 # Hash-pinned privacy scanner (review H3): the scanner the pipeline
 # executes lives in $STATE/scanner/, installed by hand with
 # ci/pin-scanner.sh from a reviewed rev — never the worktree's own
@@ -342,6 +352,71 @@ do_version_guard() {
   fi
   ci_say "version-guard: versionCode $current >= $tag_count ($tag); monotonic"
 }
+# Tag-signature verification (Wave 6C). Runs ONLY when HEAD carries a
+# tag (one or more) and SKIPS cleanly on untagged commits. Every tag
+# pointing at HEAD must carry a valid signature from the
+# operator-pinned key ($TAG_SIGNING_KEY, ops-side, never in the repo):
+# the pinned public key is imported into a throwaway GNUPGHOME, its
+# fingerprint is derived from the key itself (so there is no second
+# fingerprint file to drift), and `git verify-tag --raw` must report
+# VALIDSIG for exactly that fingerprint, with no BADSIG / EXPKEYSIG /
+# REVKEYSIG / NO_PUBKEY line. Trust is not consulted — the pin is the
+# exact key, not a trust chain. Fails closed: an unsigned tag, a tag
+# signed by any other key, and a tagged HEAD with no pinned key
+# configured all fail the run BEFORE any build or publish, so a
+# signed release can only ever come from a verified tag. A missing
+# pinned-key file on an UNTAGGED HEAD is not an error (nothing to
+# verify); it only fails when a tag is present. Lightweight tags have
+# no signature and fail here by design — releases are cut with
+# `git tag -s` (see ci/README.md "Signed tags").
+do_tag_verify() {
+  local tags tag key_fpr tmp_gnupg verify_out
+  tags=$(git -C "$WT" tag --points-at HEAD | sort)
+  if [ -z "$tags" ]; then
+    ci_say "tag-verify: HEAD has no tag; nothing to verify"
+    return 0
+  fi
+  if [ ! -s "$TAG_SIGNING_KEY" ]; then
+    ci_say "tag-verify: HEAD is tagged but no pinned operator key at $TAG_SIGNING_KEY — tags cannot be verified until an operator key is pinned; refusing"
+    return 1
+  fi
+  tmp_gnupg=$(mktemp -d)
+  chmod 700 "$tmp_gnupg"
+  if ! GNUPGHOME="$tmp_gnupg" gpg --batch --quiet --import "$TAG_SIGNING_KEY" 2>/dev/null; then
+    ci_say "tag-verify: could not import pinned key at $TAG_SIGNING_KEY"
+    rm -rf "$tmp_gnupg"
+    return 1
+  fi
+  key_fpr=$(GNUPGHOME="$tmp_gnupg" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+  case "$key_fpr" in
+    ''|*[!0-9A-F]*)
+      ci_say "tag-verify: could not derive a fingerprint from the pinned key at $TAG_SIGNING_KEY"
+      rm -rf "$tmp_gnupg"
+      return 1
+      ;;
+  esac
+  ci_say "tag-verify: pinned key fingerprint $key_fpr"
+  for tag in $tags; do
+    verify_out=$(GNUPGHOME="$tmp_gnupg" git -C "$WT" verify-tag --raw "$tag" 2>&1) || {
+      ci_say "tag-verify: tag $tag has no valid signature (git verify-tag failed); refusing"
+      rm -rf "$tmp_gnupg"
+      return 1
+    }
+    if printf '%s\n' "$verify_out" | grep -q -e BADSIG -e EXPKEYSIG -e REVKEYSIG -e NO_PUBKEY; then
+      ci_say "tag-verify: tag $tag signature is bad/expired/revoked/unverifiable; refusing"
+      rm -rf "$tmp_gnupg"
+      return 1
+    fi
+    if ! printf '%s\n' "$verify_out" | grep -q "VALIDSIG $key_fpr"; then
+      ci_say "tag-verify: tag $tag is not signed by the pinned key $key_fpr; refusing"
+      rm -rf "$tmp_gnupg"
+      return 1
+    fi
+    ci_say "tag-verify: tag $tag signature valid for pinned key $key_fpr"
+  done
+  rm -rf "$tmp_gnupg"
+  return 0
+}
 do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_lint()      { (cd "$WT" && npm run lint); }
@@ -525,9 +600,13 @@ do_fleet_teardown() {
 # untagged HEAD or a dirty tree, and this stage never invokes them on
 # an untagged commit: it gates on an exact tag first and skips cleanly
 # (logged; recorded as "skipped" in status.json) when HEAD is
-# untagged. A release is cut by tagging the commit and pushing commit
-# + tag together; the pristine worktree then sees the tag and the
-# stage runs. Any failure here fails the run and nothing publishes.
+# untagged. A release is cut by tagging the commit with a SIGNED tag
+# (`git tag -s`, verified against the pinned operator key by the
+# tag-verify stage earlier in the run) and pushing commit + tag
+# together — or tagging an already-processed commit, which the tag
+# path unit + lt_main_loop tag tracking now re-runs for the tag.
+# The pristine worktree then sees the tag and the stage runs. Any
+# failure here fails the run and nothing publishes.
 # Verification is all-or-nothing: apksigner verify (v1+v2+v3),
 # bundletool manifest dump (package + git-derived versionCode and
 # versionName), and aapt2 badging of the release APK against the same
@@ -862,6 +941,7 @@ run_one() {
     ci_stage secret-scan     do_secret_scan &&
     ci_stage legacy-hub-digests do_legacy_digests &&
     ci_stage version-guard   do_version_guard &&
+    ci_stage tag-verify      do_tag_verify &&
     ci_stage npm-ci          do_npm_ci    &&
     ci_stage typecheck       do_typecheck &&
     ci_stage lint            do_lint      &&
@@ -918,23 +998,56 @@ run_one() {
 # time, not a double publish. The shared lib is intentionally NOT
 # changed here — it serves other projects; its ci_main_loop keeps its
 # old contract.
+#
+# Tag tracking (Wave 6C): tagging an already-processed commit used to
+# never trigger a release — the loop only compared HEAD against
+# last-processed, and the tag changed neither. The loop now also
+# compares the sorted set of tags pointing at HEAD against
+# last-processed-tags (one tag per line; a missing file means "no tags
+# recorded", which is the state for every run before this change and
+# for every untagged HEAD). A re-run happens when HEAD moved OR when
+# the HEAD tag set is non-empty and differs from the recorded set, so
+# a tag added to an already-processed commit re-runs the pipeline and
+# the signed-release / github-release stages see the tag. The tag set
+# is recorded ONLY on a successful run, next to last-processed, so a
+# failed tagged run retries on the next trigger like a failed commit
+# run. A tag DELETED from HEAD does not re-trigger (an empty tag set
+# never forces a run); a second tag added to the same commit does.
+# The longtable-ci-tag.path unit fires the service within seconds of
+# a tag change, and the 10-minute timer is the backstop if the path
+# unit ever misses one.
 lt_main_loop() {
   local run_fn=$1
-  local target processed branch
+  local target processed branch tags_now tags_processed
   branch=${CI_BRANCH:-main}
   while :; do
     target=$(git -C "$CI_REPO" rev-parse "$branch")
     processed=$(cat "$CI_STATE_DIR/last-processed" 2>/dev/null || echo "")
-    if [ "$target" = "$processed" ]; then
+    tags_now=$(git -C "$CI_REPO" tag --points-at "$target" | sort)
+    tags_processed=$(cat "$CI_STATE_DIR/last-processed-tags" 2>/dev/null || echo "")
+    if [ "$target" = "$processed" ] && { [ -z "$tags_now" ] || [ "$tags_now" = "$tags_processed" ]; }; then
       ci_say "$branch @ $target already processed; nothing to do"
       break
     fi
+    if [ "$target" = "$processed" ]; then
+      ci_say "$branch @ $target already processed but HEAD tag set changed (was: ${tags_processed:-<none>}; now: $tags_now); re-running for the tag"
+    fi
     if "$run_fn" "$target"; then
       echo "$target" > "$CI_STATE_DIR/last-processed"
+      if [ -n "$tags_now" ]; then
+        printf '%s\n' "$tags_now" > "$CI_STATE_DIR/last-processed-tags"
+      else
+        : > "$CI_STATE_DIR/last-processed-tags"
+      fi
     else
       ci_say "$branch @ $target run FAILED; leaving it unprocessed so the next trigger retries it"
       break
     fi
   done
 }
-lt_main_loop run_one
+# Test hook (Wave 6C): ci/test-tag-trigger.sh sources this file with
+# LT_CI_NO_MAIN=1 to exercise lt_main_loop / do_tag_verify directly
+# against a scratch repo + state dir. Production runs never set it.
+if [ "${LT_CI_NO_MAIN:-}" != 1 ]; then
+  lt_main_loop run_one
+fi

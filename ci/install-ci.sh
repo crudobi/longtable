@@ -27,10 +27,10 @@ CI_LIB_PIN_HASH=$(grep -v '^[[:space:]]*#' "$CI_LIB_PIN" | awk '{print $1}' | he
 [ -n "$CI_LIB_PIN_HASH" ] || { echo "install-ci.sh: shared CI lib pin empty at $CI_LIB_PIN" >&2; exit 1; }
 [ "$(sha256sum "$CI_LIB" | cut -d' ' -f1)" = "$CI_LIB_PIN_HASH" ] || { echo "install-ci.sh: shared CI lib hash mismatch: $CI_LIB differs from the pin in $CI_LIB_PIN — review the lib diff and re-pin" >&2; exit 1; }
 . "$CI_LIB"
-ci_install_units "$HERE" "$STATE" "$ROOT" longtable-ci.service longtable-ci.path longtable-ci.timer longtable-history-scan.service longtable-history-scan.timer
+ci_install_units "$HERE" "$STATE" "$ROOT" longtable-ci.service longtable-ci.path longtable-ci-tag.path longtable-ci.timer longtable-history-scan.service longtable-history-scan.timer
 
 echo "Longtable CI installed."
-echo "  trigger : commit to main (path unit) + 10-min fallback timer"
+echo "  trigger : commit to main (path unit) + tag on HEAD (tag path unit) + 10-min fallback timer"
 echo "  history : nightly all-history privacy scan (03:17 timer)"
 echo "  status  : cat $STATE/status.json"
 echo "  logs    : $STATE/logs/"
