@@ -490,6 +490,33 @@ describe('S9 payload validation and caps', () => {
     ).rejects.toThrow(/title/)
   })
 
+  it('store keeps a real photo data URL whole (never slices it to item length)', async () => {
+    // Regression: the sanitizer ran photos through the 2000-char
+    // text-item slicer, corrupting every real photo (a 46 KB fixture
+    // JPEG is a ~61 KB data URL) — the migration proof then saw the
+    // <img> with naturalWidth 0. Photos are kept whole; only the count
+    // is capped, and non-image entries are dropped.
+    const repo = makeRepo()
+    const kv = memoryStore()
+    const index = await getOrCreateIndex(repo, kv)
+    const photo = `data:image/jpeg;base64,${'A'.repeat(70000)}`
+    const summary = await createRecipe(repo, index, {
+      title: 'Photo Soup',
+      ingredients: [],
+      steps: [],
+      photos: [photo, 'not-a-photo', 'data:image/png;base64,AAAA'],
+    })
+    const loaded = await getRecipe(repo, summary.url)
+    expect(loaded!.photos).toHaveLength(2)
+    expect(loaded!.photos[0]).toBe(photo)
+    expect(loaded!.photos[0]).toHaveLength(photo.length)
+
+    await updateRecipe(repo, index, summary.id, { photos: [photo] })
+    const updated = await getRecipe(repo, summary.url)
+    expect(updated!.photos).toHaveLength(1)
+    expect(updated!.photos[0]).toBe(photo)
+  })
+
   it('importReceivedShares caps an oversized friend recipe instead of persisting it whole', async () => {
     const receiver = await identityFromSeed(seed(55))
     const owner = await identityFromSeed(seed(11))

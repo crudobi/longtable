@@ -56,10 +56,12 @@ function nowIso(): string {
  * 500, MAX_ITEM 2000, photos capped at 20): anything a friend share or a
  * share code hands us is held to the same limits as an imported file, so
  * a malicious or buggy peer cannot persist unbounded strings or huge
- * arrays into IndexedDB and the render path. Over-long values are
+ * arrays into IndexedDB and the render path. Over-long text values are
  * truncated (arrays are cut to the cap, non-string entries dropped);
  * only a non-string title is rejected — a recipe without a usable title
- * cannot be listed or opened.
+ * cannot be listed or opened. Photos are the exception: they are data
+ * URLs, kept whole and capped by COUNT only (see cleanPhotos) — slicing
+ * one corrupts the image.
  */
 export const RECIPE_LIMITS = {
   titleChars: 500,
@@ -93,6 +95,28 @@ function cleanStringList(items: unknown): string[] {
 }
 
 /**
+ * Photos are data URLs (or web URLs), not short text: a real photo is
+ * tens to hundreds of kilobytes of base64, so slicing one to
+ * RECIPE_LIMITS.itemChars corrupts it — the <img> then renders with
+ * naturalWidth 0 (caught by the migration proof: a 46 KB fixture photo
+ * is a ~61 KB data URL, sliced to a 2000-char stub). Keep entries
+ * whole, cap the COUNT at RECIPE_LIMITS.photos, and drop non-strings
+ * and anything that is not a data:image/ URL or an http(s) URL — the
+ * same shape rule as the importer contract (cleanPhotos in
+ * src/importers/contract.ts).
+ */
+function cleanPhotos(items: unknown): string[] {
+  if (!Array.isArray(items)) return []
+  const out: string[] = []
+  for (const item of items) {
+    if (typeof item !== 'string') continue
+    if (item.startsWith('data:image/') || /^https?:\/\//i.test(item)) out.push(item)
+    if (out.length >= RECIPE_LIMITS.photos) break
+  }
+  return out
+}
+
+/**
  * Validate + cap a recipe input before persistence. Throws on a
  * non-string title; truncates everything else to RECIPE_LIMITS; rounds
  * minutes (H-N3). Applied by createRecipe, so the friends-share upsert
@@ -107,7 +131,7 @@ export function sanitizeRecipeInput(input: RecipeInput): RecipeInput {
     title: input.title.slice(0, RECIPE_LIMITS.titleChars),
     ingredients: cleanStringList(input.ingredients),
     steps: cleanStringList(input.steps),
-    photos: cleanStringList(input.photos).slice(0, RECIPE_LIMITS.photos),
+    photos: cleanPhotos(input.photos),
   }
   if (input.visibility !== undefined) out.visibility = input.visibility
   const prep = cleanMinutesValue(input.prepMinutes)
@@ -135,7 +159,7 @@ export function sanitizeRecipePatch(patch: RecipePatch): RecipePatch {
   if (patch.ingredients !== undefined) out.ingredients = cleanStringList(patch.ingredients)
   if (patch.steps !== undefined) out.steps = cleanStringList(patch.steps)
   if (patch.photos !== undefined) {
-    out.photos = cleanStringList(patch.photos).slice(0, RECIPE_LIMITS.photos)
+    out.photos = cleanPhotos(patch.photos)
   }
   if ('prepMinutes' in patch) out.prepMinutes = cleanMinutesValue(patch.prepMinutes)
   if ('cookMinutes' in patch) out.cookMinutes = cleanMinutesValue(patch.cookMinutes)
