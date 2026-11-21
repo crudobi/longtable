@@ -11,6 +11,7 @@ import {
 import { collectExport, exportFileName, serializeExport } from '../backup/export'
 import { shareOrDownloadFile } from '../backup/fileShare'
 import { friendlyError } from '../friendlyError'
+import { flushSecrets, secretKv } from '../secrets/secretStore'
 
 interface Props {
   /**
@@ -81,7 +82,7 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
     setResult(null)
     setError(null)
     try {
-      const exp = await collectExport(getRepo(), localStorage)
+      const exp = await collectExport(getRepo(), secretKv)
       const text = serializeExport(exp)
       const how = await shareOrDownloadFile(exportFileName(exp.exportedAt), text)
       setResult(
@@ -110,7 +111,7 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
         setError('The two passphrases do not match — type the same one twice.')
         return
       }
-      const plain = await collectBackup(getRepo(), localStorage, identity)
+      const plain = await collectBackup(getRepo(), secretKv, identity)
       const text = await createEncryptedBackup(plain, createPass)
       const how = await shareOrDownloadFile(backupFileName(plain.exportedAt), text)
       setResult(
@@ -143,10 +144,15 @@ export function BackupPanel({ identity, onClose, onRestored }: Props) {
     try {
       const report: RestoreReport = await restoreBackup(
         getRepo(),
-        localStorage,
+        secretKv,
         restoreFileText,
         restorePass,
       )
+      // Native: the restore wrote through secretKv, whose Keystore
+      // persist is an async queue — drain it before reporting success,
+      // or the reload below would migrate the still-damaged Keystore
+      // values back over the restored ones (Wave 4A open item 2).
+      await flushSecrets()
       const dropped =
         report.droppedShares + report.droppedReceived > 0
           ? ` (${report.droppedShares} orphan share${report.droppedShares === 1 ? '' : 's'} and ` +

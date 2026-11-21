@@ -182,10 +182,13 @@ export async function identityFromSeed(seed: Uint8Array): Promise<Identity> {
  * The default store is secretKv (Keystore on native): a restored
  * identity secret is a crown-jewel secret and must land in the
  * Keystore like every other identity write, never in plaintext
- * localStorage. Callers that pass an explicit kv (the backup restore
- * flow, which writes through raw localStorage and relies on the next
- * launch's migration) keep their own routing. A successful restore
- * clears any identity-damage record: the stored value is good again.
+ * localStorage. Callers that pass an explicit kv keep their own
+ * routing — and on native that kv must itself be secretKv (the backup
+ * restore flow passes it): the next launch's migration is
+ * Keystore-authoritative, so a value restored only into localStorage
+ * would be discarded in favour of the Keystore copy still holding the
+ * damaged bytes. A successful restore clears any identity-damage
+ * record: the stored value is good again.
  */
 export async function restoreIdentitySecret(
   secretKeyB64: string,
