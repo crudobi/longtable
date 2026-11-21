@@ -6,7 +6,7 @@
 # Every ERE is anchored (^...$): it must match the ENTIRE matched text.
 # An unanchored entry would exempt longer values that merely contain it
 # (2026-11-20 S24: an allowlisted address exempted a longer address
-# sharing its prefix). The two reserved-domain
+# sharing its prefix). The three reserved-domain
 # entries use ^.+@...$ so a complete address at that domain is exempt,
 # never a bare domain substring.
 # Lines starting with # and blank lines are ignored.
@@ -43,6 +43,9 @@ e2e/run-fleet.sh	^192\.168\.255\.255$
 *	^git@github\.com$
 # Reserved example domain in the contribution template (audit c5).
 *	^.+@example\.org$
+# Reserved .invalid domain (RFC 2606) in the Wave 6C tag-trigger harness
+# (2026-11-21): throwaway GPG test identities, never real addresses.
+*	^.+@example\.invalid$
 # Upstream maintainer contact in lockfiles, not the user (audit c4).
 *package-lock.json	^i@izs\.me$
 # Reserved test domain; seed fixtures are fake by construction (audit b9).
