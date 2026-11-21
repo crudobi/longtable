@@ -832,6 +832,7 @@ run_one() {
     ci_stage migration-proof do_migration &&
     ci_stage proof-p2p       do_proof proof-p2p &&
     ci_stage proof-friends   do_proof proof-friends &&
+    ci_stage proof-manual-sdp do_proof proof-manual-sdp &&
     ci_stage proof-public    do_proof proof-public &&
     ci_stage proof-thirdparty do_proof proof-thirdparty &&
     ci_stage proof-importer  do_proof proof-importer &&
