@@ -20,8 +20,9 @@
 #   run-fleet.sh teardown        stop all fleet emulators
 #
 # Suite order (it matters — see e2e/README.md "Fleet suite"):
-#   e2e-gate, migration-proof, proof-p2p, proof-friends, proof-public,
-#   proof-thirdparty, proof-importer, proof-localapi, proof-hubfail
+#   e2e-gate, migration-proof, proof-p2p, proof-friends,
+#   proof-manual-sdp, proof-public, proof-thirdparty, proof-importer,
+#   proof-localapi, proof-hubfail
 #   (proof-thirdparty consumes proof-public's seeded accounts + mimic
 #    record; proof-hubfail runs last because it rewrites the devices'
 #    hub configuration.)
@@ -618,7 +619,7 @@ case "$MODE" in
       run_step migration-proof 600 env APK="$APK" node proof-migration.mjs || overall=1
     fi
     if [ "$overall" = "0" ]; then
-      for p in proof-p2p proof-friends proof-public proof-thirdparty proof-importer proof-localapi proof-hubfail; do
+      for p in proof-p2p proof-friends proof-manual-sdp proof-public proof-thirdparty proof-importer proof-localapi proof-hubfail; do
         do_run_proof "$p" || { overall=1; break; }
       done
     fi
