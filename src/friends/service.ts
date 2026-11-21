@@ -221,12 +221,13 @@ export async function unfriendAndRekey(
 // Receiving (friend side)
 // ---------------------------------------------------------------------------
 
-interface ReceivedMapping {
+export interface ReceivedMapping {
   localId: string
   updatedAt: string
 }
 
-function loadReceived(kv: KeyValueStore): Record<string, ReceivedMapping> {
+/** Read the received-shares mapping (exported for the backup, Wave 3 C3). */
+export function loadReceivedMap(kv: KeyValueStore): Record<string, ReceivedMapping> {
   try {
     const raw = kv.getItem(RECEIVED_KEY)
     if (!raw) return {}
@@ -237,6 +238,18 @@ function loadReceived(kv: KeyValueStore): Record<string, ReceivedMapping> {
   } catch {
     return {}
   }
+}
+
+/** Replace the received-shares mapping (backup restore). */
+export function saveReceivedMap(
+  kv: KeyValueStore,
+  mapping: Record<string, ReceivedMapping>,
+): void {
+  kv.setItem(RECEIVED_KEY, JSON.stringify(mapping))
+}
+
+function loadReceived(kv: KeyValueStore): Record<string, ReceivedMapping> {
+  return loadReceivedMap(kv)
 }
 
 /** Mapping key: owner DID + ':' + recipeId (recipeId is a colon-free UUID). */
@@ -329,7 +342,7 @@ export async function importReceivedShares(
       })
     }
   }
-  kv.setItem(RECEIVED_KEY, JSON.stringify(mapping))
+  saveReceivedMap(kv, mapping)
   return count
 }
 

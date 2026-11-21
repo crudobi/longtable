@@ -8,6 +8,7 @@ This documentation is the contract surface for third-party developers.
 | Document | What it covers |
 |---|---|
 | [architecture.md](architecture.md) | The module map: every subsystem, its public interface, and the boundaries an extension should build against. |
+| [backup.md](backup.md) | Backup & restore: the longtable-json export and the encrypted (Argon2id + secretbox) backup — formats, restore semantics, and what is deliberately not backed up. |
 | [importers.md](importers.md) | The Importer API v1: how to write an importer module that the app loads and offers in its Import panel. |
 | [public-protocol.md](public-protocol.md) | The public recipe protocol: lexicons, the device-key binding, the signature schemes, and the AppView API — enough to read, write, and verify public recipes without this app. |
 | [localhost-api.md](localhost-api.md) | The localhost API: an opt-in, token-guarded HTTP API on the user's own device for scripting and local integrations (list / search / create / update / delete / import). |

@@ -47,6 +47,13 @@ export interface ImportedRecipe {
   cookMinutes?: number
   /** Data URLs or http(s) URLs. Anything else is dropped by validation. */
   photos?: string[]
+  /**
+   * Sharing tier, when the source records one (Wave 3 C3: the
+   * longtable-json export writes it, so an export round-trips with its
+   * tier intact). Importers that do not set it leave the recipe
+   * private, as before.
+   */
+  visibility?: 'private' | 'friends-only' | 'public'
 }
 
 export interface RecipeImporter {
@@ -168,6 +175,11 @@ export function validateImportedRecipe(
     prepMinutes: cleanMinutes(r.prepMinutes, 'prepMinutes', source),
     cookMinutes: cleanMinutes(r.cookMinutes, 'cookMinutes', source),
     photos: cleanPhotos(r.photos, source),
+    // A tier the source recorded (e.g. a longtable-json export) survives
+    // validation; anything else is not a tier and is dropped, never stored.
+    ...(r.visibility === 'private' || r.visibility === 'friends-only' || r.visibility === 'public'
+      ? { visibility: r.visibility }
+      : {}),
   }
 }
 

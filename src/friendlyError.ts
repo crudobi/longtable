@@ -17,6 +17,7 @@
  */
 import { AtprotoError } from './public/atproto'
 import { ImporterError } from './importers/contract'
+import { BackupError } from './backup/backup'
 
 const GENERIC = "Something went wrong, and that didn't finish. Nothing was changed — try again."
 
@@ -60,6 +61,10 @@ export function friendlyError(e: unknown, what = 'the server'): string {
   }
 
   if (e instanceof ImporterError) return e.message
+
+  // Backup errors are written for users too (wrong passphrase, damaged
+  // file, short passphrase) — pass them through verbatim.
+  if (e instanceof BackupError) return e.message
 
   if (e instanceof Error) {
     const msg = e.message.trim()

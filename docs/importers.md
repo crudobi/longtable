@@ -135,7 +135,7 @@ Two clarifications that process surfaced:
 | Importer | id | Input | Notes |
 |---|---|---|---|
 | Web page | `web-page` | URL | JSON-LD (`schema.org/Recipe`) + OpenGraph parsing of a fetched page. |
-| JSON file | `longtable-json` | file / text | One recipe object, an array, or `{"recipes": […]}`. Accepts the canonical field names plus the public-record aliases (`name`, `instructions`, `prepTimeMinutes`, `cookTimeMinutes`), so a saved `kitchen.longtable.recipe` record imports as-is. |
+| JSON file | `longtable-json` | file / text | One recipe object, an array, or `{"recipes": […]}`. Accepts the canonical field names plus the public-record aliases (`name`, `instructions`, `prepTimeMinutes`, `cookTimeMinutes`), so a saved `kitchen.longtable.recipe` record imports as-is. This is also the format the app's own export writes (Backup panel → Export recipes): an export round-trips through this importer, including each recipe's `visibility` tier. See [backup.md](backup.md). |
 | Mealie export | `mealie-json` | file / text | A `recipe.json` from a Mealie backup (unzip first). ISO-8601 durations (`PT1H30M`) become minutes; `HowToSection` groups are flattened in order. Mealie's `image` field is a file *name* inside the backup, not data, so photos are not imported. |
 
 ## Testing your importer

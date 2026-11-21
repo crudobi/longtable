@@ -21,6 +21,14 @@ What works today:
 - **Hubs** — rendezvous/indexing only, never trusted with content.
   One tarball, one config, one command to run one; clients keep a hub
   list and lose nothing when a hub dies or is switched.
+- **Backup & restore** — a readable recipe export (`.json`, through
+  the app's own importer) and an encrypted full backup (`.ltbackup`:
+  identity key, friends + pair secrets, key vault, shares, and all
+  recipes under an Argon2id passphrase). Restoring replaces the
+  device's state and is proven by tests; a wrong passphrase or a
+  damaged file changes nothing. See
+  [docs/backup.md](docs/backup.md). Android auto-backup stays off —
+  the backup is an explicit file the user keeps.
 
 ## Core principles
 
@@ -46,6 +54,9 @@ What works today:
   subsystem, its public interface, and its boundary rule.
 - [docs/importers.md](docs/importers.md) — write an importer (Importer
   API v1); drop it in `src/importers/plugins/` and the app offers it.
+- [docs/backup.md](docs/backup.md) — backup & restore: the
+  longtable-json export and the encrypted backup (formats, restore
+  semantics, what is deliberately not backed up).
 - [docs/public-protocol.md](docs/public-protocol.md) — the public
   recipe protocol: lexicons, both signature schemes, the AppView API,
   and the third-party read/verify flow.

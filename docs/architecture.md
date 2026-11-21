@@ -15,6 +15,7 @@ src/
   public/     ATProto publishing, discovery, the visibility byte-paths
   hubs/       hub registry (endpoints only — never content)
   importers/  Importer API v1: contract, registry, reference importers
+  backup/     export (longtable-json) + encrypted backup/restore
   localapi/   localhost HTTP API: router, host seam, settings, server
   components/ React UI (panels/modals; no business logic)
 appview/      hub-side public index (verify-then-index, FTS5 search)
@@ -151,6 +152,27 @@ The extension point most third parties will touch; specified fully in
 reference importers `urlImporterAdapter.ts` (web pages, JSON-LD/
 OpenGraph), `jsonImporter.ts`, `mealieImporter.ts`, plus
 `photoImport.ts` (local photo attach + downscale).
+
+## backup — `src/backup/`
+
+Export + encrypted backup/restore (Wave 3 C3). Specified fully in
+[backup.md](backup.md). `export.ts` builds the versioned
+`longtable-json` export (recipes + friends by name/DID, no secrets);
+`backup.ts` collects the whole restorable state, encrypts it
+(Argon2id via the dynamically-imported SUMO libsodium build — the
+standard build has no `crypto_pwhash` — + secretbox), and restores it
+with validate-everything-first, replace-not-merge semantics;
+`fileShare.ts` hands files to the system share sheet or a download;
+`BackupPanel.tsx` is the UI. Reads identity, vault, friends, shares,
+and recipes only through their existing accessors, and adds three
+small ones the backup needs: `restoreIdentitySecret` (identity),
+`listShares`/`saveShares` (`p2p/share`), `loadReceivedMap`/
+`saveReceivedMap` (friends service), plus `restoreRecipe` (store:
+recreate a recipe under its original id). No storage internals changed.
+
+**Boundary:** the backup never touches the network and never stores a
+passphrase; `allowBackup` stays `false` — the backup is an explicit
+user-held file, not Android auto-backup.
 
 ## localapi — `src/localapi/`
 

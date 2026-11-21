@@ -24,6 +24,7 @@
  */
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
+import type { KeyValueStore } from '../identity/identity'
 import { getOrCreateIndex, RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 
@@ -183,6 +184,39 @@ function loadShares(): ShareRecord[] {
   } catch {
     return []
   }
+}
+
+/**
+ * Key/value-parameterized share-record access (Wave 3 C3: the encrypted
+ * backup reads/writes share records through an injectable store instead
+ * of the app's global localStorage). Same key, same shape, same
+ * validation-light parse as loadShares; in the app `kv` IS localStorage,
+ * so both paths see the same records. Records that fail the shape check
+ * are dropped, never trusted.
+ */
+export function listShares(kv: KeyValueStore = localStorage): ShareRecord[] {
+  try {
+    const raw = kv.getItem(SHARES_KEY)
+    if (!raw) return []
+    const arr: unknown = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return (arr as ShareRecord[]).filter(
+      (s): s is ShareRecord =>
+        typeof s === 'object' &&
+        s !== null &&
+        typeof (s as ShareRecord).recipeId === 'string' &&
+        typeof (s as ShareRecord).room === 'string' &&
+        typeof (s as ShareRecord).signaling === 'string' &&
+        ((s as ShareRecord).role === 'host' || (s as ShareRecord).role === 'guest'),
+    )
+  } catch {
+    return []
+  }
+}
+
+/** Replace the whole saved share-record list (backup restore). */
+export function saveShares(kv: KeyValueStore, shares: ShareRecord[]): void {
+  kv.setItem(SHARES_KEY, JSON.stringify(shares))
 }
 
 function saveShare(rec: ShareRecord): void {

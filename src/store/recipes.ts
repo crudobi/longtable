@@ -294,6 +294,59 @@ export async function createRecipe(
 }
 
 /**
+ * Restore one recipe under a GIVEN id with GIVEN content and timestamps
+ * (Wave 3 C3: the encrypted backup restores recipes under their original
+ * ids, so the vault, share records, and received-shares mapping — all
+ * keyed by recipe id — keep working with no remapping). Like
+ * createRecipe, but the id is the caller's, not a fresh UUID; an
+ * existing doc under that id is overwritten in place. The index entry
+ * is (re)registered with the restored timestamps.
+ */
+export async function restoreRecipe(
+  repo: YjsStore,
+  // Named for call-shape compatibility; the index doc is resolved from
+  // the store (its guid is deterministic), so the handle itself is not needed here.
+  _index: IndexHandle,
+  id: string,
+  recipe: Recipe,
+): Promise<RecipeSummary> {
+  const input = sanitizeRecipeInput({
+    title: recipe.title,
+    ingredients: recipe.ingredients,
+    steps: recipe.steps,
+    photos: recipe.photos,
+    prepMinutes: recipe.prepMinutes,
+    cookMinutes: recipe.cookMinutes,
+    visibility: recipe.visibility,
+  })
+  const createdAt = typeof recipe.createdAt === 'string' && recipe.createdAt ? recipe.createdAt : nowIso()
+  const updatedAt = typeof recipe.updatedAt === 'string' && recipe.updatedAt ? recipe.updatedAt : createdAt
+  const doc = await getOrCreateDoc(repo, id)
+  doc.transact(() => {
+    const map = doc.getMap(RECIPE_MAP)
+    map.set('title', input.title)
+    map.set('ingredients', strArray(input.ingredients))
+    map.set('steps', strArray(input.steps))
+    map.set('photos', strArray(input.photos))
+    map.set('createdAt', createdAt)
+    map.set('updatedAt', updatedAt)
+    if (input.visibility !== undefined) map.set('visibility', input.visibility)
+    else map.delete('visibility')
+    if (input.prepMinutes !== undefined) map.set('prepMinutes', input.prepMinutes)
+    else map.delete('prepMinutes')
+    if (input.cookMinutes !== undefined) map.set('cookMinutes', input.cookMinutes)
+    else map.delete('cookMinutes')
+  })
+  const url = docUrl(id)
+  const summary: RecipeSummary = { id, title: input.title, url, updatedAt }
+  const indexDoc = await getOrCreateDoc(repo, INDEX_GUID)
+  indexDoc.transact(() => {
+    indexDoc.getMap(INDEX_MAP).set(id, entryMap({ title: input.title, url, updatedAt }))
+  })
+  return summary
+}
+
+/**
  * Register a recipe received via P2P share in the local index so it appears
  * in the list. The document content itself arrives via Yjs sync; this only
  * adds the index entry. Idempotent — a second join is a no-op.

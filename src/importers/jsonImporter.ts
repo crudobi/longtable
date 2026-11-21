@@ -32,6 +32,7 @@ function mapOne(raw: unknown, index: number): ImportedRecipe {
   }
   const title = o.title ?? o.name
   const steps = o.steps ?? o.instructions
+  const visibility = o.visibility
   return {
     title: typeof title === 'string' ? title : '',
     ingredients: (o.ingredients ?? []) as string[],
@@ -39,6 +40,11 @@ function mapOne(raw: unknown, index: number): ImportedRecipe {
     prepMinutes: (o.prepMinutes ?? o.prepTimeMinutes) as number | undefined,
     cookMinutes: (o.cookMinutes ?? o.cookTimeMinutes) as number | undefined,
     photos: o.photos as string[] | undefined,
+    // The export writes the tier so a round-trip keeps it; only a real
+    // tier passes through — anything else is dropped by validation.
+    ...(visibility === 'private' || visibility === 'friends-only' || visibility === 'public'
+      ? { visibility }
+      : {}),
     // NB: invalid field types are caught by the app's validator, which
     // reports them with the recipe number — this importer only shapes data.
   }

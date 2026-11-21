@@ -37,6 +37,7 @@ import { FriendShareModal } from './components/FriendShareModal'
 import { PublishSettingsModal } from './components/PublishSettingsModal'
 import { DiscoverPanel } from './components/DiscoverPanel'
 import { ImportPanel } from './components/ImportPanel'
+import { BackupPanel } from './components/BackupPanel'
 import { friendlyError } from './friendlyError'
 import { DEBUG_HOOKS_ENABLED } from './debugHooks'
 import { HubSettingsModal } from './components/HubSettingsModal'
@@ -76,6 +77,7 @@ export default function App() {
   const [publishSettingsOpen, setPublishSettingsOpen] = useState(false)
   const [discoverOpen, setDiscoverOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [backupOpen, setBackupOpen] = useState(false)
   const [hubsOpen, setHubsOpen] = useState(false)
   const [developerOpen, setDeveloperOpen] = useState(false)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -520,6 +522,7 @@ export default function App() {
           onImport={() => setImportOpen(true)}
           onDiscover={() => setDiscoverOpen(true)}
           onHubs={() => setHubsOpen(true)}
+          onBackup={identity ? () => setBackupOpen(true) : undefined}
           onDeveloper={() => setDeveloperOpen(true)}
         />
       )}
@@ -586,6 +589,13 @@ export default function App() {
         <ImportPanel
           onClose={() => setImportOpen(false)}
           onImported={handleImportRecipes}
+        />
+      )}
+      {backupOpen && identity && (
+        <BackupPanel
+          identity={identity}
+          onClose={() => setBackupOpen(false)}
+          onRestored={() => void refresh()}
         />
       )}
       {discoverOpen && (
