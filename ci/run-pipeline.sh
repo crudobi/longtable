@@ -5,9 +5,12 @@
 # .git/refs/heads/main; longtable-ci.timer is a 10-minute fallback).
 # Installed into the ops CI state dir by ci/install-ci.sh; the copy in
 # the repo is the source of truth. The pipeline skeleton (flock,
-# stage runner, status/history logging, always-teardown, main loop)
-# comes from the shared CI lib ops/shared/ci/ci-lib.sh; this script
-# holds the Longtable stages only.
+# stage runner, status/history logging, always-teardown) comes from
+# the shared CI lib ops/shared/ci/ci-lib.sh; this script holds the
+# Longtable stages only. The main loop is Longtable-local
+# (lt_main_loop at the end): the shared lib's ci_main_loop marks a
+# commit processed unconditionally after run_fn, which marks failed
+# runs processed (M2) — see there.
 #
 # Builds the committed tree in a pristine git worktree so a dirty
 # developer checkout never leaks into a build. Publishes the APK only
@@ -71,6 +74,11 @@ RELEASE_AAB_REL=android/app/build/outputs/bundle/release/app-release.aab
 RELEASE_APK_REL=android/app/build/outputs/apk/release/app-release.apk
 MAPPING_REL=android/app/build/outputs/mapping/release/mapping.txt
 KEYSTORE_PROPS=${LT_KEYSTORE_PROPERTIES:-$STATE/key.properties}
+# Hash-pinned privacy scanner (review H3): the scanner the pipeline
+# executes lives in $STATE/scanner/, installed by hand with
+# ci/pin-scanner.sh from a reviewed rev — never the worktree's own
+# ci/ copy, which would let a commit neuter its own gate.
+PINNED_SCANNER_DIR=$STATE/scanner
 
 export PATH=/usr/local/bin:/usr/bin:/bin
 export HOME="${HOME:-/home/$(id -un)}"
@@ -113,17 +121,47 @@ do_checkout() {
   git -C "$REPO" worktree prune
   git -C "$REPO" worktree add --detach "$WT" "$TARGET_HASH"
 }
+# Verify the hash-pinned scanner (H3) before any use: the pinned
+# copy (script + patterns + allowlist) must match the operator-written
+# sha256sums manifest byte for byte. A missing pin, a hash mismatch,
+# or a missing file fails the run closed — a commit can never weaken
+# the gate that judges it, because the gate's code does not come from
+# the commit. The repo's ci/ copy is only the source the operator
+# re-pins FROM (after reviewing its diff); it is never executed here.
+pinned_scanner_check() {
+  local dir=$PINNED_SCANNER_DIR
+  [ -d "$dir" ] || { ci_say "pinned scanner: missing directory $dir (run ci/pin-scanner.sh)"; return 1; }
+  [ -f "$dir/sha256sums" ] || { ci_say "pinned scanner: missing pin manifest $dir/sha256sums"; return 1; }
+  [ -x "$dir/privacy-scan.sh" ] || { ci_say "pinned scanner: privacy-scan.sh missing/not executable in $dir"; return 1; }
+  (cd "$dir" && sha256sum -c sha256sums >/dev/null) || { ci_say "pinned scanner: hash mismatch against $dir/sha256sums; refusing to scan with an unverified scanner"; return 1; }
+  ci_say "pinned scanner: verified against $dir/sha256sums"
+}
 # Privacy gate (secret-scan): scan the pristine worktree for secrets,
-# private addresses/paths, and PII before anything builds. The generic
-# pattern classes live in the worktree's ci/privacy-patterns (EREs, no
-# real values); specific values live only in the ops-side
-# $STATE/privacy-secrets (0600, read with grep -f). Uses the
-# worktree's own scanner, so the stage tests the committed scanner; a
-# missing scanner, a missing secrets file, or any hit fails the run.
-# (The nightly history scan uses the latest scanner from $REPO as its
-# backstop against a commit that neuters the scanner.) See ci/README.md.
+# private addresses/paths, and PII before anything builds, with the
+# HASH-PINNED scanner (H3). The generic pattern classes live in the
+# pinned patterns file (EREs, no real values); specific values live
+# only in the ops-side $STATE/privacy-secrets (0600, read with
+# grep -f). A missing scanner/pin, a missing secrets file, or any hit
+# fails the run. Commit and tag messages are scanned too (M18): they
+# are not in the tree, so the tree scan cannot see them — a secret in
+# a commit subject is caught here, before any build or publish, which
+# also closes S25 (the release-notes scan used to be the first look
+# at subjects, and it ran after publish). Tag annotations are scanned
+# when HEAD carries an exact tag. See ci/README.md.
 do_secret_scan() {
-  "$WT/ci/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$WT"
+  pinned_scanner_check || return 1
+  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$WT" || return 1
+  local msg_tmp tag rc
+  msg_tmp=$(mktemp -d)
+  git -C "$WT" log -1 --format=%B "$TARGET_HASH" > "$msg_tmp/message.txt" || { rm -rf "$msg_tmp"; return 1; }
+  tag=$(git -C "$WT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  if [ -n "$tag" ]; then
+    git -C "$WT" for-each-ref --format='%(contents)' "refs/tags/$tag" >> "$msg_tmp/message.txt" || { rm -rf "$msg_tmp"; return 1; }
+  fi
+  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$msg_tmp/message.txt"
+  rc=$?
+  rm -rf "$msg_tmp"
+  return $rc
 }
 # Legacy-hub digest check (review C1): the migration in src/hubs/hubs.ts
 # matches the pre-scrub default hub by FNV-1a-64 digest, and the digests
@@ -142,6 +180,33 @@ do_npm_ci()    { (cd "$WT" && npm ci --no-audit --no-fund); }
 do_typecheck() { (cd "$WT" && npm run typecheck); }
 do_lint()      { (cd "$WT" && npm run lint); }
 do_unit()      { (cd "$WT" && npm test); }
+# CSP assertion (review L5): the Content-Security-Policy must survive
+# into the BUILT index.html — the vite plugin injects it at build
+# time, so only the built artifact proves it. Checks the meta tag is
+# present, script-src is exactly 'self' + 'wasm-unsafe-eval' (no
+# third-party or inline script), and script-src never allows
+# 'unsafe-inline' (style-src legitimately uses it; this check is
+# scoped to the script-src directive only).
+assert_csp() { # dist dir
+  local html="$1/index.html"
+  [ -f "$html" ] || { ci_say "csp: built index.html missing at $html"; return 1; }
+  grep -q 'http-equiv="Content-Security-Policy"' "$html" || { ci_say "csp: no CSP meta tag in built index.html"; return 1; }
+  grep -q "script-src 'self' 'wasm-unsafe-eval'" "$html" || { ci_say "csp: script-src directive missing or changed in built index.html"; return 1; }
+  if grep -o "script-src[^;]*" "$html" | grep -q 'unsafe-inline'; then
+    ci_say "csp: script-src allows unsafe-inline in built index.html"
+    return 1
+  fi
+}
+# Debug-hook strings must be absent from a directory of shipped files
+# (review L6): the hooks are proof-only and expose secrets/sessions,
+# so this check runs on extracted archives, not just dist/.
+hooks_absent_dir() { # dir
+  local d=$1 h
+  [ -d "$d" ] || { ci_say "hooks: directory missing: $d"; return 1; }
+  for h in __ltFriends __ltPublic __ltSecrets; do
+    if grep -rq "$h" "$d"; then ci_say "hooks: $h present in shipped files under $d"; return 1; fi
+  done
+}
 # Proof build: debug hooks ON (VITE_LT_DEBUG_HOOKS=1). The assertion
 # pins the wiring: if the hooks ever vanish from the proof bundle, the
 # proofs would fail obscurely — fail here, loudly, instead.
@@ -150,7 +215,9 @@ do_build()     {
   if [ -f "$STATE/dev-turn-password" ]; then turn_pw=$(cat "$STATE/dev-turn-password"); fi
   (cd "$WT" && VITE_LT_DEBUG_HOOKS=1 VITE_LT_DEV_TURN_PASSWORD="$turn_pw" npm run build) &&
   grep -rq '__ltFriends' "$WT/dist/assets" &&
-  grep -rq '__ltPublic' "$WT/dist/assets"
+  grep -rq '__ltPublic' "$WT/dist/assets" &&
+  grep -rq '__ltSecrets' "$WT/dist/assets" &&
+  assert_csp "$WT/dist"
 }
 # Release build: same tree, hooks OFF and no dev TURN password
 # injected, rebuilt after all proofs pass; its APK is the one
@@ -162,11 +229,25 @@ do_release_build() {
   (cd "$WT" && env -u VITE_LT_DEBUG_HOOKS -u VITE_LT_DEV_TURN_PASSWORD npm run build) &&
   ! grep -rq '__ltFriends' "$WT/dist/assets" &&
   ! grep -rq '__ltPublic' "$WT/dist/assets" &&
+  ! grep -rq '__ltSecrets' "$WT/dist/assets" &&
   ! grep -rqF 'dev-turn-password' "$WT/dist/assets" &&
   release_turn_clean &&
   forbidden_literals_clean_dir "$WT/dist" &&
+  assert_csp "$WT/dist" &&
   (cd "$WT" && npx cap sync android) &&
-  (cd "$WT/android" && ./gradlew assembleDebug --console=plain)
+  (cd "$WT/android" && ./gradlew assembleDebug --console=plain) &&
+  release_apk_hooks_clean
+}
+# The debug APK this stage rebuilds is the artifact do_publish ships
+# (review L6): assert the hooks are absent from the ARCHIVE itself,
+# not just from dist/ — cap sync copies dist/assets into the APK, so
+# a packaging slip would otherwise ship the hooks.
+release_apk_hooks_clean() {
+  local tmp
+  tmp=$(mktemp -d)
+  unzip -qo "$WT/$APK_REL" -d "$tmp" || { rm -rf "$tmp"; return 1; }
+  hooks_absent_dir "$tmp" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
 }
 # The rotated dev TURN password must not ship either. The pattern is
 # read from the ops password file (grep -f), so the value itself never
@@ -202,7 +283,7 @@ release_artifacts_clean() {
   tmp=$(mktemp -d)
   unzip -qo "$WT/$RELEASE_APK_REL" -d "$tmp/apk" || { rm -rf "$tmp"; return 1; }
   unzip -qo "$WT/$RELEASE_AAB_REL" -d "$tmp/aab" || { rm -rf "$tmp"; return 1; }
-  if forbidden_literals_clean_dir "$tmp/apk" && forbidden_literals_clean_dir "$tmp/aab"; then
+  if forbidden_literals_clean_dir "$tmp/apk" && forbidden_literals_clean_dir "$tmp/aab" && hooks_absent_dir "$tmp/apk" && hooks_absent_dir "$tmp/aab"; then
     rm -rf "$tmp"
     return 0
   fi
@@ -363,10 +444,13 @@ do_github_release() {
     fi
   } >"$notes" || { rm -f "$notes"; return 1; }
   # Scan the generated release notes with the same privacy patterns
-  # before publishing: commit subjects are not in the source tree, so
-  # the secret-scan stage cannot see them. A hit (or a missing
-  # scanner/secrets file) fails the stage; nothing is published.
-  "$WT/ci/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$notes" || { rm -f "$notes"; return 1; }
+  # before publishing, with the PINNED scanner (H3). The secret-scan
+  # stage already scanned the commit subjects before any build, so
+  # this is defense in depth on the generated notes themselves. A hit
+  # (or a missing scanner/secrets file) fails the stage; nothing is
+  # published.
+  pinned_scanner_check || { rm -f "$notes"; return 1; }
+  "$PINNED_SCANNER_DIR/privacy-scan.sh" --secrets "$STATE/privacy-secrets" "$notes" || { rm -f "$notes"; return 1; }
   gh release create "$tag" --repo "$repo" --title "Longtable $tag" --notes-file "$notes" \
     "$PUBLISH_RELEASE_APK" "$PUBLISH_AAB" "$PUBLISH_RELEASE_APK.sha256" "$PUBLISH_AAB.sha256" || { rm -f "$notes"; return 1; }
   rm -f "$notes"
@@ -446,9 +530,43 @@ run_one() {
   ci_say "run $run_id result=$result failed_stage=${CI_FAILED_STAGE:-none} duration=$((SECONDS-t0))s log=$log"
   if [ "$result" = success ]; then
     git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
+    return 0
   else
     ci_say "failed worktree kept for inspection at $WT (wiped by next run)"
+    return 1
   fi
 }
-# --- main loop (shared lib): process HEAD, catch up if it moved ------------
-ci_main_loop run_one
+# --- main loop (Longtable-local, M2): process HEAD, catch up if it moved.
+# The shared lib's ci_main_loop marks a commit processed unconditionally
+# after run_fn returns — a failed run was marked processed and never
+# retried without a manual last-processed reset (three resets in
+# Waves 2-3), and a kill mid-run forced a duplicate full run. This loop
+# writes last-processed ONLY for a run that succeeded and breaks after
+# a failure, so the next trigger (path unit / timer) retries the same
+# commit; on success it loops to catch up if HEAD moved meanwhile.
+# Residual: a kill mid-run still re-runs the whole run (no per-stage
+# checkpointing); the publish stages are idempotent (atomic copies,
+# github-release refuses to overwrite), so the duplicate is wasted
+# time, not a double publish. The shared lib is intentionally NOT
+# changed here — it serves other projects; its ci_main_loop keeps its
+# old contract.
+lt_main_loop() {
+  local run_fn=$1
+  local target processed branch
+  branch=${CI_BRANCH:-main}
+  while :; do
+    target=$(git -C "$CI_REPO" rev-parse "$branch")
+    processed=$(cat "$CI_STATE_DIR/last-processed" 2>/dev/null || echo "")
+    if [ "$target" = "$processed" ]; then
+      ci_say "$branch @ $target already processed; nothing to do"
+      break
+    fi
+    if "$run_fn" "$target"; then
+      echo "$target" > "$CI_STATE_DIR/last-processed"
+    else
+      ci_say "$branch @ $target run FAILED; leaving it unprocessed so the next trigger retries it"
+      break
+    fi
+  done
+}
+lt_main_loop run_one

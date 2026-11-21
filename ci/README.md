@@ -5,9 +5,12 @@ pipeline runs on the project's own infrastructure, on the same machine
 that hosts the emulator fleet it drives.
 
 The skeleton — flock serialization, the stage runner, status/history
-logging, systemd unit install, always-teardown, main loop — is the
-shared CI lib at `ops/shared/ci/ci-lib.sh` (see its README);
-`ci/run-pipeline.sh` holds the Longtable stages only.
+logging, systemd unit install, always-teardown — is the shared CI
+lib at `ops/shared/ci/ci-lib.sh` (see its README);
+`ci/run-pipeline.sh` holds the Longtable stages only, including its
+own main loop (`lt_main_loop`): the shared lib's loop marks a commit
+processed unconditionally after the run, which marked failed runs
+processed (M2).
 
 ## How it triggers
 
@@ -28,15 +31,20 @@ tree** in a pristine `git worktree` — a dirty developer checkout never
 leaks into a build — and runs, in order:
 
 1. `checkout` — worktree at the target commit
-2. `secret-scan` — privacy gate (`ci/privacy-scan.sh`): scans the
-   pristine worktree for secrets, private addresses/paths, and PII.
-   Generic pattern classes live in the worktree's
-   `ci/privacy-patterns` (EREs, no real values); specific values live
+2. `secret-scan` — privacy gate: scans the pristine worktree for
+   secrets, private addresses/paths, and PII with the HASH-PINNED
+   scanner (`$STATE/scanner/`, H3 — never the worktree's own `ci/`
+   copy). Generic pattern classes live in the pinned
+   `privacy-patterns` (EREs, no real values); specific values live
    only in the ops-side `privacy-secrets` file (0600, read with
-   `grep -f`). Benign matches are allow-listed in
-   `ci/privacy-allowlist` (file-glob + ERE, matched against the
-   matched literal, anchored `^...$` — never the whole line). Fails closed: a missing scanner, a missing secrets
-   file, or any hit fails the run before anything builds.
+   `grep -f`). Benign matches are allow-listed in the pinned
+   `privacy-allowlist` (file-glob + ERE, matched against the
+   matched literal, anchored `^...$` — never the whole line). It
+   also scans the target commit's message and the tag annotation
+   when HEAD carries an exact tag (M18) — messages are not in the
+   tree, so the tree scan cannot see them. Fails closed: a missing
+   scanner/pin, a missing secrets file, or any hit fails the run
+   before anything builds.
 3. `legacy-hub-digests` — (`ci/check-legacy-hub-digests.py`): re-derives
    the expected FNV-1a-64 digests of the pre-scrub legacy hub values
    from git history (`git show d725e40:src/hubs/hubs.ts`, the scrub
@@ -80,11 +88,15 @@ leaks into a build — and runs, in order:
     `proof-public`'s seeded accounts/mimic; `proof-hubfail` runs last
     because it rewrites the devices' hub configuration.)
 16. `release-build` — rebuilds the web bundle hooks-off (no debug
-    hooks, no dev TURN password), asserts the hook strings and the
-    rotated dev TURN password are absent from the bundle, and the
-    literals from the shared ops-side `privacy-secrets` file are absent from all
-    of `dist/` (not just `dist/assets`), re-syncs and rebuilds the
-    debug APK. That artifact is what `publish` ships.
+    hooks, no dev TURN password), asserts the hook strings
+    (`__ltFriends`/`__ltPublic`/`__ltSecrets`) and the rotated dev
+    TURN password are absent from the bundle, and the literals from
+    the shared ops-side `privacy-secrets` file are absent from all
+    of `dist/` (not just `dist/assets`), asserts the CSP survives
+    into the built `index.html` (`assert_csp`, L5), re-syncs and
+    rebuilds the debug APK, and asserts the hooks are absent from
+    the APK itself (`release_apk_hooks_clean`, L6). That artifact
+    is what `publish` ships.
 17. `signed-release` — builds `bundleRelease` + `assembleRelease`
     signed with the ops-dir upload keystore (`key.properties` beside
     the keystore, never in the repo), then verifies: `apksigner
@@ -106,14 +118,34 @@ leaks into a build — and runs, in order:
     with the signed `longtable-release.aab` +
     `longtable-release.apk` and their `.sha256` sidecars,
     changelog from `git log` since the previous tag. The generated
-    release notes are scanned with the same privacy patterns before
-    `gh release create` (commit subjects are not in the source tree,
-    so the `secret-scan` stage cannot see them). Runs ONLY
+    release notes are scanned with the pinned scanner before
+    `gh release create` (defense in depth: the `secret-scan` stage
+    already scanned the commit subjects before any build). Runs ONLY
     when the signed-release stage published this run and SKIPS
     cleanly (recorded as `github_release: "skipped"`) on
     untagged commits — same gate as signed-release. Fails
     closed if a release for the tag already exists; never
     overwrites or deletes one.
+
+## Hash-pinned scanner (H3)
+
+The pipeline never executes the scanner from the worktree it is
+judging: a commit could neuter its own gate. Instead both the
+per-commit secret-scan stage and the nightly history scan run the
+scanner from `$STATE/scanner/`, installed by hand with
+`ci/pin-scanner.sh` from a reviewed rev (`git show <rev>:ci/<file>`)
+and verified against a `sha256sums` manifest before every use. A
+missing pin or a hash mismatch fails the run closed.
+
+- **Pin:** `ci/pin-scanner.sh [--repo DIR] [--state DIR] [--rev REV]`
+  (defaults: current repo, `$STATE`, `HEAD`). Review the scanner
+  diff first — the pin records the rev in `pinned-from.txt`.
+- **Re-pin** after any change to `ci/privacy-scan.sh`,
+  `ci/privacy-patterns`, or `ci/privacy-allowlist`, and after every
+  merge that touches them: the merge worker verifies the pin against
+  the merged scanner (hash check) and re-pins if it differs.
+- The repo's `ci/` copy is only the source the operator pins FROM;
+  it is never executed by the pipeline.
 
 ## Ops-side files the pipeline reads
 
@@ -126,13 +158,16 @@ with `grep -f`, so they never appear on a command line or in a log:
 - `privacy-secrets` -- one literal per line, no blank lines (an
   empty pattern matches everything): the specific values every
   privacy gate checks for -- dev-box hostname, burned TURN
-  credential, testnet password, internal paths. The `secret-scan`
-  stage and the release-notes scan check the worktree, history, and
-  notes against it; the `release-build` stage asserts none of them
-  appears in the web bundle (`dist/` as a whole), and
-  `signed-release` asserts the same for the extracted release
-  AAB/APK. A missing or empty file fails the run closed -- no gate
-  can run without its patterns, and nothing ships unverified.
+  credential, testnet password, internal paths, the dev TURN
+  password (M21), and the CI-upload keystore passwords
+  (`storePassword` + `keyPassword` from `key.properties`, M21).
+  The `secret-scan` stage and the release-notes scan check the
+  worktree, history, and notes against it; the `release-build`
+  stage asserts none of them appears in the web bundle (`dist/`
+  as a whole), and `signed-release` asserts the same for the
+  extracted release AAB/APK. A missing or empty file fails the
+  run closed -- no gate can run without its patterns, and nothing
+  ships unverified.
 
 Both files are mode `0600`, created once by the operator, and
 are NOT managed by `ci/install-ci.sh` (install only copies
@@ -148,7 +183,12 @@ pushed). The three internal paths are generic literals, described
 here by role, not by value: the muscle store root, the operator's
 home directory, and the sandbox home directory. The first two are
 also in the backup bundle; the third is a defensive tripwire that
-was never in the repo.
+was never in the repo. The dev TURN password re-derives from
+`dev-turn-password` in the same ops dir; the keystore passwords
+from `key.properties` there. After rotating any of them, re-run
+the append script so the new value is covered (an old value stays
+in the file until the operator removes it — a leaked old value
+must stay scannable).
 
 A run stops at the first failed stage and **does not publish**. Runs are
 serialized with `flock` (the emulator is a shared resource); if commits
@@ -200,8 +240,9 @@ reverted commit is still public on GitHub. `ci/history-scan.sh`
 closes that case: every night at 03:17
 (`longtable-history-scan.timer`, installed by `ci/install-ci.sh`)
 it fetches origin into a mirror under `ops/longtable-ci/work/` and
-scans every rev in `git rev-list --all` with the same
-`ci/privacy-scan.sh` patterns and allow-list.
+scans every rev in `git rev-list --all` with the hash-pinned
+scanner (`$STATE/scanner/`, H3 — never the repo's own `ci/` copy),
+plus every commit message and tag annotation (M18).
 
 The published history still contains pre-scrub residue (internal
 paths in revs before the Oct-15 rewrite) that the rewrite did not
@@ -209,11 +250,11 @@ remove, so the scan compares against a recorded baseline
 (`ops/longtable-ci/history-scan-baseline.json`, established on the
 first run) and fails only on NEW hits. Status is recorded in
 `ops/longtable-ci/history-scan.json` (`result`: `baseline-established`
-/ `known` / `dirty`, plus `revs_scanned`, `hits`, `new_hits`, and the
-per-run log path); a `dirty` result means a new hit needs human
-review. The scan uses the latest scanner from the repo checkout as
-its backstop against a commit that neuters the scanner in the
-worktree.
+/ `known` / `dirty`, plus `revs_scanned`, `hits`, `message_hits`,
+`new_hits`, `new_message_hits`, and the per-run log path); a `dirty`
+result means a new hit needs human review. The pinned scanner is
+the backstop against a commit that neuters the scanner in the
+worktree — the scan never executes the repo's own `ci/` copy.
 
 ## Install / update / disable
 

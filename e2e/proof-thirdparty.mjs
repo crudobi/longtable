@@ -182,18 +182,23 @@ async function main() {
     if (!goodPass) console.log(good.out)
 
     // Negative leg: the attacker's mimic must NOT verify.
-    const mimicRes = await fetch(`${APPVIEW}/author/${encodeURIComponent(ATTACKER.did)}`)
-    const mimicData = mimicRes.ok ? await mimicRes.json() : { results: [] }
-    const mimic = (mimicData.results || [])[0]
-    if (mimic) {
-      const bad = runClient(['--did', ATTACKER.did, '--rkey', mimic.rkey])
-      const rejected = bad.code !== 0 && !bad.out.includes('RESULT: ALL PASS')
-      step('third-party client: attacker mimic REJECTED', rejected,
-        rejected ? `exit ${bad.code}` : 'client accepted a forgery!')
-      if (!rejected) console.log(bad.out)
-    } else {
-      console.log('NOTE: no attacker record indexed — negative leg skipped (run proof-public first)')
-    }
+    // The mimic is NEVER indexed by the AppView — ingest drops it by
+    // design (proof-public proves the non-indexing: no search hit, 404
+    // on /recipe/) — so looking it up through the AppView can only
+    // ever skip this leg, which is why it skipped in every run. Run
+    // the client DIRECTLY against the mimic record in the attacker's
+    // repo instead: the client's --did/--rkey mode fetches the record
+    // from the author's PDS, not the AppView, so the client receives
+    // the forged bytes and must reject them on signature grounds.
+    // The leg FAILS (never skips) if the mimic record is absent — a
+    // missing forgery is not a passed check. Mimic rkey: proof-public
+    // publishes it at 'mimic-stew' (run proof-public first).
+    const bad = runClient(['--did', ATTACKER.did, '--rkey', 'mimic-stew'])
+    const gotForgery = bad.out.includes('records fetched from the author')
+    const rejected = bad.code !== 0 && gotForgery && bad.out.includes('FAIL') && !bad.out.includes('RESULT: ALL PASS')
+    step('third-party client: attacker mimic REJECTED', rejected,
+      rejected ? `exit ${bad.code} (forgery fetched and rejected)` : `exit ${bad.code} — ${gotForgery ? 'client accepted a forgery!' : 'mimic record not fetched; run proof-public first'}`)
+    if (!rejected) console.log(bad.out)
 
     // Cleanup: flip back to private via the app's own byte path.
     await evalJs(

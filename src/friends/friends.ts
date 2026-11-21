@@ -213,12 +213,30 @@ export function helloMessage(room: string, did: string, pairId: string): Uint8Ar
   return utf8ToU8(`longtable-pair:v2:${room}:${did}:${pairId}`)
 }
 
+// y-webrtc is lazy-loaded on first use (it pulls in WebRTC shims that
+// we do not want in the initial bundle — same reason as share.ts) — but
+// the import must execute EXACTLY ONCE. Two concurrent dynamic imports
+// of the same module race in the test runner: one caller can resolve to
+// the REAL module instead of the vi.mock factory (S8 flake root cause,
+// 2026-11-21 — reproduced with a minimal probe: 3 non-mock resolutions
+// in 200 concurrent-import rounds, 0 in sequential rounds; in the
+// pairing test the losing side got the real WebrtcProvider, never synced
+// — no WebRTC in Node, signaling unreachable — so both docs kept only
+// their own hello and both sides hit the 10 s poll timeout). A single
+// shared promise means only the first caller executes import(); every
+// later caller awaits the same module. The timeout itself was never the
+// problem and is unchanged.
+let webrtcModulePromise: Promise<typeof import('y-webrtc')> | null = null
+function loadWebrtc(): Promise<typeof import('y-webrtc')> {
+  return (webrtcModulePromise ??= import('y-webrtc'))
+}
+
 async function connectEphemeral(
   room: string,
   doc: Y.Doc,
   signaling: string,
 ): Promise<WebrtcProviderType> {
-  const { WebrtcProvider } = await import('y-webrtc')
+  const { WebrtcProvider } = await loadWebrtc()
   return new WebrtcProvider(room, doc, {
     // Rendezvous on the invite's signaling AND every configured hub, so
     // pairing succeeds as long as both sides share one live hub (Phase 4).
@@ -402,7 +420,7 @@ export async function joinFriendChannel(
     doc.on('update', () => notifyChannel(friend.did))
   }
   if (!channelProviders.has(friend.did)) {
-    const { WebrtcProvider } = await import('y-webrtc')
+    const { WebrtcProvider } = await loadWebrtc()
     const provider = new WebrtcProvider(channelRoomFor(friend), doc, {
       // The friend's recorded signaling first, then every configured hub:
       // the channel re-rendezvous on any live hub after a hub death.
