@@ -104,6 +104,13 @@ APKSIGNER=${LT_APKSIGNER:-$ANDROID_HOME/build-tools/35.0.0/apksigner}
 AAPT2=${LT_AAPT2:-$ANDROID_HOME/build-tools/35.0.0/aapt2}
 BUNDLETOOL_JAR=${LT_BUNDLETOOL_JAR:-$ROOT/tools/bundletool/bundletool-all-1.18.1.jar}
 
+# Expected upload-key certificate SHA-256 fingerprint (Wave 6A; same
+# value in README.md "Release signing" + docs/keystore-recovery.md).
+# The signed-release stage pins this: an APK signed by any other key
+# fails the run closed. Override ONLY for a negative-control test via
+# LT_EXPECTED_SIGNER_SHA256 — never in production.
+EXPECTED_SIGNER_SHA256=${LT_EXPECTED_SIGNER_SHA256:-"AD:C9:E0:62:94:C2:88:7B:A6:51:7F:9A:B7:5C:BA:C8:FB:81:42:D6:99:43:66:C0:A1:BA:54:A0:10:31:D4:E9"}
+
 # Optional operator environment (e.g. LT_HOST_LAN_IP — this host's LAN
 # address, used as the fleet TURN relay address). Lives in the ops state
 # dir, never in the repo; the systemd unit also loads it (EnvironmentFile).
@@ -525,7 +532,9 @@ do_fleet_teardown() {
 # bundletool manifest dump (package + git-derived versionCode and
 # versionName), and aapt2 badging of the release APK against the same
 # expected values, plus a privacy-secrets scan of the extracted
-# AAB/APK.
+# AAB/APK — and a signer pin (Wave 6A): the release APK's signer
+# certificate SHA-256 digest must equal EXPECTED_SIGNER_SHA256, so a
+# build signed with any other key fails closed instead of publishing.
 
 # GitHub Release (A5): after publish, the github-release stage creates
 # a GitHub Release for the tag with the signed AAB + release APK and
@@ -537,6 +546,34 @@ do_fleet_teardown() {
 # publish source trees for web projects (gh-publish scan/publish +
 # homepage 200 + tally) and Longtable is not in the recipe's allowed
 # list; this publisher ships binary release assets instead.
+
+# verify_signer_fingerprint <apk> [expected] — Wave 6A signer pin.
+# Fail closed unless the APK has exactly one signer and its
+# certificate SHA-256 digest equals the expected upload-key
+# fingerprint. apksigner prints the digest as bare lowercase hex
+# ("adc9e0..."); the expected value is colon-separated uppercase (as
+# in the README), so both sides are normalized (colons stripped,
+# uppercased) before comparing. The cert dump is captured to a temp
+# file first — never pipe apksigner into grep -q (same SIGPIPE
+# discipline as the aapt2 badging check below). An unsigned APK fails
+# here too (apksigner verify exits non-zero), so this is not a
+# substitute for the --verbose verify above, it is an additional gate.
+# The optional second argument exists for the negative-control proof
+# (wrong expected value must fail); production always uses
+# EXPECTED_SIGNER_SHA256.
+verify_signer_fingerprint() {
+  local apk="$1" expect="${2:-$EXPECTED_SIGNER_SHA256}" certs_file count fp norm_fp norm_expect
+  certs_file=$(mktemp)
+  "$APKSIGNER" verify --print-certs "$apk" >"$certs_file" 2>&1 || { ci_say "signer-pin: apksigner verify --print-certs failed for $apk"; rm -f "$certs_file"; return 1; }
+  count=$(grep -c "certificate SHA-256 digest:" "$certs_file" || true)
+  [ "$count" = "1" ] || { ci_say "signer-pin: expected exactly 1 signer certificate, found $count in $apk"; rm -f "$certs_file"; return 1; }
+  fp=$(grep "certificate SHA-256 digest:" "$certs_file" | sed 's/^.*digest: *//;s/ *$//')
+  rm -f "$certs_file"
+  norm_fp=$(printf '%s' "$fp" | tr -d ':' | tr '[:lower:]' '[:upper:]')
+  norm_expect=$(printf '%s' "$expect" | tr -d ':' | tr '[:lower:]' '[:upper:]')
+  [ -n "$norm_fp" ] && [ "$norm_fp" = "$norm_expect" ] || { ci_say "signer-pin: fingerprint mismatch for $apk (got $fp, want $expect)"; return 1; }
+  ci_say "signer-pin: verified $apk signed by expected key ($fp)"
+}
 
 do_signed_release() {
   local tag expect_code expect_name manifest badging_file
@@ -555,6 +592,7 @@ do_signed_release() {
   [ -f "$WT/$RELEASE_AAB_REL" ] || { ci_say "signed-release: AAB missing at $RELEASE_AAB_REL"; return 1; }
   [ -f "$WT/$RELEASE_APK_REL" ] || { ci_say "signed-release: release APK missing at $RELEASE_APK_REL"; return 1; }
   "$APKSIGNER" verify --verbose "$WT/$RELEASE_APK_REL" || return 1
+  verify_signer_fingerprint "$WT/$RELEASE_APK_REL" || return 1
   manifest=$(mktemp)
   "$JAVA_HOME/bin/java" -jar "$BUNDLETOOL_JAR" dump manifest --bundle "$WT/$RELEASE_AAB_REL" >"$manifest" || { rm -f "$manifest"; return 1; }
   expect_code=$(git -C "$WT" rev-list --count HEAD)

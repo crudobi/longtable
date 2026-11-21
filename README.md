@@ -143,6 +143,12 @@ held by the maintainer and is never committed to this repo.
 - Upload-key certificate SHA-256 fingerprint:
   `AD:C9:E0:62:94:C2:88:7B:A6:51:7F:9A:B7:5C:BA:C8:FB:81:42:D6:99:43:66:C0:A1:BA:54:A0:10:31:D4:E9`
 
+- The `signed-release` pipeline stage pins this fingerprint: a release
+  APK signed by any other key fails the run closed.
+- Keystore backup and recovery: [docs/keystore-recovery.md](docs/keystore-recovery.md)
+  (where the keystore and its backups live, how to restore and verify,
+  and what total loss costs).
+
 ## Verify the no-telemetry property
 
 With the local services up (hub, signaling, testnet), run

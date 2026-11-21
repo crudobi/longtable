@@ -14,6 +14,7 @@ This documentation is the contract surface for third-party developers.
 | [localhost-api.md](localhost-api.md) | The localhost API: an opt-in, token-guarded HTTP API on the user's own device for scripting and local integrations (list / search / create / update / delete / import). |
 | [accepted-risks.md](accepted-risks.md) | Accepted risks and by-design decisions: what the app deliberately does not do, and why (forward secrecy, frameable PWA, localhost-API plaintext reads, canonical-hash coverage). |
 | [release-rollback.md](release-rollback.md) | Release rollback: the Play staged-rollout + halt procedure, and what "roll back" means when there is no downgrade. |
+| [keystore-recovery.md](keystore-recovery.md) | Upload-keystore recovery: where the signing key and its backups live, how to restore and verify, and what total loss costs. |
 | [../lexicons/](../lexicons/) | The `kitchen.longtable.*` lexicon JSON schemas (the normative record shapes). |
 | [../examples/third-party-client/](../examples/third-party-client/) | A runnable third-party client that finds a public recipe through an AppView and verifies it end-to-end using only official ATProto libraries. |
 | [../examples/localhost-api/](../examples/localhost-api/) | A dependency-free command-line client for the localhost API, written from localhost-api.md alone. |
