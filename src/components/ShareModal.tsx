@@ -6,9 +6,11 @@ import type { SharePayload } from '../p2p/share'
 interface Props {
   payload: SharePayload
   onClose: () => void
+  /** Leave the P2P room without deleting the recipe. */
+  onStopSharing: () => void
 }
 
-export function ShareModal({ payload, onClose }: Props) {
+export function ShareModal({ payload, onClose, onStopSharing }: Props) {
   const [peers, setPeers] = useState(0)
   const [copied, setCopied] = useState(false)
   const code = JSON.stringify(payload)
@@ -46,6 +48,12 @@ export function ShareModal({ payload, onClose }: Props) {
             ? 'Waiting for your friend to join…'
             : `${peers} friend${peers === 1 ? '' : 's'} connected`}
         </p>
+        {payload.upgradedFromLegacy && (
+          <p className="muted" data-testid="legacy-upgrade-note">
+            This share has a new code — friends using the old code will need
+            this new one to keep syncing.
+          </p>
+        )}
         <textarea
           readOnly
           rows={4}
@@ -57,6 +65,9 @@ export function ShareModal({ payload, onClose }: Props) {
         <div className="modal-actions">
           <button data-testid="copy-share-code" onClick={() => void copy()}>
             {copied ? 'Copied!' : 'Copy code'}
+          </button>
+          <button data-testid="stop-sharing" onClick={onStopSharing}>
+            Stop sharing
           </button>
           <button className="ghost" data-testid="close-share" onClick={onClose}>
             Done

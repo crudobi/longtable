@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { getRepo } from './store/repo'
 import {
   createRecipe,
-  deleteRecipe,
   getOrCreateIndex,
   getRecipe,
   listRecipes,
@@ -13,7 +12,18 @@ import { RecipeDetail } from './components/RecipeDetail'
 import { RecipeForm } from './components/RecipeForm'
 import { ShareModal } from './components/ShareModal'
 import { JoinModal } from './components/JoinModal'
-import { destroyAllShareProviders, onShareUpdate, rejoinShares, shareRecipe } from './p2p/share'
+import {
+  destroyAllShareProviders,
+  leaveShare,
+  onShareUpdate,
+  rejoinShares,
+  shareRecipe,
+} from './p2p/share'
+import {
+  applyVisibilityFlow,
+  performDeleteFlow,
+  VisibilitySessionError,
+} from './recipeFlows'
 import type { SharePayload } from './p2p/share'
 import { getOrCreateIdentity, type Identity } from './identity/identity'
 import { disconnectAllFriendChannels, onChannelUpdate, rejoinFriendChannels } from './friends/friends'
@@ -21,7 +31,6 @@ import {
   importReceivedShares,
   installFriendsDebugHooks,
   republishIfShared,
-  unshareRecipeEverywhere,
 } from './friends/service'
 import { FriendsPanel } from './components/FriendsPanel'
 import { FriendShareModal } from './components/FriendShareModal'
@@ -40,27 +49,9 @@ import {
   loadSession,
   saveSession,
 } from './public/atproto'
-import {
-  ensurePubkeyBinding,
-  getPublication,
-  publishRecipe,
-  unpublishRecipe,
-} from './public/publish'
+import { getPublication, publishRecipe, unpublishRecipe } from './public/publish'
 import { searchAppView } from './public/discover'
 import type { Recipe, RecipeInput, RecipeSummary, VisibilityTier } from './types'
-
-/**
- * Thrown by applyVisibility when a recipe is asked to go public without
- * a publishing session. The UI catches it and opens the publishing
- * settings instead of reporting an error; the localhost API host maps
- * it to a plain 422 (nothing is written in either case).
- */
-class VisibilitySessionError extends Error {
-  constructor() {
-    super('publishing sign-in needed')
-    this.name = 'VisibilitySessionError'
-  }
-}
 
 type View =
   | { name: 'list' }
@@ -265,37 +256,21 @@ export default function App() {
 
   /**
    * The delete flow itself, without the confirmation prompt or UI
-   * navigation: strip friends-only shares, remove the public record,
-   * then delete locally. Used by the detail view AND the localhost API.
+   * navigation — see performDeleteFlow in recipeFlows.ts (strip
+   * friends-only shares, remove the public record, leave the P2P room,
+   * then delete locally). Used by the detail view AND the localhost API.
    * The local delete always proceeds — deleting here is the user's act —
    * but if a remote removal fails, the user is told plainly that the
    * shared/public copy may still be live; it is never swallowed quietly.
    */
   const performDelete = useCallback(async (id: string) => {
     const remoteProblems: string[] = []
-    // Strip friends-only shares of this recipe from friends' channels.
-    const idn = identityRef.current
-    if (idn) {
-      await unshareRecipeEverywhere(id, idn).catch((e) => {
-        console.warn('unshare failed', e)
-        remoteProblems.push('the copies shared with friends')
-      })
-    }
-    // If it was published publicly, remove the ATProto record first.
-    if (getPublication(id)) {
-      const session = loadSession()
-      if (session) {
-        await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
-          (e) => {
-            console.warn('unpublish failed', e)
-            remoteProblems.push('the public copy')
-          },
-        )
-      }
-    }
-    const repo = getRepo()
-    const index = await getOrCreateIndex(repo)
-    await deleteRecipe(repo, index, id)
+    await performDeleteFlow(id, {
+      identity: identityRef.current,
+      onRemoteProblem: (label) => {
+        remoteProblems.push(label)
+      },
+    })
     if (remoteProblems.length > 0) {
       setError(
         `Deleted from this device — but ${remoteProblems.join(' and ')} couldn't be taken down, because the other side didn't answer. ${remoteProblems.length === 1 ? 'It' : 'They'} may still be out there; your local copy is gone either way.`,
@@ -324,57 +299,17 @@ export default function App() {
   }, [])
 
   /**
-   * Visibility switching — the real byte movement between tiers:
-   *   → public:      requires an ATProto session (no session →
-   *                  VisibilitySessionError; the UI wrapper opens the
-   *                  publishing settings, the localhost API answers a
-   *                  plain 422 — tier unchanged either way); ensure the
-   *                  pubkey binding, publish the signed record to the
-   *                  PDS, only then mark the recipe 'public'.
-   *   → private:     unpublish the ATProto record first (if any); strip
-   *                  friends-only shares everywhere (if friends-only);
-   *                  then mark 'private'.
-   *   → friends-only: unpublish the ATProto record first (if any); mark
-   *                  'friends-only'. (Choosing friends and publishing
-   *                  the encrypted shares is the friend picker's job —
-   *                  the UI wrapper opens it after this runs.)
-   * Shared by the detail view and the localhost API host.
+   * Visibility switching — see applyVisibilityFlow in recipeFlows.ts for
+   * the real byte movement between tiers (public needs a session and
+   * publishes first; private/friends-only unpublish, strip friends-only
+   * shares, leave the P2P room, then mark the tier). Shared by the detail
+   * view and the localhost API host.
    */
   const applyVisibility = useCallback(
     async (id: string, recipe: Recipe, tier: VisibilityTier) => {
-      const repo = getRepo()
-      const index = await getOrCreateIndex(repo)
-      const idn = identityRef.current
-      const publication = getPublication(id)
-      const unpublishIfNeeded = async () => {
-        if (!publication) return
-        const session = loadSession()
-        if (!session) return
-        const client = new AtprotoClient(session.pdsUrl, {
-          onSessionRefresh: (s) => saveSession(s),
-        })
-        await unpublishRecipe(client, session, id)
-      }
-
-      if (tier === 'public') {
-        const session = loadSession()
-        if (!session || !idn) throw new VisibilitySessionError()
-        const client = new AtprotoClient(session.pdsUrl, {
-          onSessionRefresh: (s) => saveSession(s),
-        })
-        await ensurePubkeyBinding(client, session, idn)
-        await publishRecipe(client, session, idn, { ...recipe, id })
-        await updateRecipe(repo, index, id, { visibility: 'public' })
-      } else if (tier === 'private') {
-        await unpublishIfNeeded()
-        if (recipe.visibility === 'friends-only' && idn) {
-          await unshareRecipeEverywhere(id, idn)
-        }
-        await updateRecipe(repo, index, id, { visibility: 'private' })
-      } else {
-        await unpublishIfNeeded()
-        await updateRecipe(repo, index, id, { visibility: 'friends-only' })
-      }
+      await applyVisibilityFlow(id, recipe, tier, {
+        identity: identityRef.current,
+      })
     },
     [],
   )
@@ -528,6 +463,23 @@ export default function App() {
   }, [summaries])
 
   /**
+   * "Stop sharing" from the share modal: leave the P2P room without
+   * deleting the recipe (leaveShare destroys the provider and deletes
+   * the share record; the recipe stays). One tap, like the private flip
+   * — re-sharing is one tap too.
+   */
+  const handleStopSharing = useCallback(async (id: string) => {
+    try {
+      leaveShare(id)
+    } catch (e) {
+      setError(friendlyError(e))
+      return
+    }
+    setSharePayload(null)
+    await refresh()
+  }, [refresh])
+
+  /**
    * Hub list/active hub changed (Phase 4): rebuild every network provider
    * against the new endpoints. Providers are the ONLY thing rebuilt — docs,
    * share records, friends, and identity are hub-independent, so the switch
@@ -607,7 +559,11 @@ export default function App() {
         />
       )}
       {sharePayload && (
-        <ShareModal payload={sharePayload} onClose={() => setSharePayload(null)} />
+        <ShareModal
+          payload={sharePayload}
+          onClose={() => setSharePayload(null)}
+          onStopSharing={() => void handleStopSharing(sharePayload.recipeId)}
+        />
       )}
       {joinOpen && (
         <JoinModal onJoined={() => void handleJoined()} onClose={() => setJoinOpen(false)} />

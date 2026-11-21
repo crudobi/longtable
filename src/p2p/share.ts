@@ -18,10 +18,13 @@
  *
  * Shares persist in localStorage and are rejoined on every launch, so peers
  * reconnect after app restarts (this is also what heals a partition).
+ * A share ends only through leaveShare(), which destroys the provider and
+ * deletes the record — deleting the recipe or narrowing its visibility
+ * without leaving would resurrect the room on the next launch.
  */
 import * as Y from 'yjs'
 import { getOrCreateDoc, getRepo } from '../store/repo'
-import { RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
+import { getOrCreateIndex, RECIPE_LIMITS, RECIPE_MAP, registerSharedRecipe } from '../store/recipes'
 import { DEFAULT_HUB, getActiveHub, getIceServers, getSignalingUrls } from '../hubs/hubs'
 
 // y-webrtc is lazy-loaded on first joinRoom: it pulls in WebRTC shims that we
@@ -75,6 +78,13 @@ export interface SharePayload {
    * payloads minted by builds before room authentication existed.
    */
   secret?: string
+  /**
+   * Set when this share upgraded a legacy (pre-auth, passwordless) share:
+   * the secret is fresh, so guests holding the old code can no longer sync
+   * and need this new code. Surfaced so the UI can say so at share time.
+   * Not part of the invitation itself; joiners ignore it.
+   */
+  upgradedFromLegacy?: boolean
 }
 
 export interface ShareRecord {
@@ -185,9 +195,31 @@ function saveShare(rec: ShareRecord): void {
   }
 }
 
+/** Remove the saved share record for a recipe, if one exists. */
+function deleteShareRecord(recipeId: string): void {
+  const shares = loadShares().filter((s) => s.recipeId !== recipeId)
+  try {
+    localStorage.setItem(SHARES_KEY, JSON.stringify(shares))
+  } catch {
+    /* storage unavailable — the provider is already dead (leaveShare
+       destroys it before this runs), and rejoinShares re-reads storage,
+       so a record that cannot be removed here can only come back if
+       storage starts working again with the stale record still in it */
+  }
+}
+
 /** The saved share for a recipe, if this device shares or joined it. */
 export function getShare(recipeId: string): ShareRecord | undefined {
   return loadShares().find((s) => s.recipeId === recipeId)
+}
+
+/**
+ * Whether this device currently has a live provider for the recipe's
+ * room. Introspection for tests and debug UI — the behavioral proof is
+ * always "no further updates flow", never this flag alone.
+ */
+export function hasShareProvider(recipeId: string): boolean {
+  return providers.has(roomForRecipe(recipeId))
 }
 
 /** Number of connected peers in a room (excluding self), 0 when not joined. */
@@ -244,6 +276,48 @@ export function destroyAllShareProviders(): void {
 }
 
 /**
+ * Stop sharing a recipe (H1/H7 + H-N2): destroy this device's room
+ * provider, detach the share-update listener the provider attached to
+ * the doc, and delete the saved share record — so rejoinShares can never
+ * resurrect the room on the next launch, and no further local edits
+ * reach (ex-)guests.
+ *
+ * The recipe doc itself is untouched: the recipe stays on this device
+ * (a visibility flip or "Stop sharing" must not delete the user's
+ * recipe). Deleting the recipe as well is performDeleteFlow's job, which
+ * calls this first and then wipes the doc.
+ *
+ * Idempotent and total: leaving a recipe that was never shared, or
+ * leaving twice, is a no-op. Never throws for a missing share; provider
+ * teardown is best-effort (destroy() on a live provider does not throw,
+ * and a dead one is already gone).
+ */
+export function leaveShare(recipeId: string): void {
+  const room = roomForRecipe(recipeId)
+  const p = providers.get(room)
+  if (p) {
+    try {
+      p.destroy()
+    } catch {
+      /* already gone */
+    }
+    providers.delete(room)
+  }
+  // The provider attached this listener to the doc in joinRoom; drop it
+  // so a left share stops triggering UI refreshes on local edits. Only
+  // when the doc is already loaded — an unloaded doc never had one.
+  const cached = getRepo().docs.get(recipeId)
+  if (cached) {
+    try {
+      cached.doc.off('update', notifyUpdate)
+    } catch {
+      /* ignore */
+    }
+  }
+  deleteShareRecord(recipeId)
+}
+
+/**
  * Host side: start sharing one of my recipes. Idempotent — calling twice
  * returns the same room. The returned payload is what goes in the QR code.
  */
@@ -258,14 +332,28 @@ export async function shareRecipe(
   // Reuse the share's existing secret so re-sharing is idempotent; a
   // legacy record (pre-auth) gains a fresh secret here, which upgrades
   // the share: earlier guests hold a passwordless payload and must be
-  // given the new code to keep syncing.
-  const secret = getShare(recipeId)?.secret ?? newShareSecret()
+  // given the new code to keep syncing. That upgrade is surfaced to the
+  // caller (upgradedFromLegacy on the payload) so the UI can say so at
+  // share time instead of silently stranding the old guests.
+  const existing = getShare(recipeId)
+  const secret = existing?.secret ?? newShareSecret()
+  const upgradedFromLegacy =
+    existing !== undefined && existing.secret === undefined
   await joinRoom(room, doc, signaling, secret)
   saveShare({ recipeId, room, signaling, role: 'host', secret })
   // Embed a snapshot so the guest gets content instantly, even if y-webrtc
   // hasn't synced yet. y-webrtc handles live updates after the join.
   const snapshot = u8ToBase64(Y.encodeStateAsUpdate(doc))
-  return { v: 1 as const, room, signaling, recipeId, title, snapshot, secret }
+  return {
+    v: 1 as const,
+    room,
+    signaling,
+    recipeId,
+    title,
+    snapshot,
+    secret,
+    ...(upgradedFromLegacy ? { upgradedFromLegacy: true as const } : {}),
+  }
 }
 
 /**
@@ -337,7 +425,32 @@ export async function joinShare(payload: SharePayload): Promise<void> {
  */
 export async function rejoinShares(): Promise<void> {
   const repo = getRepo()
+  // Orphan cleanup (H1/H7): a share record whose recipe is no longer in
+  // the index is a leftover of a delete that predates leaveShare (or of
+  // a delete path that bypassed it). Rejoining it would resurrect the doc
+  // and keep the room syncing, unlisted, forever — so tear the share
+  // down (leaveShare) instead of joining. Records are only written after
+  // the recipe is
+  // registered in the index (joinShare) or created there (shareRecipe),
+  // so a missing entry is never a live share. If the index itself cannot
+  // be read, rejoin everything (today's behavior) rather than dropping
+  // shares on a transient failure.
+  let indexed: Set<string> | null = null
+  try {
+    const snap = await (await getOrCreateIndex(repo)).doc()
+    indexed = new Set(Object.keys(snap?.recipes ?? {}))
+  } catch (e) {
+    console.warn('rejoin shares: index unreadable, rejoining all', e)
+  }
   for (const s of loadShares()) {
+    if (indexed !== null && !indexed.has(s.recipeId)) {
+      // Full teardown, not just a record delete: a provider for this
+      // room may already be live in this session (e.g. the share was
+      // joined, then the recipe deleted without leaving). Leaving it
+      // would keep the room syncing with a doc that no longer exists.
+      leaveShare(s.recipeId)
+      continue
+    }
     try {
       const doc = await getOrCreateDoc(repo, s.recipeId)
       await joinRoom(s.room, doc, s.signaling, s.secret)
