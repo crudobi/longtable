@@ -349,8 +349,14 @@ async function main() {
     const fo = await raw('POST', '/v1/recipes', { token, body: { ...base, visibility: 'friends-only' } });
     assert(fo.status === 422, `friends-only got ${fo.status}: ${fo.text}`);
     assert(/friends-only/i.test(fo.body.error), `friends-only message: ${fo.body.error}`);
-    const pub = await raw('POST', '/v1/recipes', { token, body: { ...base, visibility: 'public' } });
+    // H12: confirm:true is sent so this still tests the sign-in
+    // refusal (not the confirm gate — that has its own assertion below).
+    const pub = await raw('POST', '/v1/recipes', { token, body: { ...base, visibility: 'public', confirm: true } });
     assert(pub.status === 422, `public got ${pub.status}: ${pub.text}`);
+    assert(/publishing account/i.test(pub.body.error), `public message: ${pub.body.error}`);
+    const noConfirm = await raw('POST', '/v1/recipes', { token, body: { ...base, visibility: 'public' } });
+    assert(noConfirm.status === 422, `public-without-confirm got ${noConfirm.status}: ${noConfirm.text}`);
+    assert(/confirm/i.test(noConfirm.body.error), `no-confirm message: ${noConfirm.body.error}`);
     const list = runClient(['list'], token);
     assert(!list.recipes.some((r) => r.title === 'Should Not Exist'), 'a refused create wrote a recipe');
     assert(list.recipes.length === 2, `expected the 2 proven recipes, got ${list.recipes.length}`);

@@ -326,6 +326,18 @@ export class AtprotoClient {
     return data.blob
   }
 
+  /**
+   * Delete a blob by CID (M2(int)): publish calls this for every blob it
+   * uploaded when the publish then fails, so a failed putRecord does not
+   * orphan blobs on the PDS. A missing blob (or a PDS without
+   * deleteBlob) is a 404-style failure the caller treats as best-effort.
+   */
+  async deleteBlob(session: AtprotoSession, cid: string): Promise<void> {
+    await this.authed(session, 'com.atproto.repo.deleteBlob', (jwt) =>
+      this.jsonInit(jwt, { cid }),
+    )
+  }
+
   /** Download a blob's raw bytes (public read). */
   async getBlob(did: string, cid: string): Promise<ArrayBuffer> {
     const qs = new URLSearchParams({ did, cid })

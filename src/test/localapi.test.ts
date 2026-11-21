@@ -10,8 +10,9 @@
  *    token), CRUD, search, import atomicity, the visibility rules
  *    (friends-only refused plainly; public refused before anything is
  *    written when no publishing session exists; public honored through
- *    the host's byte-path hook when one does), and the friends surface
- *    (names + DIDs only, secrets never serialized).
+ *    the host's byte-path hook when one does), and the confirm gate
+ *    (H12: DELETE and going public need `"confirm": true`) with the
+ *    warnings arrays (H13) every mutating response carries.
  */
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
@@ -202,8 +203,9 @@ describe('localhost API recipes', () => {
       ingredients: ['5 tomatoes'],
     })
 
-    const del = await call(req('DELETE', `/v1/recipes/${id}`))
+    const del = await call(req('DELETE', `/v1/recipes/${id}`, { body: { confirm: true } }))
     expect(del.status).toBe(200)
+    expect((del.body as { warnings: unknown }).warnings).toEqual([])
     const got3 = await call(req('GET', `/v1/recipes/${id}`))
     expect(got3.status).toBe(404)
     const list2 = await call(req('GET', '/v1/recipes'))
@@ -278,8 +280,10 @@ describe('localhost API visibility rules', () => {
 
   it('refuses public before writing when no publishing session exists', async () => {
     // The store-backed test host has no applyVisibility/canPublish hooks.
+    // confirm:true is sent so the refusal tested here is the sign-in
+    // refusal (H12), not the confirm gate — that has its own tests below.
     const res = await call(
-      req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'public' } }),
+      req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'public', confirm: true } }),
     )
     expect(res.status).toBe(422)
     expect((res.body as { error: string }).error).toMatch(/publishing account/i)
@@ -295,15 +299,17 @@ describe('localhost API visibility rules', () => {
       applyVisibility: async (id, _recipe: Recipe, t) => {
         flips.push({ id, tier: t })
         tier = t
+        return []
       },
     })
     // The hook above only records the flip; emulate the doc-side tier by
     // re-checking the recorded state through a second host read path:
     const created = await call(
-      req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'public' } }),
+      req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'public', confirm: true } }),
     )
     expect(created.status).toBe(201)
     expect((created.body as { visibility: string }).visibility).toBe('public')
+    expect((created.body as { warnings: unknown }).warnings).toEqual([])
     expect(flips).toHaveLength(1)
     expect(flips[0].tier).toBe('public')
     expect(tier).toBe('public')
@@ -314,6 +320,104 @@ describe('localhost API visibility rules', () => {
       req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'everyone' } }),
     )
     expect(res.status).toBe(400)
+  })
+})
+
+describe('localhost API confirm gate + warnings (H12/H13)', () => {
+  it('DELETE without confirm is refused with 422 and deletes nothing', async () => {
+    const created = await call(req('POST', '/v1/recipes', { body: soupBody }))
+    const { id } = created.body as { id: string }
+    const refused = await call(req('DELETE', `/v1/recipes/${id}`))
+    expect(refused.status).toBe(422)
+    expect((refused.body as { error: string }).error).toMatch(/confirm/i)
+    const got = await call(req('GET', `/v1/recipes/${id}`))
+    expect(got.status).toBe(200)
+  })
+
+  it('DELETE with confirm:false, a non-boolean confirm, or malformed JSON is refused', async () => {
+    const created = await call(req('POST', '/v1/recipes', { body: soupBody }))
+    const { id } = created.body as { id: string }
+    const no = await call(req('DELETE', `/v1/recipes/${id}`, { body: { confirm: false } }))
+    expect(no.status).toBe(422)
+    const bad = await call(req('DELETE', `/v1/recipes/${id}`, { body: { confirm: 'yes' } }))
+    expect(bad.status).toBe(400)
+    const malformed = await call(req('DELETE', `/v1/recipes/${id}`, { body: '{oops' }))
+    expect(malformed.status).toBe(400)
+    const got = await call(req('GET', `/v1/recipes/${id}`))
+    expect(got.status).toBe(200)
+  })
+
+  it('DELETE with confirm:true deletes and reports a warnings array', async () => {
+    const created = await call(req('POST', '/v1/recipes', { body: soupBody }))
+    const { id } = created.body as { id: string }
+    const del = await call(req('DELETE', `/v1/recipes/${id}`, { body: { confirm: true } }))
+    expect(del.status).toBe(200)
+    expect((del.body as { warnings: unknown }).warnings).toEqual([])
+    const got = await call(req('GET', `/v1/recipes/${id}`))
+    expect(got.status).toBe(404)
+  })
+
+  it('DELETE of an unknown id is 404 even without confirm', async () => {
+    const res = await call(req('DELETE', '/v1/recipes/does-not-exist'))
+    expect(res.status).toBe(404)
+  })
+
+  it('making a recipe public without confirm is refused and writes nothing', async () => {
+    const res = await call(
+      req('POST', '/v1/recipes', { body: { ...soupBody, visibility: 'public' } }),
+    )
+    expect(res.status).toBe(422)
+    expect((res.body as { error: string }).error).toMatch(/confirm/i)
+    const list = await call(req('GET', '/v1/recipes'))
+    expect((list.body as { recipes: unknown[] }).recipes).toHaveLength(0)
+  })
+
+  it('PUT to public without confirm is refused; with confirm it runs the flow', async () => {
+    const flips: { id: string; tier: string }[] = []
+    host = makeHost({
+      canPublish: () => true,
+      applyVisibility: async (id, _recipe: Recipe, t) => {
+        flips.push({ id, tier: t })
+        return []
+      },
+    })
+    const created = await call(req('POST', '/v1/recipes', { body: soupBody }))
+    const { id } = created.body as { id: string }
+    const refused = await call(
+      req('PUT', `/v1/recipes/${id}`, { body: { ...soupBody, visibility: 'public' } }),
+    )
+    expect(refused.status).toBe(422)
+    expect((refused.body as { error: string }).error).toMatch(/confirm/i)
+    expect(flips).toHaveLength(0)
+    const ok = await call(
+      req('PUT', `/v1/recipes/${id}`, {
+        body: { ...soupBody, visibility: 'public', confirm: true },
+      }),
+    )
+    expect(ok.status).toBe(200)
+    expect((ok.body as { warnings: unknown }).warnings).toEqual([])
+    expect(flips).toHaveLength(1)
+    expect(flips[0].tier).toBe('public')
+  })
+
+  it('private creates, private updates, and imports always carry a warnings array', async () => {
+    const created = await call(req('POST', '/v1/recipes', { body: soupBody }))
+    expect((created.body as { warnings: unknown }).warnings).toEqual([])
+    const { id } = created.body as { id: string }
+    const updated = await call(
+      req('PUT', `/v1/recipes/${id}`, { body: { ...soupBody, title: 'v2' } }),
+    )
+    expect((updated.body as { warnings: unknown }).warnings).toEqual([])
+    const imported = await call(
+      req('POST', '/v1/import', {
+        body: {
+          importerId: 'longtable-json',
+          text: JSON.stringify({ title: 'Via API', ingredients: [], steps: [] }),
+        },
+      }),
+    )
+    expect(imported.status).toBe(201)
+    expect((imported.body as { warnings: unknown }).warnings).toEqual([])
   })
 })
 

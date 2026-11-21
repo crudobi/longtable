@@ -54,6 +54,14 @@ export interface ImportedRecipe {
    * private, as before.
    */
   visibility?: 'private' | 'friends-only' | 'public'
+  /**
+   * Non-fatal notes from the importer (Wave 4B H10: the web-page
+   * importer reports each photo it dropped and why). The registry
+   * surfaces these to the user and the API; the contract validator
+   * strips them before anything is stored — warnings are never part
+   * of a recipe.
+   */
+  warnings?: string[]
 }
 
 export interface RecipeImporter {

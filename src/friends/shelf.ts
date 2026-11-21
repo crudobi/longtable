@@ -24,6 +24,19 @@
  * The revoked friend keeps whatever old ciphertext+key they already had
  * (they can still read the OLD version — that is inherent), but every new
  * version is undecryptable to them: no envelope, no key, no plaintext.
+ *
+ * Delete / unshare / unfriend = tombstone (H6): removing a recipe from a
+ * friend's shelf ALSO writes a signed tombstone into the channel doc
+ * (`tombstone:<recipeId>`). The friend's next import verifies the
+ * signature and deletes their local copy + its received-shares mapping —
+ * deleting here finally removes the recipient's copy instead of leaving
+ * a stale one they can re-share. Best-effort only, and the code says so
+ * where it matters: a friend whose device never syncs again keeps their
+ * copy; a friend who saved a PUBLIC copy (no channel to them) is
+ * unreachable by any tombstone; a P2P guest's persisted doc is out of
+ * reach once the room is left (Wave 2 stops the live updates, not the
+ * guest's disk). Re-sharing a recipe clears its tombstone first, so a
+ * tombstone can never delete a live share.
  */
 import * as Y from 'yjs'
 import sodium from 'libsodium-wrappers'
@@ -290,9 +303,76 @@ export interface KeyEnvelope {
   sealedKey: string
 }
 
+/**
+ * A delete tombstone (H6): the owner's signed statement "I deleted this
+ * recipe — delete your received copy too". Stored under
+ * `tombstone:<recipeId>` in the friend's shelf doc. Signed exactly like
+ * the manifest (detached Ed25519 over a canonical message), so a relay
+ * or a third party in the room cannot forge a deletion for someone
+ * else's recipe — the recipient verifies the signature against the
+ * owner's DID before acting on it.
+ */
+export interface ShelfTombstone {
+  recipeId: string
+  ownerDid: string
+  /** ISO-8601 time of the delete (also binds the signature). */
+  deletedAt: string
+  /** Base64 detached Ed25519 signature over tombstoneMessage. */
+  sig: string
+}
+
+/** The exact bytes a tombstone signature covers. */
+export function tombstoneMessage(
+  ownerDid: string,
+  recipeId: string,
+  deletedAt: string,
+): string {
+  return `longtable-tombstone:v1\n${ownerDid}\n${recipeId}\n${deletedAt}`
+}
+
+/** Sign a tombstone for `recipeId` as `identity`. */
+export async function buildTombstone(
+  identity: Identity,
+  recipeId: string,
+): Promise<ShelfTombstone> {
+  const deletedAt = new Date().toISOString()
+  const sig = await signDetached(
+    identity,
+    utf8ToU8(tombstoneMessage(identity.did, recipeId, deletedAt)),
+  )
+  return { recipeId, ownerDid: identity.did, deletedAt, sig: u8ToBase64(sig) }
+}
+
+/** True only when the tombstone is well-shaped and its signature verifies. */
+export async function verifyTombstone(t: ShelfTombstone): Promise<boolean> {
+  if (
+    !t ||
+    typeof t !== 'object' ||
+    typeof t.recipeId !== 'string' ||
+    !t.recipeId ||
+    typeof t.ownerDid !== 'string' ||
+    !t.ownerDid ||
+    typeof t.deletedAt !== 'string' ||
+    !t.deletedAt ||
+    typeof t.sig !== 'string'
+  ) {
+    return false
+  }
+  try {
+    return await verifyDetached(
+      t.ownerDid,
+      utf8ToU8(tombstoneMessage(t.ownerDid, t.recipeId, t.deletedAt)),
+      base64ToU8(t.sig),
+    )
+  } catch {
+    return false
+  }
+}
+
 const manifestKey = (did: string) => `manifest:${did}`
 const payloadKey = (shareId: string) => `payload:${shareId}`
 const envelopeKey = (shareId: string, toDid: string) => `envelope:${shareId}:${toDid}`
+const tombstoneKey = (recipeId: string) => `tombstone:${recipeId}`
 
 function shelfMap(doc: Y.Doc): Y.Map<unknown> {
   return doc.getMap(SHELF_MAP)
@@ -383,6 +463,34 @@ export function allManifests(doc: Y.Doc): ShelfManifest[] {
   return out
 }
 
+/** All tombstones currently in the shelf doc (unverified — verify before acting). */
+export function readTombstones(doc: Y.Doc): ShelfTombstone[] {
+  const out: ShelfTombstone[] = []
+  shelfMap(doc).forEach((raw, key) => {
+    if (!key.startsWith('tombstone:') || typeof raw !== 'string') return
+    try {
+      out.push(JSON.parse(raw) as ShelfTombstone)
+    } catch {
+      /* skip corrupt */
+    }
+  })
+  return out
+}
+
+/** Write (or overwrite) one tombstone in the shelf doc. */
+export function writeTombstone(doc: Y.Doc, tombstone: ShelfTombstone): void {
+  doc.transact(() => {
+    shelfMap(doc).set(tombstoneKey(tombstone.recipeId), JSON.stringify(tombstone))
+  })
+}
+
+/** Clear a recipe's tombstone (re-share: the recipe is live again). */
+export function deleteTombstone(doc: Y.Doc, recipeId: string): void {
+  doc.transact(() => {
+    shelfMap(doc).delete(tombstoneKey(recipeId))
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Publishing (owner side) and processing (friend side)
 // ---------------------------------------------------------------------------
@@ -424,6 +532,10 @@ export async function publishShare(
     map.set(payloadKey(recipeId), JSON.stringify(payload))
     map.set(envelopeKey(recipeId, friendDid), JSON.stringify(envelope))
   })
+  // Re-sharing clears any tombstone for this recipe (H6): a tombstone
+  // must never delete a live share — and the friend's next import would
+  // otherwise apply the stale tombstone to the fresh copy.
+  deleteTombstone(doc, recipeId)
   // Refresh my manifest, preserving other shares already listed in it.
   const existing = readManifest(doc, identity.did)
   const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
@@ -452,6 +564,11 @@ export async function unpublishShare(
   const existing = readManifest(doc, identity.did)
   const shares = (existing?.shares ?? []).filter((s) => s.recipeId !== recipeId)
   writeManifest(doc, await buildManifest(identity, myName, shares))
+  // H6: the friend's next import deletes their local copy on the
+  // strength of this signed tombstone. Written on every unpublish path
+  // (delete, unfriend, de-authorize) — unpublishShare is exactly "this
+  // friend should no longer have this recipe".
+  writeTombstone(doc, await buildTombstone(identity, recipeId))
 }
 
 export interface ReceivedShare {
@@ -475,13 +592,27 @@ export interface ProcessFailure {
  * verify its signature, then for each listed share open my key envelope
  * and decrypt the payload. Anything I am not authorized for lands in
  * `failures` with an explicit reason — never silently, never partially.
+ *
+ * Also returns the doc's verified `tombstones` (H6): signed delete
+ * notices from other parties. The caller (service.ts) deletes the
+ * matching local received copies. A tombstone that fails verification
+ * lands in `failures` and is NOT acted on — a forged deletion deletes
+ * nothing. A tombstone for a recipe that is ALSO listed as a live share
+ * in the same doc is skipped: the live share wins (the owner re-shared
+ * after deleting, and the tombstone is stale).
  */
 export async function processChannel(
   doc: Y.Doc,
   identity: Identity,
-): Promise<{ received: ReceivedShare[]; failures: ProcessFailure[] }> {
+): Promise<{
+  received: ReceivedShare[]
+  failures: ProcessFailure[]
+  tombstones: ShelfTombstone[]
+}> {
   const received: ReceivedShare[] = []
   const failures: ProcessFailure[] = []
+  const tombstones: ShelfTombstone[] = []
+  const liveShares = new Set<string>()
   for (const manifest of allManifests(doc)) {
     if (manifest.did === identity.did) continue
     // One poisoned manifest must never abort the other friends' imports
@@ -517,6 +648,12 @@ export async function processChannel(
             reason: `manifest from ${manifest.did} lists a malformed share reference`,
           })
           continue
+        }
+        // Live shares win over tombstones (H6): a recipe listed here is
+        // currently shared, so a tombstone for it — from an earlier
+        // delete before a re-share — is stale and must not delete it.
+        if (typeof ref.recipeId === 'string') {
+          liveShares.add(`${manifest.did}:${ref.recipeId}`)
         }
         const payload = readPayload(doc, ref.shareId)
         if (!payload) {
@@ -566,5 +703,20 @@ export async function processChannel(
       })
     }
   }
-  return { received, failures }
+  // Tombstones (H6): verified, from other parties, and not for a recipe
+  // that is live-shared in this same doc. Unverifiable tombstones are
+  // failures, never actions.
+  for (const t of readTombstones(doc)) {
+    if (t.ownerDid === identity.did) continue
+    if (!(await verifyTombstone(t))) {
+      failures.push({
+        shareId: t.recipeId || `tombstone:${t.ownerDid}`,
+        reason: `tombstone from ${t.ownerDid} did not verify — the delete was not applied`,
+      })
+      continue
+    }
+    if (liveShares.has(`${t.ownerDid}:${t.recipeId}`)) continue
+    tombstones.push(t)
+  }
+  return { received, failures, tombstones }
 }

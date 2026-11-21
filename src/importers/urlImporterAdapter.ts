@@ -24,15 +24,19 @@ export const urlImporterAdapter: RecipeImporter = {
   async import(input: ImporterInput): Promise<ImportedRecipe[]> {
     const url = (input.url ?? '').trim()
     if (!url) throw new ImporterError('Paste a recipe page URL first.')
-    const partial = await importRecipeFromUrl(url)
+    const { recipe, photoWarnings } = await importRecipeFromUrl(url)
     return [
       {
-        title: partial.title ?? '',
-        ingredients: partial.ingredients ?? [],
-        steps: partial.steps ?? [],
-        prepMinutes: partial.prepMinutes,
-        cookMinutes: partial.cookMinutes,
-        photos: partial.photos ?? [],
+        title: recipe.title ?? '',
+        ingredients: recipe.ingredients ?? [],
+        steps: recipe.steps ?? [],
+        prepMinutes: recipe.prepMinutes,
+        cookMinutes: recipe.cookMinutes,
+        photos: recipe.photos ?? [],
+        // H10: photos the importer had to drop (fetch failed / not an
+        // image / over the byte cap) — surfaced by the registry, never
+        // stored in the recipe.
+        ...(photoWarnings.length > 0 ? { warnings: photoWarnings } : {}),
       },
     ]
   },

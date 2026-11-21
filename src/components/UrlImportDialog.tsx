@@ -1,9 +1,8 @@
 import { useState } from 'react'
-import { UrlImportError, importRecipeFromUrl } from '../importers/urlImport'
-import type { RecipeInput } from '../types'
+import { UrlImportError, importRecipeFromUrl, type UrlImportResult } from '../importers/urlImport'
 
 interface Props {
-  onImport: (partial: Partial<RecipeInput>) => void
+  onImport: (result: UrlImportResult) => void
   onClose: () => void
 }
 
@@ -21,8 +20,10 @@ export function UrlImportDialog({ onImport, onClose }: Props) {
     setBusy(true)
     setStatus(null)
     try {
-      const partial = await importRecipeFromUrl(url)
-      onImport(partial)
+      // The result carries the prefill AND any photos left out (H10) —
+      // the form shows those warnings next to the prefilled recipe.
+      const result = await importRecipeFromUrl(url)
+      onImport(result)
       onClose()
     } catch (err) {
       if (err instanceof UrlImportError) {

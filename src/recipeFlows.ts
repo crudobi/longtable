@@ -19,7 +19,12 @@ import {
   publishRecipe,
   unpublishRecipe,
 } from './public/publish'
-import { AtprotoClient, loadSession, saveSession } from './public/atproto'
+import {
+  AtprotoClient,
+  loadSession,
+  saveSession,
+  type PublicKv,
+} from './public/atproto'
 import type { Identity } from './identity/identity'
 import type { Recipe, VisibilityTier } from './types'
 
@@ -39,39 +44,68 @@ export class VisibilitySessionError extends Error {
 export interface FlowContext {
   identity: Identity | null
   /**
-   * Called with the user-facing label of each remote copy that could not
-   * be taken down ('the copies shared with friends', 'the public copy').
+   * Publications registry override (tests only — production reads the
+   * app's registry). Lets a test stage a public record without a
+   * localStorage stub.
    */
-  onRemoteProblem?: (label: string) => void
+  publicationsKv?: PublicKv
+}
+
+/** The tombstone notice (H6/H13): friends' copies are recalled on sync, not instantly. */
+export const TOMBSTONE_NOTICE =
+  'Friends who already received this recipe will have their copies ' +
+  'removed when their device next syncs; a copy on a device that never ' +
+  'syncs again stays.'
+
+/** The signed-out public notice (H5 behavior, H13 surfacing): the record stays live. */
+export const PUBLIC_LIVE_NOTICE =
+  'The public copy could not be removed because no publishing account ' +
+  'is signed in on this device — it may still be listed publicly.'
+
+function publicationOf(id: string, ctx: FlowContext) {
+  return ctx.publicationsKv ? getPublication(id, ctx.publicationsKv) : getPublication(id)
 }
 
 /**
  * The delete flow itself, without the confirmation prompt or UI
  * navigation: strip friends-only shares, remove the public record, leave
  * the P2P room, then delete locally. The local delete always proceeds —
- * deleting here is the user's act — but if a remote removal fails, the
- * caller is told plainly (via onRemoteProblem) that the shared/public
- * copy may still be live; it is never swallowed quietly.
+ * deleting here is the user's act — but the flow RETURNS every warning
+ * in plain sentences (H13): remote copies that could not be taken down,
+ * and the best-effort limits of the tombstone recall. Nothing about a
+ * remote copy is ever swallowed quietly.
  */
-export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<void> {
+export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<string[]> {
+  const problems: string[] = []
+  const warnings: string[] = []
   // Strip friends-only shares of this recipe from friends' channels.
+  // A successful unshare writes a signed tombstone per channel (H6);
+  // the recall lands when each friend next syncs — that limit is itself
+  // a warning the caller must surface, not a silent assumption.
   const idn = ctx.identity
   if (idn) {
-    await unshareRecipeEverywhere(id, idn).catch((e) => {
+    try {
+      const sharedWith = await unshareRecipeEverywhere(id, idn)
+      if (sharedWith.length > 0) warnings.push(TOMBSTONE_NOTICE)
+    } catch (e) {
       console.warn('unshare failed', e)
-      ctx.onRemoteProblem?.('the copies shared with friends')
-    })
+      problems.push('the copies shared with friends')
+    }
   }
   // If it was published publicly, remove the ATProto record first.
-  if (getPublication(id)) {
+  if (publicationOf(id, ctx)) {
     const session = loadSession()
     if (session) {
       await unpublishRecipe(new AtprotoClient(session.pdsUrl), session, id).catch(
         (e) => {
           console.warn('unpublish failed', e)
-          ctx.onRemoteProblem?.('the public copy')
+          problems.push('the public copy')
         },
       )
+    } else {
+      // H5 owns fixing the signed-out delete (Wave 6); until then the
+      // caller is told plainly the public record is still live.
+      warnings.push(PUBLIC_LIVE_NOTICE)
     }
   }
   // P2P (H1/H7): leave the room BEFORE the doc is wiped, so the provider
@@ -86,6 +120,12 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<v
   const repo = getRepo()
   const index = await getOrCreateIndex(repo)
   await deleteRecipe(repo, index, id)
+  if (problems.length > 0) {
+    warnings.unshift(
+      `Deleted from this device — but ${problems.join(' and ')} couldn't be taken down, because the other side didn't answer. ${problems.length === 1 ? 'It' : 'They'} may still be out there; your local copy is gone either way.`,
+    )
+  }
+  return warnings
 }
 
 /**
@@ -106,21 +146,31 @@ export async function performDeleteFlow(id: string, ctx: FlowContext): Promise<v
  *                  and publishing the encrypted shares is the friend
  *                  picker's job — the UI wrapper opens it after this
  *                  runs.)
+ * Returns the plain-language warnings (H13) — a public copy left live
+ * for lack of a session, the tombstone recall limit on a private flip.
+ * An unpublish that is ATTEMPTED and fails still throws (the caller
+ * maps it to a 502), so a warning here never means "failed silently".
  */
 export async function applyVisibilityFlow(
   id: string,
   recipe: Recipe,
   tier: VisibilityTier,
   ctx: FlowContext,
-): Promise<void> {
+): Promise<string[]> {
   const repo = getRepo()
   const index = await getOrCreateIndex(repo)
   const idn = ctx.identity
-  const publication = getPublication(id)
+  const publication = publicationOf(id, ctx)
+  const warnings: string[] = []
   const unpublishIfNeeded = async () => {
     if (!publication) return
     const session = loadSession()
-    if (!session) return
+    if (!session) {
+      // H5 owns fixing the signed-out flip (Wave 6); until then the
+      // caller is told plainly the public record is still live.
+      warnings.push(PUBLIC_LIVE_NOTICE)
+      return
+    }
     const client = new AtprotoClient(session.pdsUrl, {
       onSessionRefresh: (s) => saveSession(s),
     })
@@ -150,7 +200,10 @@ export async function applyVisibilityFlow(
   } else if (tier === 'private') {
     await unpublishIfNeeded()
     if (recipe.visibility === 'friends-only' && idn) {
-      await unshareRecipeEverywhere(id, idn)
+      // Narrowing to private recalls friends' copies by tombstone (H6)
+      // — same best-effort limit as the delete path, same notice.
+      const sharedWith = await unshareRecipeEverywhere(id, idn)
+      if (sharedWith.length > 0) warnings.push(TOMBSTONE_NOTICE)
     }
     leaveP2PIfNeeded()
     await updateRecipe(repo, index, id, { visibility: 'private' })
@@ -159,4 +212,5 @@ export async function applyVisibilityFlow(
     leaveP2PIfNeeded()
     await updateRecipe(repo, index, id, { visibility: 'friends-only' })
   }
+  return warnings
 }

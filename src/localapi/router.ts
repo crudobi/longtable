@@ -19,6 +19,19 @@
  *    session exists, before anything is written). 'friends-only' is
  *    refused with a plain explanation — choosing friends is an in-app
  *    act, and faking the tier without the encrypted shares would lie.
+ *  - Destructive calls need an explicit human gate (H12): DELETE, and
+ *    any create/update that makes a recipe public, require
+ *    `"confirm": true` in the JSON body — the API's equivalent of the
+ *    UI's delete / make-public confirm dialogs. The token authorizes
+ *    the caller; the confirm proves the caller meant this irreversible
+ *    act. Without it the call is refused with 422 and nothing is
+ *    written.
+ *  - Warnings ride in 200/201 bodies (H13): `warnings: string[]` —
+ *    remote copies that could not be taken down, the tombstone recall
+ *    limit on a delete, import notes (dropped photos). A warning never
+ *    means the call failed; it means something about the result needs
+ *    the caller's attention. Always present (possibly empty) on
+ *    DELETE, PUT, public POST, and POST /v1/import.
  */
 import { ImporterError, validateImportedRecipe } from '../importers/contract'
 import { ensurePluginsLoaded, runImporter } from '../importers/registry'
@@ -73,6 +86,8 @@ function parseJsonBody(req: ApiRequest): unknown {
 interface RecipeBody {
   input: RecipeInput
   visibility?: string
+  /** Explicit human gate for destructive acts (H12) — see requireConfirm. */
+  confirm?: boolean
 }
 
 /** Validate a create/update body: importer recipe shape + optional tier. */
@@ -92,9 +107,50 @@ function parseRecipeBody(req: ApiRequest): RecipeBody {
     }
     visibility = r.visibility
   }
+  let confirm: boolean | undefined
+  if ('confirm' in r && r.confirm !== undefined) {
+    if (typeof r.confirm !== 'boolean') {
+      throw new LocalApiError(400, '"confirm" must be true or false.')
+    }
+    confirm = r.confirm
+  }
   // ImporterError (→ 422) on any shape problem; the message is plain.
   const input = validateImportedRecipe(r, 'localhost API')
-  return { input, visibility }
+  return { input, visibility, confirm }
+}
+
+/**
+ * The confirm gate (H12): destructive calls need `"confirm": true` in
+ * the body — the API's equivalent of the UI's confirm dialog. Refused
+ * with 422 before anything is written, with the consequence in the
+ * message so a script author knows what they are confirming.
+ */
+function requireConfirm(confirmed: boolean | undefined, what: string): void {
+  if (confirmed === true) return
+  throw new LocalApiError(422, `${what} Send "confirm": true in the request body to confirm.`)
+}
+
+/**
+ * Read an optional JSON body for calls that take no other body (DELETE):
+ * absent body → undefined (no confirm); present but malformed → 400;
+ * present and an object → its `confirm` field (must be boolean).
+ */
+function parseOptionalConfirm(req: ApiRequest): boolean | undefined {
+  if (!req.body || !req.body.trim()) return undefined
+  let raw: unknown
+  try {
+    raw = JSON.parse(req.body) as unknown
+  } catch {
+    throw new LocalApiError(400, 'That request body was not valid JSON.')
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new LocalApiError(400, 'Expected a JSON object with "confirm".')
+  }
+  const confirm = (raw as Record<string, unknown>).confirm
+  if (confirm !== undefined && typeof confirm !== 'boolean') {
+    throw new LocalApiError(400, '"confirm" must be true or false.')
+  }
+  return confirm
 }
 
 /**
@@ -198,18 +254,28 @@ async function route(
   }
 
   if (method === 'POST' && isRecipes && seg.length === 2) {
-    const { input, visibility } = parseRecipeBody(req)
+    const { input, visibility, confirm } = parseRecipeBody(req)
     checkTierAllowed(visibility)
+    if (visibility === 'public') {
+      // H12: making a recipe public is the one wide-exposure move — the
+      // UI confirms it first, and so must the API, before anything is
+      // written. (The sign-in refusal below is a separate 422.)
+      requireConfirm(
+        confirm,
+        'Making a recipe public lists it under your publishing account for anyone to find.',
+      )
+    }
     if (visibility === 'public' && !host.canPublish()) {
       // Refuse BEFORE creating anything, so a refused publish never
       // leaves a surprise private recipe behind.
       throw new LocalApiError(422, NOT_SIGNED_IN)
     }
     const { id } = await host.createRecipe(input)
+    let warnings: string[] = []
     if (visibility === 'public') {
-      await host.setVisibility(id, 'public')
+      ;({ warnings } = await host.setVisibility(id, 'public'))
     }
-    return ok(201, { id, title: input.title, visibility: visibility ?? 'private' })
+    return ok(201, { id, title: input.title, visibility: visibility ?? 'private', warnings })
   }
 
   if (method === 'PUT' && isRecipes && seg.length === 3) {
@@ -218,27 +284,34 @@ async function route(
     if (!existing) {
       return fail(404, 'No recipe with that id exists in this cookbook.')
     }
-    const { input, visibility } = parseRecipeBody(req)
+    const { input, visibility, confirm } = parseRecipeBody(req)
     checkTierAllowed(visibility)
     const target = visibility as 'private' | 'public' | undefined
+    let warnings: string[] = []
     if (target && target !== existing.visibility) {
       if (target === 'public') {
+        // H12: see the POST branch — the confirm comes first, before
+        // the sign-in check and before anything is written.
+        requireConfirm(
+          confirm,
+          'Making a recipe public lists it under your publishing account for anyone to find.',
+        )
         if (!host.canPublish()) throw new LocalApiError(422, NOT_SIGNED_IN)
         // Update content while still private (a plain update — no
         // republish of half-moved state), then publish the new content
         // through the byte-path flow in one write.
         await host.updateRecipe(id, input)
-        await host.setVisibility(id, 'public')
+        ;({ warnings } = await host.setVisibility(id, 'public'))
       } else {
         // Going private: unpublish through the flow FIRST, then update
         // as an ordinary private recipe.
-        await host.setVisibility(id, 'private')
+        ;({ warnings } = await host.setVisibility(id, 'private'))
         await host.updateRecipe(id, input)
       }
     } else {
       await host.updateRecipe(id, input)
     }
-    return ok(200, { id, visibility: target ?? existing.visibility })
+    return ok(200, { id, visibility: target ?? existing.visibility, warnings })
   }
 
   if (method === 'DELETE' && isRecipes && seg.length === 3) {
@@ -247,8 +320,14 @@ async function route(
     if (!existing) {
       return fail(404, 'No recipe with that id exists in this cookbook.')
     }
-    await host.deleteRecipe(id)
-    return ok(200, { id, deleted: true })
+    // H12: deleting is permanent — the UI confirms first, and so must
+    // the API. Refused before the flow runs, so nothing is unwritten.
+    requireConfirm(
+      parseOptionalConfirm(req),
+      'Deleting a recipe is permanent — it cannot be undone.',
+    )
+    const { warnings } = await host.deleteRecipe(id)
+    return ok(200, { id, deleted: true, warnings })
   }
 
   if (method === 'POST' && path === '/v1/import') {
@@ -266,12 +345,12 @@ async function route(
     await ensurePluginsLoaded()
     // runImporter validates every recipe; one bad recipe fails the
     // whole import and nothing is saved (same atomicity as the UI).
-    const { recipes } = await runImporter(r.importerId, {
+    const { recipes, warnings } = await runImporter(r.importerId, {
       kind: 'text',
       text: r.text,
     })
     const ids = await host.importRecipes(recipes)
-    return ok(201, { importer: r.importerId, imported: ids, count: ids.length })
+    return ok(201, { importer: r.importerId, imported: ids, count: ids.length, warnings })
   }
 
   if (seg[0] === 'v1' && (seg[1] === 'recipes' || seg[1] === 'import' || seg[1] === 'identity' || seg[1] === 'friends' || seg[1] === 'health')) {
@@ -299,8 +378,9 @@ export async function handleApiRequest(
     console.warn('[longtable] localhost API request failed', e)
     return fail(
       500,
-      "Something went wrong on the device while handling that request. " +
-        'Nothing was changed — try again.',
+      'Something went wrong on the device while handling that request. ' +
+        'Some changes may already have been applied — check the recipe ' +
+        'list before trying again.',
     )
   }
 }

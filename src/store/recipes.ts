@@ -294,6 +294,68 @@ export async function createRecipe(
 }
 
 /**
+ * Create several recipes atomically, best-effort (H11): the importer
+ * registry validates everything first, so a failure here is a store
+ * failure mid-loop — and a plain loop would leave a partial import
+ * behind while the caller reported "nothing was changed". On any
+ * failure this removes every recipe it already created, then throws an
+ * Error that says what failed, where, and whether the rollback held.
+ * A rollback that itself fails is reported honestly (with the stranded
+ * ids, so the caller can clean up) instead of claiming nothing changed.
+ * This is best-effort, not a transaction: a crash between the last
+ * create and the rollback can still strand recipes — the error text
+ * says so by naming exactly what was and was not removed.
+ */
+export async function createRecipesAtomic(
+  repo: YjsStore,
+  index: IndexHandle,
+  inputs: RecipeInput[],
+): Promise<string[]> {
+  const ids: string[] = []
+  try {
+    for (const input of inputs) {
+      const summary = await createRecipe(repo, index, input)
+      ids.push(summary.id)
+    }
+    return ids
+  } catch (e) {
+    const failedAt = ids.length + 1
+    // The reason usually ends with its own period — strip one so
+    // the sentences below do not come out doubled ("text..").
+    const reason = (e instanceof Error ? e.message : String(e)).replace(/\.$/, '')
+    const created = ids.length
+    const rollbackFailed: string[] = []
+    for (const id of ids) {
+      try {
+        await deleteRecipe(repo, index, id)
+      } catch {
+        rollbackFailed.push(id)
+      }
+    }
+    if (rollbackFailed.length > 0) {
+      throw new Error(
+        `Import failed at recipe ${failedAt} of ${inputs.length}: ${reason}. ` +
+          `${created} ${created === 1 ? 'recipe was' : 'recipes were'} created before the failure, and ` +
+          `${rollbackFailed.length} could not be removed — ` +
+          `${rollbackFailed.length === 1 ? 'it is' : 'they are'} still in the cookbook: ${rollbackFailed.join(', ')}.`,
+        { cause: e },
+      )
+    }
+    if (created === 0) {
+      throw new Error(
+        `Import failed at recipe 1 of ${inputs.length}: ${reason}. Nothing was imported.`,
+        { cause: e },
+      )
+    }
+    throw new Error(
+      `Import failed at recipe ${failedAt} of ${inputs.length}: ${reason}. The ${created} ` +
+        `${created === 1 ? 'recipe' : 'recipes'} created before the failure ${created === 1 ? 'was' : 'were'} removed, so nothing was imported.`,
+      { cause: e },
+    )
+  }
+}
+
+/**
  * Restore one recipe under a GIVEN id with GIVEN content and timestamps
  * (Wave 3 C3: the encrypted backup restores recipes under their original
  * ids, so the vault, share records, and received-shares mapping — all

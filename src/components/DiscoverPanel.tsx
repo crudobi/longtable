@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import type { RecipeInput } from '../types'
 import {
-  AtprotoClient,
   loadAppViewUrl,
   loadSession,
   saveAppViewUrl,
 } from '../public/atproto'
 import {
   blobBytesToDataUrl,
+  fetchAuthorPhotoBytes,
   fetchPublicRecipe,
   publicRecordToInput,
   searchAppView,
@@ -208,16 +208,34 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
     const rec = selected
     setSaveError(null)
     try {
-      // Photos live as blobs on the author's PDS. On the local testnet that
-      // is the same PDS the settings point at; fall back to the canonical
-      // local testnet address when this device has never signed in.
-      const pdsUrl = loadSession()?.pdsUrl || getActiveHub().pdsUrl
-      const client = new AtprotoClient(pdsUrl)
-      const input = await publicRecordToInput(rec, async (cid, blob) => {
-        const buf = await client.getBlob(rec.did, cid)
-        return blobBytesToDataUrl(new Uint8Array(buf), blob)
-      })
+      // Photos live as blobs on the AUTHOR's PDS (M-N2) — resolved the
+      // same way as the binding fetch (viewer's PDS as a first hint for
+      // single-PDS deployments, then the author's PDS via PLC) — and
+      // hash-checked against their CID before they are stored, so a
+      // PDS serving wrong bytes for a CID cannot plant a wrong photo.
+      const skipped: string[] = []
+      const input = await publicRecordToInput(
+        rec,
+        async (cid, blob) => {
+          const bytes = await fetchAuthorPhotoBytes(rec.did, cid, undefined, {
+            authorPdsUrl: loadSession()?.pdsUrl || getActiveHub().pdsUrl,
+          })
+          return blobBytesToDataUrl(bytes, blob)
+        },
+        (_cid, reason) => {
+          skipped.push(reason)
+        },
+      )
       await onSaveCopy(input)
+      if (skipped.length > 0) {
+        // The copy saved, but a photo was left out — stay open and say
+        // so, instead of closing and leaving the user wondering where
+        // the photo went.
+        setSaveError(
+          `Saved a copy, but ${skipped.length === 1 ? 'a photo' : `${skipped.length} photos`} ${skipped.length === 1 ? 'was' : 'were'} left out: ${skipped.join(' ')}`,
+        )
+        return
+      }
       onClose()
     } catch (e) {
       // A failed photo fetch or create used to reject silently and leave
