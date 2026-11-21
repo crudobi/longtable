@@ -4,7 +4,9 @@
  * the import UI offers it alongside file importers. In the recipe form the
  * same underlying importer is used in "prefill" mode via UrlImportDialog;
  * through the registry it creates a recipe directly, so a page with no
- * recipe title fails validation visibly instead of importing a stub.
+ * recipe title fails validation visibly instead of importing a stub —
+ * and so does a title-only page with no ingredients and no steps (M15:
+ * a bare title is not a recipe, it is a stub).
  */
 import {
   IMPORTER_API_VERSION,
@@ -25,6 +27,14 @@ export const urlImporterAdapter: RecipeImporter = {
     const url = (input.url ?? '').trim()
     if (!url) throw new ImporterError('Paste a recipe page URL first.')
     const { recipe, photoWarnings } = await importRecipeFromUrl(url)
+    if (
+      (recipe.ingredients?.length ?? 0) === 0 &&
+      (recipe.steps?.length ?? 0) === 0
+    ) {
+      throw new ImporterError(
+        `The page “${recipe.title || url}” has a title but no ingredients or steps — nothing was imported. Try a recipe page, or copy the ingredients and steps by hand.`,
+      )
+    }
     return [
       {
         title: recipe.title ?? '',
@@ -33,6 +43,11 @@ export const urlImporterAdapter: RecipeImporter = {
         prepMinutes: recipe.prepMinutes,
         cookMinutes: recipe.cookMinutes,
         photos: recipe.photos ?? [],
+        ...(recipe.description ? { description: recipe.description } : {}),
+        ...(recipe.recipeYield ? { recipeYield: recipe.recipeYield } : {}),
+        ...(recipe.tags ? { tags: recipe.tags } : {}),
+        ...(recipe.author ? { author: recipe.author } : {}),
+        ...(recipe.sourceUrl ? { sourceUrl: recipe.sourceUrl } : {}),
         // H10: photos the importer had to drop (fetch failed / not an
         // image / over the byte cap) — surfaced by the registry, never
         // stored in the recipe.

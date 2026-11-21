@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { filesToDataUrls } from '../importers/photoImport'
+import { filesToDataUrlsDetailed } from '../importers/photoImport'
 import type { UrlImportResult } from '../importers/urlImport'
 import { UrlImportDialog } from './UrlImportDialog'
 import { friendlyError } from '../friendlyError'
@@ -52,9 +52,22 @@ export function RecipeForm({ initial, heading, onSave, onCancel }: Props) {
   const attachPhotos = async (files: FileList | null) => {
     if (!files || files.length === 0) return
     setPhotoBusy(true)
+    setSaveError(null)
     try {
-      const urls = await filesToDataUrls(files)
-      setPhotos((xs) => [...xs, ...urls])
+      const { urls, failed } = await filesToDataUrlsDetailed(files)
+      if (urls.length > 0) setPhotos((xs) => [...xs, ...urls])
+      if (failed.length > 0) {
+        setSaveError(
+          failed.length === 1
+            ? `Couldn't attach “${failed[0]}” — the file couldn't be read as an image. Nothing was attached for it.`
+            : `Couldn't attach ${failed.length} photos (${failed.join(', ')}) — those files couldn't be read as images. The rest were attached.`,
+        )
+      }
+    } catch (e) {
+      // attachPhotos is fired from an event handler (void) — a
+      // rejection here used to vanish as an unhandled rejection (M18).
+      // Show it on the form instead.
+      setSaveError(friendlyError(e))
     } finally {
       setPhotoBusy(false)
     }

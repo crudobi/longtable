@@ -15,54 +15,29 @@
  *   }
  *
  * Instructions may be HowToStep objects, HowToSection groups (flattened,
- * in order), or plain strings. The `image` field names a file inside the
- * Mealie backup rather than carrying image data, so it is not imported —
- * attach the photo afterwards if you have it.
+ * in order, with the section name kept on the first step), plain
+ * strings, or a single string. The `image` field names a file inside
+ * the Mealie backup rather than carrying image data, so it cannot be
+ * imported as a photo — the import warns about it instead of dropping
+ * it silently (M21). An `image` that is already a web URL is kept as a
+ * photo.
  *
  * Format documentation: docs/importers.md.
  */
 import {
   IMPORTER_API_VERSION,
   ImporterError,
+  normalizeRecipeYield,
+  normalizeTags,
   type ImporterInput,
   type ImportedRecipe,
   type RecipeImporter,
 } from './contract'
+import { stepsFromInstructions } from './howtoSteps'
+import { isoDurationToMinutes } from './isoDuration'
 
-/** Parse an ISO-8601 duration ("PT1H30M", "PT45M", "PT90S") to minutes. */
-export function isoDurationToMinutes(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-    return Math.round(value)
-  }
-  if (typeof value !== 'string') return undefined
-  const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/.exec(
-    value.trim(),
-  )
-  if (!m) return undefined
-  const days = Number(m[1] ?? 0)
-  const hours = Number(m[2] ?? 0)
-  const minutes = Number(m[3] ?? 0)
-  const seconds = Number(m[4] ?? 0)
-  const total = days * 1440 + hours * 60 + minutes + seconds / 60
-  return total > 0 ? Math.round(total) : undefined
-}
-
-function stepsFromInstructions(instructions: unknown): string[] {
-  if (!Array.isArray(instructions)) return []
-  const out: string[] = []
-  const walk = (item: unknown) => {
-    if (typeof item === 'string') {
-      if (item.trim()) out.push(item.trim())
-      return
-    }
-    if (typeof item !== 'object' || item === null) return
-    const o = item as Record<string, unknown>
-    if (typeof o.text === 'string' && o.text.trim()) out.push(o.text.trim())
-    if (Array.isArray(o.itemListElement)) o.itemListElement.forEach(walk)
-  }
-  instructions.forEach(walk)
-  return out
-}
+/** Kept for existing callers/tests: the shared ISO-8601 parser. */
+export { isoDurationToMinutes } from './isoDuration'
 
 function mapMealie(raw: unknown, index: number): ImportedRecipe {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -79,20 +54,49 @@ function mapMealie(raw: unknown, index: number): ImportedRecipe {
   }
   const prep = isoDurationToMinutes(o.prepTime)
   let cook = isoDurationToMinutes(o.cookTime)
-  if (cook === undefined) {
-    // Fall back to totalTime minus prep when only the total is given.
+  if (cook === undefined && prep !== undefined) {
+    // Fall back to totalTime minus prep when only the total is given —
+    // but only when prep is known (M21): deriving cook from the total
+    // alone overstates it, because the total includes the prep.
     const total = isoDurationToMinutes(o.totalTime)
-    if (total !== undefined) cook = Math.max(0, total - (prep ?? 0))
+    if (total !== undefined && total > prep) cook = total - prep
   }
   const ingredients = Array.isArray(o.recipeIngredient)
     ? o.recipeIngredient.filter((x): x is string => typeof x === 'string')
     : []
+  const warnings: string[] = []
+  let photos: string[] | undefined
+  if (typeof o.image === 'string' && o.image.trim()) {
+    const image = o.image.trim()
+    if (/^https?:\/\//i.test(image)) {
+      photos = [image]
+    } else {
+      warnings.push(
+        `Photo "${image}" is only a file name inside the Mealie backup, so it wasn't imported — attach the photo afterwards.`,
+      )
+    }
+  }
+  const tags = normalizeTags(o.tags)
+  const categoryTags = normalizeTags(o.recipeCategory)
+  const allTags =
+    tags || categoryTags
+      ? [...(tags ?? []), ...(categoryTags ?? []).filter((t) => !(tags ?? []).includes(t))]
+      : undefined
   return {
     title: typeof o.name === 'string' ? o.name : '',
     ingredients,
     steps: stepsFromInstructions(o.recipeInstructions),
     prepMinutes: prep,
     cookMinutes: cook,
+    ...(photos ? { photos } : {}),
+    ...(typeof o.description === 'string' && o.description.trim()
+      ? { description: o.description }
+      : {}),
+    ...(normalizeRecipeYield(o.recipeYield)
+      ? { recipeYield: normalizeRecipeYield(o.recipeYield)! }
+      : {}),
+    ...(allTags && allTags.length > 0 ? { tags: allTags } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
   }
 }
 
@@ -100,7 +104,7 @@ export const mealieImporter: RecipeImporter = {
   apiVersion: IMPORTER_API_VERSION,
   id: 'mealie-json',
   name: 'Mealie export',
-  description: 'A recipe.json from a Mealie backup (unzip the backup first). Photos are not included.',
+  description: 'A recipe.json from a Mealie backup (unzip the backup first). A photo file name is not imported — attach the photo afterwards.',
   accepts: ['file', 'text'],
   fileExtensions: ['.json'],
   async import(input: ImporterInput): Promise<ImportedRecipe[]> {

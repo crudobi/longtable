@@ -38,6 +38,25 @@ import type { Recipe, RecipeInput } from '../types'
 /** localStorage flag: set once the migration has completed (or no-oped). */
 export const MIGRATED_KEY = 'longtable:migrated-from-automerge'
 
+/**
+ * Flag format version (integrity M14). The v1 flag was an unversioned
+ * `{"at", "imported"}` object written even when corrupt docs were
+ * silently skipped, so no later run could ever revisit them. A v2
+ * flag is `{"version": 2, "at", "imported", "skippedDuplicates"}` and
+ * is only written by a run with zero failed documents. A missing or
+ * older flag means "run again" (dedupe keeps the re-run from
+ * importing anything twice).
+ */
+export const MIGRATION_FLAG_VERSION = 2
+
+/**
+ * localStorage key recording the failed-doc id set the user has
+ * already been told about (see migrationFailureNotice). The notice is
+ * one-time per set: a repeat launch with the same failures stays
+ * quiet, a new failure speaks up.
+ */
+export const MIGRATION_NOTICED_KEY = 'longtable:migrated-from-automerge:noticed'
+
 /** Object store used by automerge-repo's IndexedDB adapter. */
 const OLD_STORE = 'documents'
 
@@ -52,6 +71,8 @@ export interface RecoveredRecipe {
   input: RecipeInput
   createdAt?: string
   updatedAt?: string
+  /** Old Automerge document id this recipe came from (for failure records). */
+  sourceDocId?: string
 }
 
 export interface MigrationOutcome {
@@ -61,6 +82,19 @@ export interface MigrationOutcome {
   skippedDuplicates: number
   /** Old documents that failed to load or import; they stay orphaned. */
   failedDocs: number
+  /**
+   * Ids of the old documents that failed to load or import (M14).
+   * Empty when the run was clean. Survives in the outcome (and in the
+   * user notice) — previously only the count survived, so nobody could
+   * tell which documents were lost.
+   */
+  failedDocIds: string[]
+  /**
+   * True when the run was clean (no failed documents). Only a clean
+   * run sets the completion flag — a failed load or import blocks
+   * completion, so the next launch retries.
+   */
+  complete: boolean
 }
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {
@@ -216,7 +250,7 @@ export function recipeFingerprint(r: {
 export async function recoverOldRecipes(
   chunks: OldChunk[],
   Automerge: typeof import('@automerge/automerge'),
-): Promise<{ recipes: RecoveredRecipe[]; failedDocs: number }> {
+): Promise<{ recipes: RecoveredRecipe[]; failedDocIds: string[] }> {
   const byDoc = new Map<string, OldChunk[]>()
   for (const c of chunks) {
     const arr = byDoc.get(c.docId)
@@ -224,19 +258,19 @@ export async function recoverOldRecipes(
     else byDoc.set(c.docId, [c])
   }
   const recipes: RecoveredRecipe[] = []
-  let failedDocs = 0
-  for (const docChunks of byDoc.values()) {
+  const failedDocIds: string[] = []
+  for (const [docId, docChunks] of byDoc) {
     try {
       const merged = concatBytes(docChunks.map((c) => c.data))
       const doc = Automerge.loadIncremental(Automerge.init(), merged)
       const recovered = asRecoveredRecipe(doc)
-      if (recovered) recipes.push(recovered)
+      if (recovered) recipes.push({ ...recovered, sourceDocId: docId })
     } catch {
-      // Corrupt or partial chunk set — skip this document, keep going.
-      failedDocs += 1
+      // Corrupt or partial chunk set — record the id, keep going.
+      failedDocIds.push(docId)
     }
   }
-  return { recipes, failedDocs }
+  return { recipes, failedDocIds }
 }
 
 /**
@@ -256,10 +290,29 @@ export async function migrateFromAutomergeIfNeeded(
     imported: 0,
     skippedDuplicates: 0,
     failedDocs: 0,
+    failedDocIds: [],
+    complete: false,
   }
   const kv: KeyValueStore = deps.kv ?? localStorage
   try {
-    if (kv.getItem(MIGRATED_KEY)) return none
+    const rawFlag = kv.getItem(MIGRATED_KEY)
+    if (rawFlag) {
+      try {
+        const parsed = JSON.parse(rawFlag) as unknown
+        if (
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          (parsed as Record<string, unknown>).version === MIGRATION_FLAG_VERSION
+        ) {
+          return none
+        }
+      } catch {
+        // Unparseable flag — fall through and run; a clean run rewrites it.
+      }
+      // A flag without the current version is a pre-v2 completion: the
+      // old run may have silently dropped corrupt docs, so run again
+      // under the v2 rules (dedupe keeps it from importing twice).
+    }
   } catch {
     // localStorage unavailable (private mode etc.) — proceed without the
     // flag; dedupe still prevents duplicate imports.
@@ -280,13 +333,47 @@ export async function migrateFromAutomergeIfNeeded(
     try {
       kv.setItem(
         MIGRATED_KEY,
-        JSON.stringify({ at: new Date().toISOString(), imported: outcome.imported }),
+        JSON.stringify({
+          version: MIGRATION_FLAG_VERSION,
+          at: new Date().toISOString(),
+          imported: outcome.imported,
+          skippedDuplicates: outcome.skippedDuplicates,
+        }),
       )
     } catch {
       // Flag could not be persisted; dedupe keeps the next run harmless.
     }
   }
   return outcome
+}
+
+/**
+ * One-time user notice for a migration run with failed documents
+ * (M14). Returns the plain-language notice the app should show, or
+ * null when there is nothing to say (no run, no failures, or this
+ * exact failed-doc set was already told about — the notice is
+ * one-time per set, so a repeat launch with the same corrupt docs
+ * stays quiet while a NEW failure speaks up). The set is recorded in
+ * `kv` under MIGRATION_NOTICED_KEY.
+ */
+export function migrationFailureNotice(
+  outcome: MigrationOutcome,
+  kv: KeyValueStore = localStorage,
+): string | null {
+  if (!outcome.ran || outcome.failedDocIds.length === 0) return null
+  const key = [...outcome.failedDocIds].sort().join(',')
+  try {
+    if (kv.getItem(MIGRATION_NOTICED_KEY) === key) return null
+    kv.setItem(MIGRATION_NOTICED_KEY, key)
+  } catch {
+    // Notice record could not be persisted — still show it this once.
+  }
+  const n = outcome.failedDocIds.length
+  return (
+    `The old cookbook recovery couldn't read ${n} recipe${n === 1 ? '' : 's'} ` +
+    `from the previous format, so ${n === 1 ? 'it was' : 'they were'} left out. ` +
+    'Your current recipes are unaffected, and the old data is still kept on this device.'
+  )
 }
 
 async function runMigration(
@@ -298,13 +385,23 @@ async function runMigration(
   if (!chunks) {
     // No Phase 0 database (fresh install or already-clean device).
     return {
-      outcome: { ran: true, imported: 0, skippedDuplicates: 0, failedDocs: 0 },
+      outcome: {
+        ran: true,
+        imported: 0,
+        skippedDuplicates: 0,
+        failedDocs: 0,
+        failedDocIds: [],
+        complete: true,
+      },
       complete: true,
     }
   }
   // Only pay for the Automerge WASM when there is something to recover.
   const Automerge = await import('@automerge/automerge')
-  const { recipes: recovered, failedDocs } = await recoverOldRecipes(chunks, Automerge)
+  const { recipes: recovered, failedDocIds: loadFailed } = await recoverOldRecipes(
+    chunks,
+    Automerge,
+  )
 
   const index = await getOrCreateIndex(store, kv)
   const fingerprints = new Set<string>()
@@ -315,7 +412,7 @@ async function runMigration(
 
   let imported = 0
   let skippedDuplicates = 0
-  let failedImports = 0
+  const failedImportIds: string[] = []
   for (const rec of recovered) {
     const fp = recipeFingerprint(rec.input)
     if (fingerprints.has(fp)) {
@@ -331,19 +428,28 @@ async function runMigration(
       imported += 1
     } catch (e) {
       console.warn('[longtable] failed to import a recovered recipe:', e)
-      failedImports += 1
+      if (rec.sourceDocId) failedImportIds.push(rec.sourceDocId)
     }
   }
+  // Integrity M14: ANY failed document — a corrupt chunk set that
+  // could not load, or a recovered recipe that could not import —
+  // blocks completion, so the flag stays unset and the next launch
+  // retries. The failed ids are recorded (previously only a count
+  // survived) and the user is told once per set (see
+  // migrationFailureNotice). A permanently corrupt doc means the run
+  // retries every launch; that is the honest cost of not silently
+  // dropping it, and dedupe keeps each retry from importing twice.
+  const failedDocIds = [...loadFailed, ...failedImportIds]
+  const complete = failedDocIds.length === 0
   return {
     outcome: {
       ran: true,
       imported,
       skippedDuplicates,
-      failedDocs: failedDocs + failedImports,
+      failedDocs: failedDocIds.length,
+      failedDocIds,
+      complete,
     },
-    // Corrupt-doc load failures are permanent (retrying cannot help, and
-    // dedupe makes them cheap), so they don't block completion. Import
-    // failures do — the flag stays unset and the next launch retries.
-    complete: failedImports === 0,
+    complete,
   }
 }

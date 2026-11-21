@@ -29,13 +29,27 @@ export interface ImporterInput {
   mimeType?: string
   /** The page to fetch (kind 'url' only). */
   url?: string
+  /**
+   * Optional app-provided resolver for image CIDs (M-N6): when an
+   * importer returns `imageCids` (e.g. a saved public record's
+   * `images[].ref.$link`), `runImporter` calls this for each CID and
+   * stores the returned data URL as a photo. It receives only the CID
+   * string; it returns a `data:image/…` URL, or null when the blob
+   * cannot be fetched. Importers never call it themselves — the
+   * registry does, after validation. Absent when the caller has no
+   * blob source (a bare JSON file carries no author DID to fetch
+   * from), in which case the photos are left out and warned about.
+   */
+  resolveImageCid?: (cid: string) => Promise<string | null>
 }
 
 /**
- * One recipe as an importer returns it. Exactly the app's `RecipeInput`
- * fields. Extra source fields (description, yield, tags, …) are NOT part
- * of API v1: the local recipe shape doesn't store them yet, so importers
- * should fold anything essential into the title/ingredients/steps.
+ * One recipe as an importer returns it. The app's `RecipeInput` fields
+ * plus the optional descriptive fields the store now keeps
+ * (`description`, `recipeYield`, `tags`, `author`, `sourceUrl`) — a
+ * source that records them no longer has to drop them or fold them
+ * into the steps. `imageCids` and `warnings` are import-time only:
+ * they never reach the store (see below).
  */
 export interface ImportedRecipe {
   title: string
@@ -54,12 +68,32 @@ export interface ImportedRecipe {
    * private, as before.
    */
   visibility?: 'private' | 'friends-only' | 'public'
+  /** Free-text description, when the source records one. */
+  description?: string
+  /** Yield as written in the source ("4 servings"), when recorded. */
+  recipeYield?: string
+  /** Tags / keywords / categories, when the source records them. */
+  tags?: string[]
+  /** Author name as written in the source, when recorded. */
+  author?: string
+  /** The page or file the recipe came from, when known. */
+  sourceUrl?: string
+  /**
+   * Photo CIDs the importer could not turn into bytes itself (M-N6: a
+   * saved `kitchen.longtable.recipe` record carries photos as
+   * `images[].ref.$link`). `runImporter` resolves these through
+   * `input.resolveImageCid` when one is provided; otherwise it warns
+   * that the photos were left out. Never stored as-is — a bare CID is
+   * not a renderable photo.
+   */
+  imageCids?: string[]
   /**
    * Non-fatal notes from the importer (Wave 4B H10: the web-page
-   * importer reports each photo it dropped and why). The registry
-   * surfaces these to the user and the API; the contract validator
-   * strips them before anything is stored — warnings are never part
-   * of a recipe.
+   * importer reports each photo it dropped and why; M20: a Markdown
+   * recipe with no steps; M21: a Mealie `image` file name that could
+   * not be fetched). The registry surfaces these to the user and the
+   * API; the contract validator strips them before anything is stored
+   * — warnings are never part of a recipe.
    */
   warnings?: string[]
 }
@@ -95,6 +129,34 @@ export class ImporterError extends Error {
     this.name = 'ImporterError'
   }
 }
+
+// ---------------------------------------------------------------------------
+// Import limits (integrity M17). A malicious or buggy source cannot make
+// the app persist unbounded data: photos are capped by count and by
+// decoded bytes, recipes per run are capped, and the file picker caps
+// the file itself (ImportPanel checks MAX_IMPORT_FILE_BYTES before
+// reading). Over-cap input fails the run visibly — it is never silently
+// truncated, so the user knows something was left out.
+// ---------------------------------------------------------------------------
+
+/** At most this many photos on one imported recipe. */
+export const MAX_IMPORT_PHOTOS = 20
+/** At most this many decoded bytes in one imported photo (5 MiB). */
+export const MAX_IMPORT_PHOTO_BYTES = 5 * 1024 * 1024
+/** At most this many recipes in one import run. */
+export const MAX_IMPORT_RECIPES = 500
+/** At most this many bytes in a file chosen in the Import panel (10 MiB). */
+export const MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024
+/** At most this many characters in an imported description. */
+export const MAX_IMPORT_DESCRIPTION_CHARS = 5000
+/** At most this many characters in an imported yield string. */
+export const MAX_IMPORT_YIELD_CHARS = 200
+/** At most this many characters in an imported author name. */
+export const MAX_IMPORT_AUTHOR_CHARS = 200
+/** At most this many tags on one imported recipe. */
+export const MAX_IMPORT_TAGS = 50
+/** At most this many characters in one imported tag. */
+export const MAX_IMPORT_TAG_CHARS = 200
 
 // ---------------------------------------------------------------------------
 // Validation — the app's side of the contract. Every recipe an importer
@@ -136,6 +198,20 @@ function cleanMinutes(value: unknown, field: string, source: string): number | u
   return Math.round(n)
 }
 
+/** Approximate decoded byte size of a data URL (base64 inflates by 4/3). */
+export function dataUrlApproxBytes(dataUrl: string): number {
+  const comma = dataUrl.indexOf(',')
+  if (comma === -1) return dataUrl.length
+  const head = dataUrl.slice(0, comma)
+  const body = dataUrl.slice(comma + 1)
+  if (/;base64$/i.test(head)) {
+    const padding = body.endsWith('==') ? 2 : body.endsWith('=') ? 1 : 0
+    return Math.max(0, Math.floor((body.length * 3) / 4) - padding)
+  }
+  // Non-base64 data URLs (e.g. URL-encoded SVG): the text is the payload.
+  return body.length
+}
+
 function cleanPhotos(value: unknown, source: string): string[] {
   if (value === undefined || value === null) return []
   if (!Array.isArray(value)) {
@@ -150,7 +226,122 @@ function cleanPhotos(value: unknown, source: string): string[] {
     // javascript:, blobs from another origin) is dropped, not stored.
     if (item.startsWith('data:image/') || /^https?:\/\//i.test(item)) out.push(item)
   }
+  if (out.length > MAX_IMPORT_PHOTOS) {
+    throw new ImporterError(
+      `${source}: too many photos (${out.length}; at most ${MAX_IMPORT_PHOTOS}).`,
+    )
+  }
+  for (let i = 0; i < out.length; i++) {
+    const item = out[i]
+    if (item.startsWith('data:image/')) {
+      const bytes = dataUrlApproxBytes(item)
+      if (bytes > MAX_IMPORT_PHOTO_BYTES) {
+        throw new ImporterError(
+          `${source}: photo ${i + 1} is too large (about ${Math.round(bytes / 1048576)} MB; at most 5 MB).`,
+        )
+      }
+    }
+  }
   return out
+}
+
+function cleanText(
+  value: unknown,
+  field: string,
+  source: string,
+  maxChars: number,
+): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new ImporterError(`${source}: "${field}" must be text.`)
+  }
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  if (trimmed.length > maxChars) {
+    throw new ImporterError(`${source}: "${field}" is too long (${trimmed.length} characters).`)
+  }
+  return trimmed
+}
+
+function cleanTags(value: unknown, source: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) {
+    throw new ImporterError(`${source}: "tags" must be a list.`)
+  }
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') {
+      throw new ImporterError(`${source}: every "tags" entry must be text.`)
+    }
+    const trimmed = item.trim()
+    if (!trimmed) continue
+    if (trimmed.length > MAX_IMPORT_TAG_CHARS) {
+      throw new ImporterError(`${source}: a "tags" entry is too long (${trimmed.length} characters).`)
+    }
+    if (!out.includes(trimmed)) out.push(trimmed)
+  }
+  if (out.length > MAX_IMPORT_TAGS) {
+    throw new ImporterError(`${source}: too many "tags" entries (${out.length}).`)
+  }
+  return out.length > 0 ? out : undefined
+}
+
+function cleanSourceUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  // Only web URLs survive; anything else is dropped, not stored.
+  if (!/^https?:\/\//i.test(trimmed) || trimmed.length > 2000) return undefined
+  return trimmed
+}
+
+/**
+ * Normalize a yield value from a source format into the plain string the
+ * store keeps: "4 servings" stays as-is; a bare number becomes "4"; a
+ * list like ["4", "servings"] joins with spaces. Anything else yields
+ * undefined (the field is optional — an unparseable yield is dropped,
+ * never stored as "[object Object]").
+ */
+export function normalizeRecipeYield(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed ? trimmed : undefined
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (Array.isArray(value)) {
+    const parts = value.filter((x): x is string => typeof x === 'string')
+      .map((x) => x.trim())
+      .filter(Boolean)
+    return parts.length > 0 ? parts.join(' ') : undefined
+  }
+  return undefined
+}
+
+/**
+ * Normalize a tags/categories value into a deduped string list: plain
+ * strings stay; objects with a `name` string contribute the name
+ * (Mealie tags/categories are `{name, slug}` objects); anything else is
+ * dropped. Returns undefined when nothing usable remains.
+ */
+export function normalizeTags(value: unknown): string[] | undefined {
+  if (typeof value === 'string') {
+    const tags = value.split(',').map((t) => t.trim()).filter(Boolean)
+    return tags.length > 0 ? [...new Set(tags)] : undefined
+  }
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item === 'string') {
+      const trimmed = item.trim()
+      if (trimmed && !out.includes(trimmed)) out.push(trimmed)
+    } else if (typeof item === 'object' && item !== null) {
+      const name = (item as Record<string, unknown>).name
+      if (typeof name === 'string') {
+        const trimmed = name.trim()
+        if (trimmed && !out.includes(trimmed)) out.push(trimmed)
+      }
+    }
+  }
+  return out.length > 0 ? out : undefined
 }
 
 /**
@@ -176,6 +367,11 @@ export function validateImportedRecipe(
   if (title.length > MAX_TITLE) {
     throw new ImporterError(`${source}: the title is too long (${title.length} characters).`)
   }
+  const description = cleanText(r.description, 'description', source, MAX_IMPORT_DESCRIPTION_CHARS)
+  const recipeYield = cleanText(r.recipeYield, 'recipeYield', source, MAX_IMPORT_YIELD_CHARS)
+  const tags = cleanTags(r.tags, source)
+  const author = cleanText(r.author, 'author', source, MAX_IMPORT_AUTHOR_CHARS)
+  const sourceUrl = cleanSourceUrl(r.sourceUrl)
   return {
     title,
     ingredients: cleanStringList(r.ingredients, 'ingredients', source),
@@ -188,6 +384,13 @@ export function validateImportedRecipe(
     ...(r.visibility === 'private' || r.visibility === 'friends-only' || r.visibility === 'public'
       ? { visibility: r.visibility }
       : {}),
+    // Descriptive fields the store keeps (M15/M21): validated and
+    // capped like everything else, never silently invented.
+    ...(description ? { description } : {}),
+    ...(recipeYield ? { recipeYield } : {}),
+    ...(tags ? { tags } : {}),
+    ...(author ? { author } : {}),
+    ...(sourceUrl ? { sourceUrl } : {}),
   }
 }
 

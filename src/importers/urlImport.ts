@@ -1,5 +1,8 @@
 import type { RecipeInput } from '../types'
 import { blobToDataUrl, MAX_PHOTO_BYTES } from './photoImport'
+import { normalizeRecipeYield, normalizeTags } from './contract'
+import { stepsFromInstructions } from './howtoSteps'
+import { isoDurationToMinutes } from './isoDuration'
 
 /**
  * URL recipe importer.
@@ -184,9 +187,15 @@ interface JsonLdRecipeNode {
   '@type'?: string | string[]
   name?: string
   recipeIngredient?: string[]
-  recipeInstructions?: Array<string | { text?: string } | { itemListElement?: Array<{ text?: string }> }>
+  recipeInstructions?: unknown
   image?: string | string[] | { url?: string } | Array<{ url?: string }>
   description?: string
+  recipeYield?: string | number | string[]
+  author?: string | { name?: string } | Array<string | { name?: string }>
+  keywords?: string | string[]
+  prepTime?: string
+  cookTime?: string
+  totalTime?: string
 }
 
 function isRecipeNode(node: unknown): node is JsonLdRecipeNode {
@@ -212,28 +221,6 @@ function findRecipeNode(payload: unknown): JsonLdRecipeNode | undefined {
   return undefined
 }
 
-function stepsFromInstructions(
-  instructions: JsonLdRecipeNode['recipeInstructions'],
-): string[] {
-  if (!instructions) return []
-  const out: string[] = []
-  for (const item of instructions) {
-    if (typeof item === 'string') {
-      if (item.trim()) out.push(item.trim())
-    } else if (typeof item === 'object' && item !== null) {
-      const step = item as { text?: string; itemListElement?: Array<{ text?: string }> }
-      if (typeof step.text === 'string' && step.text.trim()) {
-        out.push(step.text.trim())
-      } else if (Array.isArray(step.itemListElement)) {
-        for (const sub of step.itemListElement) {
-          if (typeof sub?.text === 'string' && sub.text.trim()) out.push(sub.text.trim())
-        }
-      }
-    }
-  }
-  return out
-}
-
 function photosFromImage(image: JsonLdRecipeNode['image']): string[] {
   if (!image) return []
   const urls: string[] = []
@@ -256,6 +243,19 @@ function photosFromImage(image: JsonLdRecipeNode['image']): string[] {
   return urls
 }
 
+function authorName(author: JsonLdRecipeNode['author']): string | undefined {
+  if (!author) return undefined
+  const list = Array.isArray(author) ? author : [author]
+  for (const item of list) {
+    if (typeof item === 'string' && item.trim()) return item.trim()
+    if (typeof item === 'object' && item !== null) {
+      const name = item.name
+      if (typeof name === 'string' && name.trim()) return name.trim()
+    }
+  }
+  return undefined
+}
+
 function parseJsonLdRecipe(doc: Document): JsonLdRecipeNode | undefined {
   const scripts = doc.querySelectorAll('script[type="application/ld+json"]')
   for (const script of scripts) {
@@ -271,7 +271,11 @@ function parseJsonLdRecipe(doc: Document): JsonLdRecipeNode | undefined {
   return undefined
 }
 
-/** Parse OpenGraph tags + schema.org Recipe JSON-LD out of page HTML. Exported for tests. */
+/**
+ * Parse OpenGraph tags + schema.org Recipe JSON-LD out of page HTML.
+ * Exported for tests. The fetched page URL is kept as `sourceUrl`, so
+ * the imported recipe still says where it came from (M15).
+ */
 export function parseRecipeHtml(html: string, url: string): Partial<RecipeInput> {
   const doc = new DOMParser().parseFromString(html, 'text/html')
   const jsonLd = parseJsonLdRecipe(doc)
@@ -295,11 +299,40 @@ export function parseRecipeHtml(html: string, url: string): Partial<RecipeInput>
   const ogImage = metaContent(doc, 'og:image')
   if (photos.length === 0 && ogImage) photos.push(resolvePhoto(ogImage))
 
+  // Times (M15): ISO-8601 durations from the JSON-LD. A totalTime only
+  // fills in the one missing leg — deriving cook from the total alone
+  // would overstate it, because the total includes the prep (same rule
+  // as the Mealie importer, M21).
+  const prep = isoDurationToMinutes(jsonLd?.prepTime)
+  let cook = isoDurationToMinutes(jsonLd?.cookTime)
+  const total = isoDurationToMinutes(jsonLd?.totalTime)
+  if (cook === undefined && prep !== undefined && total !== undefined && total > prep) {
+    cook = total - prep
+  }
+  let prepMinutes = prep
+  if (prepMinutes === undefined && cook !== undefined && total !== undefined && total > cook) {
+    prepMinutes = total - cook
+  }
+
+  const description =
+    (typeof jsonLd?.description === 'string' && jsonLd.description.trim()
+      ? jsonLd.description.trim()
+      : undefined) ?? metaContent(doc, 'og:description')
+
   const partial: Partial<RecipeInput> = {
     title,
     ingredients,
     steps,
     photos,
+    ...(prepMinutes !== undefined ? { prepMinutes } : {}),
+    ...(cook !== undefined ? { cookMinutes: cook } : {}),
+    ...(description ? { description } : {}),
+    ...(normalizeRecipeYield(jsonLd?.recipeYield)
+      ? { recipeYield: normalizeRecipeYield(jsonLd?.recipeYield)! }
+      : {}),
+    ...(normalizeTags(jsonLd?.keywords) ? { tags: normalizeTags(jsonLd?.keywords)! } : {}),
+    ...(authorName(jsonLd?.author) ? { author: authorName(jsonLd?.author)! } : {}),
+    ...(url ? { sourceUrl: url } : {}),
   }
   return partial
 }

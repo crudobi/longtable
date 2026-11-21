@@ -5,6 +5,8 @@
 // Format:
 //   # Recipe Title
 //
+//   A line or two about the recipe.
+//
 //   Prep: 15 min
 //   Cook: 30 min
 //
@@ -15,6 +17,12 @@
 //   ## Steps
 //   1. Mix everything.
 //   2. Bake for 30 minutes.
+//
+// Prep/Cook (and Total) lines are read wherever they appear outside
+// the ingredient/step lists. Lines that are not list items inside a
+// list section continue the previous item instead of being dropped.
+// A recipe with ingredients but no steps still imports — with a
+// warning, so the missing method is visible rather than silent.
 
 function parseMinutes(raw) {
   var value = String(raw).trim().toLowerCase();
@@ -53,6 +61,8 @@ function importMarkdown(input) {
   var title = null;
   var prepMinutes;
   var cookMinutes;
+  var totalMinutes;
+  var descriptionLines = [];
   var ingredients = [];
   var steps = [];
   var sawIngredientsSection = false;
@@ -62,6 +72,7 @@ function importMarkdown(input) {
   for (var i = 0; i < lines.length; i++) {
     var rawLine = lines[i];
     var line = rawLine.trim();
+    if (!line) continue;
 
     // Section headings: ## ...
     var sectionMatch = line.match(/^##\s+(.+?)\s*#*\s*$/);
@@ -93,24 +104,33 @@ function importMarkdown(input) {
       continue;
     }
 
-    // Prep / Cook lines: only before the sections, per the format description
-    if (currentSection === null) {
-      var timeMatch = line.match(/^(prep|cook)(?:\s+time)?\s*:\s*(.+?)\s*$/i);
+    // Prep / Cook / Total lines: anywhere outside the ingredient and
+    // step lists (before the sections, under a notes/details heading,
+    // or after the lists) — not only before the first section.
+    if (currentSection !== 'ingredients' && currentSection !== 'steps') {
+      var timeMatch = line.match(/^(prep|cook|total)(?:\s+time)?\s*:\s*(.+?)\s*$/i);
       if (timeMatch) {
         var parsed = parseMinutes(timeMatch[2]);
         if (parsed !== undefined) {
-          if (timeMatch[1].toLowerCase() === 'prep') prepMinutes = parsed;
-          else cookMinutes = parsed;
+          var which = timeMatch[1].toLowerCase();
+          if (which === 'prep') prepMinutes = parsed;
+          else if (which === 'cook') cookMinutes = parsed;
+          else totalMinutes = parsed;
         }
         continue;
       }
     }
 
     if (currentSection === 'ingredients') {
-      var bullet = line.match(/^[-*]\s+(.+?)\s*$/);
+      var bullet = line.match(/^[-*+]\s+(.+?)\s*$/);
       if (bullet) {
         var ingredient = bullet[1].trim();
         if (ingredient) ingredients.push(ingredient);
+        continue;
+      }
+      // A continuation line belongs to the previous ingredient.
+      if (ingredients.length > 0) {
+        ingredients[ingredients.length - 1] += ' ' + line;
       }
       continue;
     }
@@ -122,15 +142,32 @@ function importMarkdown(input) {
         if (stepText) steps.push(stepText);
         continue;
       }
-      var stepBullet = line.match(/^[-*]\s+(.+?)\s*$/);
+      var stepBullet = line.match(/^[-*+]\s+(.+?)\s*$/);
       if (stepBullet) {
         var bulletStep = stepBullet[1].trim();
         if (bulletStep) steps.push(bulletStep);
+        continue;
+      }
+      // A continuation line belongs to the previous step.
+      if (steps.length > 0) {
+        steps[steps.length - 1] += ' ' + line;
       }
       continue;
     }
 
-    // Other sections and stray lines are ignored.
+    // Stray prose (before any section, or under an unrecognized
+    // heading) is the recipe's description — it used to be dropped.
+    descriptionLines.push(line);
+  }
+
+  // A total time fills in the one missing leg only; deriving a leg
+  // from the total alone would overstate it.
+  if (totalMinutes !== undefined) {
+    if (prepMinutes !== undefined && cookMinutes === undefined && totalMinutes > prepMinutes) {
+      cookMinutes = totalMinutes - prepMinutes;
+    } else if (cookMinutes !== undefined && prepMinutes === undefined && totalMinutes > cookMinutes) {
+      prepMinutes = totalMinutes - cookMinutes;
+    }
   }
 
   if (title === null || title === '') {
@@ -150,6 +187,10 @@ function importMarkdown(input) {
   };
   if (prepMinutes !== undefined) recipe.prepMinutes = prepMinutes;
   if (cookMinutes !== undefined) recipe.cookMinutes = cookMinutes;
+  if (descriptionLines.length > 0) recipe.description = descriptionLines.join('\n');
+  if (steps.length === 0) {
+    recipe.warnings = ['This recipe has no steps — the ingredients imported, but add the method afterwards.'];
+  }
   return [recipe];
 }
 

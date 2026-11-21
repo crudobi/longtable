@@ -22,6 +22,8 @@ export interface ImporterInput {
   fileName?: string  // original file name ('file' only)
   mimeType?: string  // file MIME type, when known ('file' only)
   url?: string       // the page to fetch ('url' only)
+  // Optional, app-provided: resolve a photo blob CID to a data URL.
+  resolveImageCid?: (cid: string) => Promise<string | null>
 }
 
 export interface ImportedRecipe {
@@ -31,6 +33,14 @@ export interface ImportedRecipe {
   prepMinutes?: number   // minutes
   cookMinutes?: number   // minutes
   photos?: string[]      // data URLs or http(s) URLs
+  visibility?: 'private' | 'friends-only' | 'public'
+  description?: string   // free text, kept when the source records it
+  recipeYield?: string   // e.g. "4 servings"
+  tags?: string[]        // keywords / categories
+  author?: string        // author name as written in the source
+  sourceUrl?: string     // the page or file the recipe came from
+  imageCids?: string[]   // photo blob CIDs the app resolves (see below)
+  warnings?: string[]    // non-fatal notes shown with the result
 }
 
 export interface RecipeImporter {
@@ -66,9 +76,23 @@ Rules of the road:
   your importer returns, the app validates every recipe (below). Map
   your format's fields to the canonical names; don't stuff data into
   fields it doesn't belong in.
-- **API v1 stores no description/yield/tags.** The local recipe shape
-  doesn't have them yet. If your source has an essential note, fold it
-  into a step; don't silently invent fields — extra fields are ignored.
+- **Keep what the source records.** The recipe shape keeps
+  `description`, `recipeYield`, `tags`, `author`, and `sourceUrl`
+  when an importer returns them (validated and capped like
+  everything else — see below). Don't fold them into the steps, and
+  don't silently drop them either.
+- **Warn, don't silently drop.** When something is lost or
+  incomplete but the import can still land — a recipe with no steps,
+  a photo that is only a file name, image references nobody can
+  fetch — attach a plain-language `warnings` entry to the recipe.
+  The app shows warnings with the success message; the import still
+  lands.
+- **Photos by reference.** A source that records photos as blob
+  CIDs (a saved `kitchen.longtable.recipe` record's
+  `images[].ref.$link`) returns them as `imageCids`. The app
+  resolves them through `input.resolveImageCid` when the caller
+  supplied one, and warns when it didn't. Never invent a data URL
+  for a CID you cannot fetch.
 
 ## Validation (the app's side)
 
@@ -82,6 +106,15 @@ is saved. One invalid recipe fails the whole run — imports are atomic.
   (numeric strings are coerced; values are rounded).
 - `photos`: optional array of strings; only `data:image/…` and
   `http(s)://` entries are kept — anything else is dropped, not stored.
+  At most 20 photos per recipe, and a data-URL photo decodes to at
+  most 5 MB — over either cap the whole run fails visibly.
+- `description`: optional text, at most 5000 characters.
+  `recipeYield`: optional text, at most 200 characters. `tags`:
+  optional list of at most 50 tags of at most 200 characters.
+  `author`: optional text, at most 200 characters. `sourceUrl`:
+  optional; only `http(s)://` URLs are kept.
+- A run imports at most 500 recipes; the file picker refuses files
+  over 10 MB before reading them.
 
 Your importer's own shape is also checked when it registers: wrong
 `apiVersion`, a non-kebab-case `id`, an empty `accepts`, or a missing
@@ -134,9 +167,9 @@ Two clarifications that process surfaced:
 
 | Importer | id | Input | Notes |
 |---|---|---|---|
-| Web page | `web-page` | URL | JSON-LD (`schema.org/Recipe`) + OpenGraph parsing of a fetched page. |
-| JSON file | `longtable-json` | file / text | One recipe object, an array, or `{"recipes": […]}`. Accepts the canonical field names plus the public-record aliases (`name`, `instructions`, `prepTimeMinutes`, `cookTimeMinutes`), so a saved `kitchen.longtable.recipe` record imports as-is. This is also the format the app's own export writes (Backup panel → Export recipes): an export round-trips through this importer, including each recipe's `visibility` tier. See [backup.md](backup.md). |
-| Mealie export | `mealie-json` | file / text | A `recipe.json` from a Mealie backup (unzip first). ISO-8601 durations (`PT1H30M`) become minutes; `HowToSection` groups are flattened in order. Mealie's `image` field is a file *name* inside the backup, not data, so photos are not imported. |
+| Web page | `web-page` | URL | JSON-LD (`schema.org/Recipe`) + OpenGraph parsing of a fetched page. ISO-8601 durations, description, yield, author, keywords, and the page URL are kept. A page with a title but no ingredients and no steps is refused as a stub — use the form's prefill for those. |
+| JSON file | `longtable-json` | file / text | One recipe object, an array, or `{"recipes": […]}`. Accepts the canonical field names plus the public-record aliases (`name`, `instructions`, `recipeIngredient`, `prepTimeMinutes`, `cookTimeMinutes`), so a saved `kitchen.longtable.recipe` record imports as-is. A record's `images[].ref.$link` photo CIDs are resolved when the caller can fetch blobs, and warned about otherwise. This is also the format the app's own export writes (Backup panel → Export recipes): an export round-trips through this importer, including each recipe's `visibility` tier and descriptive fields. See [backup.md](backup.md). |
+| Mealie export | `mealie-json` | file / text | A `recipe.json` from a Mealie backup (unzip first). ISO-8601 durations (`PT1H30M`, `P1W`) become minutes; `HowToSection` groups are flattened in order with the section name kept; a name-only `HowToStep` still lands as a step. Description, yield, tags, and categories are kept. Mealie's `image` field is a file *name* inside the backup, not data, so it is warned about instead of imported (a web-URL `image` is kept as a photo). |
 
 ## Testing your importer
 

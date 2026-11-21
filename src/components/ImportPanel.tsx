@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { RecipeInput } from '../types'
+import { MAX_IMPORT_FILE_BYTES } from '../importers/contract'
 import type { ImporterInput, RecipeImporter } from '../importers/contract'
 import {
   ensurePluginsLoaded,
@@ -34,6 +35,7 @@ export function ImportPanel({ onClose, onImported }: Props) {
   const [fileName, setFileName] = useState('')
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<string | null>(null)
+  const [warnings, setWarnings] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
 
   // Drop-in plugins load lazily; refresh the list when they land.
@@ -56,10 +58,22 @@ export function ImportPanel({ onClose, onImported }: Props) {
 
   const pickFile = async (file: File | null) => {
     setResult(null)
+    setWarnings([])
     setError(null)
     if (!file) {
       setFileText(null)
       setFileName('')
+      return
+    }
+    // Integrity M17: cap the file before reading it — a huge file
+    // cannot be imported anyway (at most 500 recipes per run), and
+    // reading it into memory first would waste the device's RAM.
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+      setFileText(null)
+      setFileName('')
+      setError(
+        `That file is too large (${(file.size / 1048576).toFixed(1)} MB; at most 10 MB). Choose a smaller file.`,
+      )
       return
     }
     try {
@@ -94,16 +108,18 @@ export function ImportPanel({ onClose, onImported }: Props) {
     if (!input) return
     setBusy(true)
     setResult(null)
+    setWarnings([])
     setError(null)
     try {
-      const { recipes, warnings } = await runImporter(selected.id, input)
+      const { recipes, warnings: runWarnings } = await runImporter(selected.id, input)
       await onImported(recipes)
       setResult(
         (recipes.length === 1
           ? `Imported “${recipes[0].title}”.`
           : `Imported ${recipes.length} recipes: ${recipes.map((r) => `“${r.title}”`).join(', ')}.`) +
-          (warnings.length > 0 ? ` ${warnings.join(' ')}` : ''),
+          (runWarnings.length > 0 ? ` ${runWarnings.join(' ')}` : ''),
       )
+      setWarnings(runWarnings)
       setText('')
       setFileText(null)
       setFileName('')
@@ -202,6 +218,13 @@ export function ImportPanel({ onClose, onImported }: Props) {
 
         {result && (
           <p className="status" data-testid="import-result">{result}</p>
+        )}
+        {warnings.length > 0 && (
+          <div className="status" data-testid="import-warnings">
+            {warnings.map((w, i) => (
+              <p key={i}>{w}</p>
+            ))}
+          </div>
         )}
         {error && (
           <p className="status error" data-testid="import-error">{error}</p>
