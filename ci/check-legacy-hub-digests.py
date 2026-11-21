@@ -5,8 +5,9 @@ Derives the expected FNV-1a-64 digests of the pre-scrub legacy hub
 values from `git show d725e40:src/hubs/hubs.ts` (the scrub parent —
 the values that actually shipped) and compares them against the
 committed LEGACY_HUB_HASHES in src/hubs/hubs.ts. The defensive
-LEGACY_HUB_HASHES_V0 set is pinned the same way, against the digests
-committed by 440c8ac (`git show 440c8ac:src/hubs/hubs.ts`).
+LEGACY_HUB_HASHES_V0 set (fragment-joined strings that never shipped)
+was pinned the same way until it was removed after the v0.2.2 release;
+it is no longer checked and must not come back.
 
 Fails closed (exit 1) on any mismatch, any unparsable file, or any
 unavailable revision — a wrong digest must never ship silently again.
@@ -24,7 +25,6 @@ import sys
 from pathlib import Path
 
 SCRUB_PARENT_REV = "d725e40"
-V0_COMMIT_REV = "440c8ac"
 HUBS_PATH = "src/hubs/hubs.ts"
 
 FNV_OFFSET = 0xCBF29CE484222325
@@ -141,31 +141,6 @@ def main():
             f"legacy-hub-digests: LEGACY_HUB_HASHES.{field} "
             f"len={len(values[field])} derived={derived} "
             f"committed={committed[field]} match={str(match).lower()}"
-        )
-
-    # --- defensive V0 set: pinned to the digests committed by 440c8ac --
-    v0_src = git_show(repo, V0_COMMIT_REV)
-    if v0_src is None:
-        return 1
-    expected_v0 = parse_committed_set(v0_src, "LEGACY_HUB_HASHES")
-    if expected_v0 is None:
-        print(
-            f"legacy-hub-digests: cannot parse LEGACY_HUB_HASHES from "
-            f"{V0_COMMIT_REV}:{HUBS_PATH}; refusing to guess"
-        )
-        return 1
-    committed_v0 = parse_committed_set(committed_src, "LEGACY_HUB_HASHES_V0")
-    if committed_v0 is None:
-        print("legacy-hub-digests: cannot parse LEGACY_HUB_HASHES_V0 from "
-              f"{hubs_file}; refusing to guess")
-        return 1
-    for field in FIELDS:
-        match = expected_v0[field] == committed_v0[field]
-        ok = ok and match
-        print(
-            f"legacy-hub-digests: LEGACY_HUB_HASHES_V0.{field} "
-            f"expected={expected_v0[field]} "
-            f"committed={committed_v0[field]} match={str(match).lower()}"
         )
 
     print(f"legacy-hub-digests: ALL_MATCH={str(ok).lower()}")

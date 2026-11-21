@@ -49,13 +49,14 @@ leaks into a build — and runs, in order:
    the expected FNV-1a-64 digests of the pre-scrub legacy hub values
    from git history (`git show d725e40:src/hubs/hubs.ts`, the scrub
    parent) and compares them against the committed
-   `LEGACY_HUB_HASHES` in `src/hubs/hubs.ts`; pins the defensive
-   `LEGACY_HUB_HASHES_V0` set against the digests committed by
-   440c8ac. Prints digests/match booleans only, never the values.
-   Fails closed on any mismatch or an unavailable revision — this is
-   the check whose absence let the 440c8ac digests (which hash
-   strings that never shipped) pass the bundle gate (review C1,
-   2026-11-15).
+   `LEGACY_HUB_HASHES` in `src/hubs/hubs.ts`. Prints digests/match
+   booleans only, never the values. (The defensive
+   `LEGACY_HUB_HASHES_V0` set was pinned the same way until it was
+   removed after the v0.2.2 release — the fragment strings never
+   shipped, so no device needs it.) Fails closed on any mismatch or an
+   unavailable revision — this is the check whose absence let the
+   440c8ac digests (which hash strings that never shipped) pass the
+   bundle gate (review C1, 2026-11-15).
 4. `npm-ci` — `npm ci`
 5. `typecheck` — `tsc --noEmit`
 6. `lint` — `npm run lint`
