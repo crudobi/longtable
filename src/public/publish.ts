@@ -65,7 +65,15 @@ export interface RecipeRecord {
   longtableId: string
 }
 
-/** The `kitchen.longtable.pubkey` record shape (rkey "self"). */
+/**
+ * The `kitchen.longtable.pubkey` record shape. One record per device, at
+ * the rkey `pubkeyRkeyForDeviceDid(deviceDid)` (H-N1): a second device
+ * publishing must NOT overwrite the first device's binding, so each
+ * device binds under its own rkey. The legacy single-slot rkey "self"
+ * (pre-H-N1 clients) is still honored by the AppView as one device's
+ * binding — see `verifyPubkeyBindings` in appview/device-signature.mjs —
+ * but this client never writes it.
+ */
 export interface PubkeyRecord {
   $type: 'kitchen.longtable.pubkey'
   deviceDid: string
@@ -201,6 +209,34 @@ export function pubkeyBindingMessage(
   return `longtable-pubkey:v1\n${accountDid}\n${deviceDid}\n${devicePublicKeyBase64}`
 }
 
+/**
+ * The per-device rkey for a device's pubkey binding record (H-N1).
+ *
+ * `dev-` + the first 32 hex chars of the BLAKE2b-256 of the deviceDid
+ * string. Deterministic from the deviceDid alone, so any party — the
+ * publishing client, the AppView, a reader fetching the binding from
+ * the PDS — can compute the address of a device's binding without an
+ * index scan. The deviceDid itself is NOT used as the rkey: it contains
+ * colons, which the ATProto rkey grammar allows in theory but PDS
+ * implementations validate unevenly; `dev-<hex>` is valid under every
+ * rkey rule (lowercase alphanumerics + hyphen) and fixed-length. The
+ * binding record itself still carries the deviceDid, so the rkey is an
+ * address, not the identity.
+ *
+ * Cross-implementation pin:
+ * pubkeyRkeyForDeviceDid(
+ *   'did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK')
+ * === 'dev-af0042b31ec6679cc02818a49bf60f70' (BLAKE2b-256 computed
+ * independently; the AppView and client tests pin the same vector).
+ */
+export async function pubkeyRkeyForDeviceDid(deviceDid: string): Promise<string> {
+  await cryptoReady()
+  const hashHex = sodium.to_hex(
+    sodium.crypto_generichash(32, utf8ToU8(deviceDid), null),
+  )
+  return `dev-${hashHex.slice(0, 32)}`
+}
+
 // ---------------------------------------------------------------------------
 // Publications registry (localStorage)
 // ---------------------------------------------------------------------------
@@ -246,9 +282,16 @@ function dropPublication(recipeId: string, kv: PublicKv): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Ensure the account's `kitchen.longtable.pubkey` record (rkey "self")
- * binds THIS device key. Writes the record only when it is missing or
- * bound to a different device key. Returns true when a record was written.
+ * Ensure the account's `kitchen.longtable.pubkey` record for THIS device
+ * binds this device key, at its per-device rkey (H-N1). Writes the record
+ * only when it is missing or bound to a different key. Returns true when
+ * a record was written.
+ *
+ * A second device publishing NEVER touches another device's binding:
+ * each device writes only its own per-device rkey, and the legacy `self`
+ * record is never read or overwritten here. The AppView verifies each
+ * recipe against its own device's binding, so two devices flip-flopping
+ * no longer un-publish each other's recipes.
  */
 export async function ensurePubkeyBinding(
   client: AtprotoClient,
@@ -256,7 +299,8 @@ export async function ensurePubkeyBinding(
   identity: Identity,
   kv: KeyValueStore = localStorageSafe(),
 ): Promise<boolean> {
-  const existing = await client.getRecord(session.did, PUBKEY_COLLECTION, 'self')
+  const rkey = await pubkeyRkeyForDeviceDid(identity.did)
+  const existing = await client.getRecord(session.did, PUBKEY_COLLECTION, rkey)
   const devicePublicKey = u8ToBase64(identity.publicKey)
   if (
     existing &&
@@ -277,7 +321,7 @@ export async function ensurePubkeyBinding(
   await client.putRecord(session, {
     repo: session.did,
     collection: PUBKEY_COLLECTION,
-    rkey: 'self',
+    rkey,
     record: { ...record } as Record<string, unknown>,
   })
   saveSession(session, kv as PublicKv)

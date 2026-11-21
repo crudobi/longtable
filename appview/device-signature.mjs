@@ -6,16 +6,21 @@
  * repo key and produces that signature — it proves nothing about the
  * *device* that authored the recipe. The device signature does:
  *
- *   1. The author's `kitchen.longtable.pubkey/self` binding record binds
- *      one device key to the account: `deviceDid` (a did:key), the same key
- *      as standard-base64 `devicePublicKey`, and `signature` — the device
- *      key's detached Ed25519 signature over
+ *   1. The author's `kitchen.longtable.pubkey` binding records bind
+ *      device keys to the account — one record per device (H-N1), at
+ *      the rkey `pubkeyRkeyForDeviceDid(deviceDid)`; the legacy
+ *      single-slot rkey `self` is still honored as one device's
+ *      binding (migration). Each record carries `deviceDid` (a did:key),
+ *      the same key as standard-base64 `devicePublicKey`, and
+ *      `signature` — the device key's detached Ed25519 signature over
  *      `longtable-pubkey:v1\n<accountDid>\n<deviceDid>\n<devicePublicKey>`.
  *   2. Each recipe record carries `deviceDid` + `deviceSignature` — the
  *      detached Ed25519 signature over
  *      `longtable-recipe:v1\n<accountDid>\n<longtableId>\n<hashHex>`, where
  *      `hashHex` is the BLAKE2b-256 hex of the canonical JSON array
- *      (see canonicalRecipeHashHex).
+ *      (see canonicalRecipeHashHex). A recipe verifies against ITS OWN
+ *      device's binding — a second device publishing never un-indexes
+ *      the first device's recipes.
  *
  * This module is a port of the same checks in the independent verifier
  * (scripts/verify-public/verify-public.mjs) — same canonical hash, same
@@ -30,6 +35,9 @@
  * input. (libsodium itself is the one dependency; see package.json.)
  */
 import sodium from 'libsodium-wrappers'
+
+/** The pubkey binding collection (same literal as db.mjs). */
+const PUBKEY_COLLECTION = 'kitchen.longtable.pubkey'
 
 // libsodium's crypto functions are attached only once the WASM module has
 // loaded: `sodium.ready` MUST resolve before any synchronous export in this
@@ -86,6 +94,21 @@ export function recipeSignatureMessage(accountDid, longtableId, hashHex) {
 /** The exact UTF-8 payload signed for the pubkey binding record. */
 export function pubkeyBindingMessage(accountDid, deviceDid, devicePublicKeyBase64) {
   return `longtable-pubkey:v1\n${accountDid}\n${deviceDid}\n${devicePublicKeyBase64}`
+}
+
+/**
+ * The per-device rkey for a device's pubkey binding record (H-N1) —
+ * the AppView half of the same scheme as the client's
+ * `pubkeyRkeyForDeviceDid` in src/public/publish.ts (same hash, same
+ * truncation, same `dev-` prefix; both pin the same test vector).
+ * Returns null for a non-string input (never throws for bad input).
+ */
+export function pubkeyRkeyForDeviceDid(deviceDid) {
+  if (typeof deviceDid !== 'string' || deviceDid.length === 0) return null
+  const hashHex = sodium.to_hex(
+    sodium.crypto_generichash(32, sodium.from_string(deviceDid)),
+  )
+  return `dev-${hashHex.slice(0, 32)}`
 }
 
 /* ---------------- base58btc (did:key multibase) -------------------------- */
@@ -178,8 +201,10 @@ export function decodeBase64Strict(value, expectedLength) {
 /* ---------------- verification ------------------------------------------- */
 
 /**
- * Verify a `kitchen.longtable.pubkey/self` binding record for `accountDid`.
- * Returns { ok: true, deviceDid, devicePublicKey, devicePublicKeyBytes }
+ * Verify a `kitchen.longtable.pubkey` binding record for `accountDid`.
+ * The record may sit at any accepted rkey (see verifyPubkeyBindings) —
+ * the rkey is an address, not part of the signed payload. Returns
+ * { ok: true, deviceDid, devicePublicKey, devicePublicKeyBytes }
  * or { ok: false, reason }. Checks, in order: the binding's key field
  * decodes to 32 bytes; its deviceDid is an Ed25519 did:key for exactly
  * those bytes; the binding signature (64 bytes) verifies against the
@@ -216,6 +241,57 @@ export async function verifyPubkeyBinding(accountDid, binding) {
     devicePublicKey: binding.devicePublicKey,
     devicePublicKeyBytes: keyBytes,
   }
+}
+
+/**
+ * Verify ALL pubkey binding records in a verified repo state (H-N1).
+ *
+ * `records` are the `{ collection, rkey, cid, record }` entries of one
+ * account's verified repo state. Returns:
+ *   { bindings, candidates, firstInvalidReason, ignoredRkeys }
+ * where `bindings` is a Map from deviceDid to its verified binding
+ * ({ ok: true, ... } as returned by verifyPubkeyBinding), `candidates`
+ * counts the pubkey records at an accepted rkey, `firstInvalidReason`
+ * is the first candidate's failure reason (null when every candidate
+ * verified, or when there were no candidates), and `ignoredRkeys`
+ * lists pubkey records at an rkey that is neither the legacy `self`
+ * nor the device's own per-device rkey — those are not bindings at
+ * all (the rkey is bound to the record's deviceDid, so a record at a
+ * stray rkey cannot stand in for a device's binding).
+ *
+ * Rules:
+ * - Accepted rkeys: `self` (legacy migration — the pre-H-N1 single
+ *   slot, honored as one device's binding so existing published
+ *   recipes keep verifying) or `pubkeyRkeyForDeviceDid(deviceDid)`.
+ * - Two valid bindings naming the same deviceDid (e.g. `self` plus
+ *   the per-device record, after a client upgrade) are equivalent —
+ *   the deviceDid determines the key — so the first one wins.
+ * - A deviceDid is the key: two different keys can never share one.
+ */
+export async function verifyPubkeyBindings(accountDid, records) {
+  await ready()
+  const bindings = new Map()
+  const ignoredRkeys = []
+  let candidates = 0
+  let firstInvalidReason = null
+  for (const entry of records ?? []) {
+    if (entry?.collection !== PUBKEY_COLLECTION) continue
+    const record = entry.record
+    const rkey = entry.rkey
+    const derived = pubkeyRkeyForDeviceDid(record?.deviceDid)
+    if (rkey !== 'self' && rkey !== derived) {
+      ignoredRkeys.push(rkey)
+      continue
+    }
+    candidates++
+    const checked = await verifyPubkeyBinding(accountDid, record)
+    if (!checked.ok) {
+      if (firstInvalidReason === null) firstInvalidReason = checked.reason
+      continue
+    }
+    if (!bindings.has(checked.deviceDid)) bindings.set(checked.deviceDid, checked)
+  }
+  return { bindings, candidates, firstInvalidReason, ignoredRkeys }
 }
 
 /**

@@ -28,8 +28,10 @@ function shortDid(did: string): string {
 }
 
 /**
- * Read-only view of one public recipe, with its author's account DID and
- * a "Save a copy" action that imports it as an ordinary local recipe.
+ * Read-only view of one public recipe, with its author's account DID,
+ * the authoring device (verified against the author's PDS, with
+ * known/new-device status — S3/H-N4), and a "Save a copy" action that
+ * imports it as an ordinary local recipe.
  */
 export function PublicRecipeView({
   record,
@@ -71,6 +73,20 @@ export function PublicRecipeView({
       </p>
       {record.deviceDid && (
         <p className="muted">Device: {shortDid(record.deviceDid)}</p>
+      )}
+      {/* S3/H-N4: the device binding was verified against the author's
+          PDS (not the hub), and the pin store says whether this device
+          was seen for this author before — a substitution after first
+          sight is visible here, not silent. */}
+      {record.bindingVerifiedVia === 'pds' && (
+        <p className="muted" data-testid="public-device-verified">
+          Device verified against the author&apos;s PDS
+          {record.deviceSeenBefore === false
+            ? ' — new device for this author, first time seen. If you were not expecting a new device, treat this recipe with care.'
+            : record.deviceSeenBefore === true
+              ? ' — known device for this author.'
+              : ''}
+        </p>
       )}
       {record.description && <p>{record.description}</p>}
       <div className="times">
@@ -171,7 +187,15 @@ export function DiscoverPanel({ onClose, onSaveCopy }: DiscoverProps) {
     setSaveError(null)
     try {
       const url = appViewUrl.trim() || loadAppViewUrl()
-      setSelected(await fetchPublicRecipe(url, r.did, r.rkey))
+      // S3/H-N4: the binding check fetches from the author's PDS — the
+      // viewer's own PDS URL is the first hint (testnet / single-PDS);
+      // authors on another PDS fall back to PLC resolution inside
+      // fetchPublicRecipe.
+      setSelected(
+        await fetchPublicRecipe(url, r.did, r.rkey, undefined, {
+          authorPdsUrl: loadSession()?.pdsUrl || getActiveHub().pdsUrl,
+        }),
+      )
     } catch (e) {
       setError(friendlyError(e, 'the discovery service'))
     } finally {

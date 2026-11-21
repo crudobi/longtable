@@ -27,16 +27,20 @@ import {
 } from '../public/discover'
 import {
   buildRecipeRecord,
+  pubkeyBindingMessage,
+  pubkeyRkeyForDeviceDid,
   signRecipeRecord,
   type PublishableRecipe,
 } from '../public/publish'
-import { identityFromSeed, type Identity } from '../identity/identity'
-import { base64ToU8, u8ToBase64 } from '../identity/codec'
+import { identityFromSeed, signDetached, type Identity } from '../identity/identity'
+import { base64ToU8, u8ToBase64, utf8ToU8 } from '../identity/codec'
 
 const ACCT = 'did:plc:accttest'
 const SEED = new Uint8Array(32).fill(7)
 const OTHER_SEED = new Uint8Array(32).fill(8)
 const APPVIEW = 'http://localhost:3210'
+const PDS_URL = 'http://localhost:2583'
+const PLC_URL = 'https://plc.directory'
 
 function fixtureRecipe(): PublishableRecipe {
   return {
@@ -81,13 +85,73 @@ async function signedServedRecord(
   }
 }
 
-function mockAppView(served: unknown, status = 200) {
+/** The genuine per-device binding record for `identity`, signed by its device key. */
+async function bindingRecordFor(identity: Identity): Promise<Record<string, unknown>> {
+  const devicePublicKey = u8ToBase64(identity.publicKey)
+  return {
+    $type: 'kitchen.longtable.pubkey',
+    deviceDid: identity.did,
+    devicePublicKey,
+    signature: u8ToBase64(
+      await signDetached(
+        identity,
+        utf8ToU8(pubkeyBindingMessage(ACCT, identity.did, devicePublicKey)),
+      ),
+    ),
+    createdAt: '2026-01-01T00:00:00.000Z',
+  }
+}
+
+/**
+ * A mock fetch serving the whole verification stack: the AppView's
+ * /recipe/ response, the PLC DID document (naming the fake PDS), and
+ * the PDS's getRecord for the author's per-device binding.
+ * fetchPublicRecipe now verifies the binding through the PDS channel
+ * (S3/H-N4), so a mock that only served the AppView would fail every
+ * test with binding-unavailable. No authorPdsUrl hint is passed, so
+ * these tests exercise the PLC-resolution path too.
+ */
+function mockAppView(served: unknown, identity: Identity, opts: { binding?: unknown } = {}) {
   return async (url: string): Promise<Response> => {
-    expect(url).toContain('/recipe/')
-    return new Response(JSON.stringify(served), {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    if (url.includes('/recipe/')) {
+      return new Response(JSON.stringify(served), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    if (url.startsWith(`${PLC_URL}/`)) {
+      return new Response(
+        JSON.stringify({
+          id: ACCT,
+          service: [
+            {
+              id: '#atproto_pds',
+              type: 'AtprotoPersonalDataServer',
+              serviceEndpoint: PDS_URL,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+    if (url.includes('com.atproto.repo.getRecord')) {
+      const binding = opts.binding !== undefined ? opts.binding : await bindingRecordFor(identity)
+      if (binding === null) {
+        return new Response(
+          JSON.stringify({ error: 'RecordNotFound', message: 'Record not found' }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response(
+        JSON.stringify({
+          uri: `at://${ACCT}/kitchen.longtable.pubkey/${await pubkeyRkeyForDeviceDid(identity.did)}`,
+          cid: 'bafybinding',
+          value: binding,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+    throw new Error(`unexpected fetch URL in mock: ${url}`)
   }
 }
 
@@ -107,11 +171,13 @@ describe('fetchPublicRecipe device-signature verification', () => {
   it('returns a valid device-signed record', async () => {
     const identity = await identityFromSeed(SEED)
     const served = await signedServedRecord(identity)
-    const rec = await fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served))
+    const rec = await fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity))
     expect(rec.name).toBe('Tomato Soup')
     expect(rec.longtableId).toBe('recipe-1')
     expect(rec.deviceDid).toBe(identity.did)
     expect(rec.deviceKey).toBe(u8ToBase64(identity.publicKey))
+    // S3/H-N4: the binding was verified through the PDS channel, not the hub.
+    expect(rec.bindingVerifiedVia).toBe('pds')
     // Direct verification of the returned record also passes.
     await verifyPublicRecipe(rec, ACCT)
   })
@@ -122,7 +188,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     served.name = 'Tomato Soup (HACKED)'
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('signature-invalid')
   })
@@ -133,7 +199,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     served.ingredients = ['tomatoes', 'salt', 'arsenic']
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('signature-invalid')
   })
@@ -145,7 +211,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     images[0].ref.$link = 'bafyforged'
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('signature-invalid')
   })
@@ -158,7 +224,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     served.deviceSignature = u8ToBase64(sig)
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('signature-invalid')
   })
@@ -169,7 +235,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     delete served.deviceSignature
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('missing-deviceSignature')
   })
@@ -180,7 +246,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     delete served.deviceDid
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('missing-deviceDid')
   })
@@ -191,7 +257,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     delete served.deviceKey
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('missing-deviceKey')
   })
@@ -203,7 +269,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     served.deviceKey = u8ToBase64(other.publicKey)
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('deviceKey-mismatch')
   })
@@ -214,7 +280,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     served.longtableId = 'recipe-2'
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('signature-invalid')
   })
@@ -225,7 +291,7 @@ describe('fetchPublicRecipe device-signature verification', () => {
     delete served.longtableId
     expect(
       await rejectionReason(
-        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+        fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
       ),
     ).toBe('missing-longtableId')
   })
@@ -235,12 +301,12 @@ describe('fetchPublicRecipe device-signature verification', () => {
     const served = await signedServedRecord(identity)
     served.name = 'Forged'
     await expect(
-      fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served)),
+      fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity)),
     ).rejects.toBeInstanceOf(RecipeVerificationError)
     // And the UI copy is a plain short sentence (friendlyError passes it
     // through verbatim): no stack, no JSON blob, under 200 chars.
     try {
-      await fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served))
+      await fetchPublicRecipe(APPVIEW, ACCT, 'recipe-1', mockAppView(served, identity))
       expect.unreachable()
     } catch (e) {
       expect(e).toBeInstanceOf(RecipeVerificationError)

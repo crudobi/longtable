@@ -11,6 +11,7 @@ import {
   canonicalRecipeHashHex,
   recipeSignatureMessage,
   pubkeyBindingMessage,
+  pubkeyRkeyForDeviceDid,
   didKeyFromPublicKeyBytes,
 } from '../device-signature.mjs'
 
@@ -29,7 +30,7 @@ export function signMsg(device, message) {
   return crypto.sign(null, Buffer.from(message, 'utf8'), device.privateKey).toString('base64')
 }
 
-/** A valid `kitchen.longtable.pubkey/self` binding record for `device`. */
+/** A valid `kitchen.longtable.pubkey` binding record for `device` (rkey chosen by the entry). */
 export function bindingRecord(device, accountDid) {
   return {
     $type: 'kitchen.longtable.pubkey',
@@ -40,6 +41,21 @@ export function bindingRecord(device, accountDid) {
       pubkeyBindingMessage(accountDid, device.deviceDid, device.devicePublicKey),
     ),
     createdAt: '2026-10-12T00:00:00.000Z',
+  }
+}
+
+/** A repo-state entry for `device`'s binding at the legacy `self` rkey (migration). */
+export function legacyBindingEntry(device, accountDid, cid = 'cid-pk') {
+  return { collection: 'kitchen.longtable.pubkey', rkey: 'self', cid, record: bindingRecord(device, accountDid) }
+}
+
+/** A repo-state entry for `device`'s binding at its per-device rkey (H-N1). */
+export function perDeviceBindingEntry(device, accountDid, cid = 'cid-pk') {
+  return {
+    collection: 'kitchen.longtable.pubkey',
+    rkey: pubkeyRkeyForDeviceDid(device.deviceDid),
+    cid,
+    record: bindingRecord(device, accountDid),
   }
 }
 

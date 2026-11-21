@@ -12,19 +12,21 @@
  * asks the repo-state provider (verify.mjs in production) for the DID's
  * *signature-verified* repo state and diffs the index against it, and then
  * verifies every recipe's DEVICE signature against the author's
- * kitchen.longtable.pubkey/self binding from that same verified state
- * (device-signature.mjs). The repo-commit signature alone is not the
- * device guarantee — the PDS holds the repo key and produces it — so a
- * record whose device signature is missing, mismatched or forged is
- * dropped and counted (stats.rejected / stats.signatureRejected), never
- * indexed. Records that are merely *claimed* (by a firehose frame, a hub,
- * or a direct ingestClaim call) are never indexed on their own.
+ * kitchen.longtable.pubkey bindings from that same verified state
+ * (device-signature.mjs) — one binding per device (H-N1), each recipe
+ * checked against its own device's binding. The repo-commit signature
+ * alone is not the device guarantee — the PDS holds the repo key and
+ * produces it — so a record whose device signature is missing, mismatched
+ * or forged is dropped and counted (stats.rejected /
+ * stats.signatureRejected), never indexed. Records that are merely
+ * *claimed* (by a firehose frame, a hub, or a direct ingestClaim call)
+ * are never indexed on their own.
  */
 import WebSocket from 'ws'
 import { cborDecodeMulti } from '@atproto/common'
 import { cidForRecord } from '@atproto/repo'
 import { RECIPE_COLLECTION, PUBKEY_COLLECTION } from './db.mjs'
-import { verifyPubkeyBinding, verifyRecipeDeviceSignature } from './device-signature.mjs'
+import { verifyPubkeyBindings, verifyRecipeDeviceSignature } from './device-signature.mjs'
 
 export const WANTED_COLLECTIONS = [RECIPE_COLLECTION, PUBKEY_COLLECTION]
 
@@ -73,14 +75,17 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
    * upsert new/changed recipes, delete recipes that vanished from the repo.
    * On any verification failure: index nothing, stats.rejected++, {ok:false}.
    *
-   * Binding-failure sweep rule (N1 / M-N5): a *missing* binding is
-   * ambiguous — the binding commit may simply not have arrived yet — so
+   * Binding-failure sweep rule (N1 / M-N5): NO binding at all is
+   * ambiguous — a binding commit may simply not have arrived yet — so
    * new records are rejected but the sweep is skipped and
-   * previously-verified rows stay until re-verified. Any other binding
-   * failure is positive evidence the binding is wrong, so the sweep runs.
-   * The one exception is a verified-EMPTY repo state: with no recipe
-   * records at all there is nothing ambiguous left, so the sweep runs
-   * as the author's deletion.
+   * previously-verified rows stay until re-verified. A recipe whose
+   * device has no binding while OTHER devices are bound is positive
+   * evidence that device is unbound (its binding was deleted or never
+   * existed), so it is rejected and its old row IS swept. Any other
+   * binding failure is positive evidence the binding is wrong, so the
+   * sweep runs. The one exception is a verified-EMPTY repo state: with
+   * no recipe records at all there is nothing ambiguous left, so the
+   * sweep runs as the author's deletion.
    */
   async function reconcileRepo(did) {
     let state
@@ -91,20 +96,40 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
       log.warn?.(`[appview] reconcile ${did} rejected: ${err?.message ?? err}`)
       return { ok: false, did, error: String(err?.message ?? err) }
     }
-    // Device-signature gate (C2): the repo state is commit-verified, but
-    // the PDS holds the repo key — only the device signature proves the
-    // author's device wrote the recipe. Load the author's
-    // kitchen.longtable.pubkey/self binding from the SAME verified CAR,
-    // verify its binding signature, then verify each recipe against the
-    // bound key. Records that fail any check are dropped and counted
+    // Device-signature gate (C2, per-device since H-N1): the repo state
+    // is commit-verified, but the PDS holds the repo key — only the device
+    // signature proves the author's device wrote the recipe. Load ALL of
+    // the author's kitchen.longtable.pubkey bindings from the SAME verified
+    // CAR (one record per device at its per-device rkey; the legacy `self`
+    // record counts as one device's binding), verify each binding
+    // signature, then verify each recipe against ITS OWN device's binding.
+    // Records that fail any check are dropped and counted
     // (stats.rejected + stats.signatureRejected) — never indexed — and any
     // previously-indexed row for a dropped record is deleted by the sweep
-    // below (it is not added to `seen`).
+    // below (it is not added to `seen`). A device publishing a binding
+    // never affects another device's recipes: rebind is additive now.
     const records = state.records ?? []
-    const bindingEntry = records.find(
-      (r) => r.collection === PUBKEY_COLLECTION && r.rkey === 'self',
-    )
-    const binding = await verifyPubkeyBinding(did, bindingEntry?.record)
+    const {
+      bindings,
+      candidates,
+      firstInvalidReason,
+      ignoredRkeys,
+    } = await verifyPubkeyBindings(did, records)
+    if (ignoredRkeys.length > 0) {
+      log.warn?.(
+        `[appview] reconcile ${did}: ignored ${ignoredRkeys.length} pubkey record(s) at unexpected rkey(s): ${ignoredRkeys.join(', ')}`,
+      )
+    }
+    // The single binding reason the result reports: null while at least
+    // one device is bound; 'missing-binding' when the repo carries no
+    // binding record at all; otherwise the first invalid binding's
+    // reason (positive evidence the binding is wrong).
+    const bindingReason =
+      bindings.size > 0
+        ? null
+        : candidates === 0
+          ? 'missing-binding'
+          : firstInvalidReason
     let signatureRejected = 0
     const reject = (entry, reason) => {
       signatureRejected++
@@ -114,48 +139,58 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
         `[appview] reconcile ${did}: dropped ${entry.collection}/${entry.rkey}: device signature rejected (${reason})`,
       )
     }
-    if (!binding.ok) {
+    if (bindings.size === 0) {
       for (const entry of records) {
         if (entry.collection !== RECIPE_COLLECTION) continue
-        reject(entry, binding.reason)
+        reject(entry, bindingReason)
       }
     }
-    // N1 sweep-skip: missing binding + recipe records present in the
+    // N1 sweep-skip: no binding at all + recipe records present in the
     // verified state means the evidence is ambiguous (transient gap),
-    // so keep previously-verified rows. Missing binding with zero
-    // recipe records is a verified-empty repo — the sweep is the
-    // author's deletion, so it runs. Any other binding failure
-    // (invalid key / bad binding signature / key mismatch) is positive
-    // evidence the binding is wrong — e.g. a rebind — so the sweep
-    // runs as before and old-device rows leave.
+    // so keep previously-verified rows. No binding with zero recipe
+    // records is a verified-empty repo — the sweep is the author's
+    // deletion, so it runs. Any other binding failure (invalid key /
+    // bad binding signature / key mismatch) is positive evidence the
+    // binding is wrong — so the sweep runs as before and rows for the
+    // unbound device leave. A recipe whose device has no binding while
+    // OTHER devices are bound is the same positive evidence (its binding
+    // was deleted or never existed) — it is dropped below and its old row
+    // is swept, while the bound devices' rows stay.
     const recipeCount = records.filter((r) => r.collection === RECIPE_COLLECTION).length
-    const skipSweep =
-      !binding.ok && binding.reason === 'missing-binding' && recipeCount > 0
+    const skipSweep = bindings.size === 0 && candidates === 0 && recipeCount > 0
     const seen = new Set()
     let changed = 0
-    if (binding.ok) {
-      for (const entry of records) {
-        if (entry.collection !== RECIPE_COLLECTION) continue
-        const check = await verifyRecipeDeviceSignature(did, entry.record, binding)
-        if (!check.ok) {
-          reject(entry, check.reason)
-          continue
-        }
-        const uri = `at://${did}/${entry.collection}/${entry.rkey}`
-        seen.add(uri)
-        if (
-          index.upsert({
-            uri,
-            did,
-            rkey: entry.rkey,
-            cid: entry.cid,
-            record: entry.record,
-            deviceKey: binding.devicePublicKey,
-          })
-        ) {
-          changed++
-          stats.indexed++
-        }
+    for (const entry of records) {
+      if (entry.collection !== RECIPE_COLLECTION) continue
+      const binding = bindings.get(entry.record?.deviceDid)
+      if (!binding) {
+        // No verified binding for THIS device. When no device is bound
+        // at all the recipe was already rejected above with the
+        // account-level reason; here the account HAS bindings, so this
+        // device specifically is unbound — reject with missing-binding
+        // and let the sweep drop its previously-indexed row.
+        if (bindings.size > 0) reject(entry, 'missing-binding')
+        continue
+      }
+      const check = await verifyRecipeDeviceSignature(did, entry.record, binding)
+      if (!check.ok) {
+        reject(entry, check.reason)
+        continue
+      }
+      const uri = `at://${did}/${entry.collection}/${entry.rkey}`
+      seen.add(uri)
+      if (
+        index.upsert({
+          uri,
+          did,
+          rkey: entry.rkey,
+          cid: entry.cid,
+          record: entry.record,
+          deviceKey: binding.devicePublicKey,
+        })
+      ) {
+        changed++
+        stats.indexed++
       }
     }
     let deleted = 0
@@ -173,7 +208,7 @@ export function createIngestor({ index, repoStateProvider, pdsUrl, log = console
       }
     }
     stats.lastReconcileAt = new Date().toISOString()
-    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected, signatureRejected, sweepSkipped: skipSweep, bindingReason: binding.ok ? null : binding.reason }
+    return { ok: true, did, indexed: changed, deleted, total: seen.size, rejected: signatureRejected, signatureRejected, sweepSkipped: skipSweep, bindingReason, bindings: bindings.size }
   }
 
   /**
