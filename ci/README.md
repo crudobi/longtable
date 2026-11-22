@@ -241,14 +241,17 @@ annotated but unsigned; they point at old commits, so they do not
 trip the gate — but no future release can be cut from an unsigned
 tag.
 
-Creating the operator key is a USER-side action (no key exists for
-this project as of Wave 6C; do not invent or silently create one):
+The operator key was created 2026-11-21 (ed25519, signing-only,
+expires 2028-11-21, no passphrase — the key lives in the operator's
+keyring on the build box and signing is done by the operator there;
+the pipeline only verifies). Fingerprint:
+`2C9EBBBCE1F075CAB42F25C671A715B20FF6D12C`. The public key is pinned
+at `$STATE/tag-signing-key.pub`; the secret key is backed up in the
+vault (KeePass entry "Longtable tag-signing key"). Future tags MUST
+be signed with this key:
 
 ```bash
-gpg --full-generate-key        # RSA or ed25519, signing-capable; no expiry or a dated one, your call
-git config --global user.signingkey <fingerprint>   # gpg --list-secret-keys --keyid-format long
-gpg --armor --export <fingerprint> > <host root>/ops/longtable-ci/tag-signing-key.pub
-chmod 644 <host root>/ops/longtable-ci/tag-signing-key.pub
+git config --global user.signingkey 2C9EBBBCE1F075CAB42F25C671A715B20FF6D12C   # already set on the build box
 git tag -s v0.2.3 -m "Longtable v0.2.3"   # sign with the pinned key
 git verify-tag v0.2.3                      # sanity check before pushing
 ```
@@ -386,7 +389,7 @@ All under the ops CI dir (`<host root>/ops/longtable-ci/`):
   it, `last-processed-tags` (Wave 6C) — the sorted tags pointing at
   that commit when it was processed, one per line.
 - `tag-signing-key.pub` — the operator-pinned tag-signing public key
-  (Wave 6C; see "Signed tags"). Absent until the operator pins one.
+  (Wave 6C; see "Signed tags"). Pinned 2026-11-21.
 - `history-scan.json` — the latest nightly all-history scan (see
   above); `history-scan-baseline.json` — the recorded known-hit set
   it compares against.
